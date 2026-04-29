@@ -52,6 +52,11 @@ const sidebars: SidebarsConfig = {
         'miren-cloud/subdomains',
         {
           type: 'doc',
+          id: 'miren-cloud/global-router',
+          label: 'Global Router',
+        },
+        {
+          type: 'doc',
           id: 'miren-cloud/cloud-updates',
           label: 'Updates',
         },

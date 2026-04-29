@@ -11,20 +11,20 @@ func TestDisableFeatureWithPrefix(t *testing.T) {
 	Reset()
 
 	// Enable first, then disable
-	Init(nil, []string{"globalrouter", "-globalrouter"})
+	Init(nil, []string{"routeoidc", "-routeoidc"})
 
-	if GlobalRouter() {
-		t.Error("GlobalRouter should be disabled after '-globalrouter'")
+	if RouteOIDC() {
+		t.Error("RouteOIDC should be disabled after '-routeoidc'")
 	}
 }
 
 func TestCaseInsensitiveFeatureNames(t *testing.T) {
 	Reset()
 
-	Init(nil, []string{"GlobalRouter", "ADMINAPI"})
+	Init(nil, []string{"RouteOIDC", "ADMINAPI"})
 
-	if !GlobalRouter() {
-		t.Error("GlobalRouter should be enabled (case-insensitive)")
+	if !RouteOIDC() {
+		t.Error("RouteOIDC should be enabled (case-insensitive)")
 	}
 	if !AdminAPI() {
 		t.Error("AdminAPI should be enabled (case-insensitive)")
@@ -51,10 +51,10 @@ func TestUnknownFeatureLogsWarning(t *testing.T) {
 func TestEmptyAndWhitespaceFlags(t *testing.T) {
 	Reset()
 
-	Init(nil, []string{"", "  ", "globalrouter", "  ", ""})
+	Init(nil, []string{"", "  ", "routeoidc", "  ", ""})
 
-	if !GlobalRouter() {
-		t.Error("GlobalRouter should be enabled despite empty/whitespace flags")
+	if !RouteOIDC() {
+		t.Error("RouteOIDC should be enabled despite empty/whitespace flags")
 	}
 }
 
@@ -91,7 +91,7 @@ func TestAllKeywordWithExclusion(t *testing.T) {
 func TestNegativeAllDisablesAll(t *testing.T) {
 	Reset()
 
-	Init(nil, []string{"globalrouter", "adminapi", "-all"})
+	Init(nil, []string{"routeoidc", "adminapi", "-all"})
 
 	for _, name := range AllFeatures() {
 		if IsEnabled(name) {
