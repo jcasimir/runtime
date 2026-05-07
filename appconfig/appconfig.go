@@ -72,6 +72,10 @@ type ServiceConfig struct {
 	EnvVars     []AppEnvVar               `toml:"env"`
 	Concurrency *ServiceConcurrencyConfig `toml:"concurrency"`
 	Disks       []DiskConfig              `toml:"disks"`
+	// PortWaitTimeout overrides the default 15s wait for the service to bind
+	// its port during startup. Accepts a Go duration string (e.g. "60s", "2m").
+	// Empty or invalid values fall back to the default.
+	PortWaitTimeout string `toml:"port_wait_timeout,omitempty"`
 }
 
 // AddonConfig represents configuration for an addon in app.toml.
@@ -243,6 +247,18 @@ func (ac *AppConfig) Validate() error {
 						KeyPath: concurrencyPath + ".shutdown_timeout",
 						Message: fmt.Sprintf("service %s: invalid shutdown_timeout %q: %v", serviceName, concurrency.ShutdownTimeout, err),
 					}
+				}
+			}
+		}
+
+		// Validate port_wait_timeout (parsed downstream by resolvePortWaitTimeout;
+		// catch typos like "120" missing the unit suffix at deploy time rather
+		// than silently falling back to the 15s default).
+		if svcConfig.PortWaitTimeout != "" {
+			if _, err := time.ParseDuration(svcConfig.PortWaitTimeout); err != nil {
+				return &ValidationError{
+					KeyPath: svcPrefix + ".port_wait_timeout",
+					Message: fmt.Sprintf("service %s: invalid port_wait_timeout %q: %v", serviceName, svcConfig.PortWaitTimeout, err),
 				}
 			}
 		}

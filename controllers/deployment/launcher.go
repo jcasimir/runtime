@@ -542,6 +542,9 @@ func (l *Launcher) buildSandboxSpec(
 			if svc.Concurrency.ShutdownTimeout != "" {
 				shutdownTimeout = svc.Concurrency.ShutdownTimeout
 			}
+			if svc.PortWaitTimeout != "" {
+				sbSpec.PortWaitTimeout = svc.PortWaitTimeout
+			}
 
 			if len(svc.Ports) > 0 {
 				// Multi-port path: map each port entry
