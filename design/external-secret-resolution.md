@@ -7,9 +7,16 @@
 ## Goal
 
 Let `app.toml` reference secrets by URI (initially `op://vault/item/field`)
-without ever writing the resolved value to disk, the manifest, or etcd.
-Resolution happens on the runner at sandbox boot. The 1Password integration
-itself should live outside the core runtime — minimally invasive, plugin-shaped.
+without writing the resolved value to the manifest, etcd, or any control-plane
+storage. Resolution happens on the runner at sandbox boot. The 1Password
+integration itself should live outside the core runtime — minimally invasive,
+plugin-shaped.
+
+Resolved values *do* persist to the runner host's local disk in an
+availability cache (see [Persistent cache](#persistent-cache) below). That's
+an explicit tradeoff: the runner host already holds the OP service-account
+token, so the trust boundary is the same. The win is graceful degradation
+when the secrets backend is briefly unreachable.
 
 ```toml
 [[services.web.env]]
@@ -139,15 +146,81 @@ Acceptable bootstrap paths in priority order:
 The token is read once at runner startup, held in memory, never logged, never
 serialized.
 
+## Persistent cache
+
+The resolver registry sits in front of an on-disk cache so a runner that just
+restarted — or a 1P backend that's briefly unavailable — can still boot
+sandboxes with the last-known values. This trades some surface area (resolved
+values briefly persist to local disk) for real availability.
+
+**Location.** `/var/lib/miren/runner/secrets-cache/`, mode 0700, owned by the
+runner user. One file per URI, named by `sha256(uri)` to avoid filename
+escaping. Atomic writes via tmp + rename.
+
+**Entry format (CBOR or JSON):**
+
+```
+{
+  "uri":         "op://Production/litellm/db_url",
+  "value":       "...",
+  "fetched_at":  "2026-05-07T14:22:01Z",
+  "resolver":    "onepassword/v1"
+}
+```
+
+**Resolution flow at sandbox boot:**
+
+1. **In-memory hit, fresh** (within in-memory TTL, default 30s): use it.
+2. **Miss or in-memory stale**: call the live resolver.
+   - On success: write through to in-memory + disk cache, return value.
+   - On failure: fall through to the disk cache.
+3. **Disk-cache hit**: use the value, log a structured warning (`secrets.cache.stale_fallback` with URI and `fetched_at`), emit a metric. Sandbox boots, operator gets paged.
+4. **No cache, resolver failed**: hard fail; the sandbox doesn't boot. Surface in `m sandbox describe`.
+
+**Bounds.** Per-host bound on cache size (default 1000 entries) + age-based
+eviction for entries not touched in N days (default 30). Both as runner
+config. Cache size is operational hygiene, not a correctness concern.
+
+**Operator controls.** `m runner secrets cache flush` (all entries) and
+`m runner secrets cache flush <uri>` (single entry). Useful after a forced
+secret rotation where you need every runner to re-fetch on next sandbox
+restart. Out of scope for v1, but easy follow-up.
+
+**What this does NOT do.** The cache is per-runner; there is no replication
+or coordination between runners. That's deliberate — each runner is a
+separate trust boundary, and consistency falls out of "every resolver returns
+the same value for the same URI." If a runner's cache disagrees with another
+runner's cache, the next successful upstream fetch reconciles them.
+
+**Encryption at rest.** Open question — see below.
+
+## Token bootstrap (the unavoidable secret)
+
+The OP service-account token has to live somewhere on each runner host. This
+is the one thing this design *cannot* eliminate; it collapses N secrets to 1.
+Acceptable bootstrap paths in priority order:
+
+1. File on the runner host loaded at process start (`/etc/miren/op-token`,
+   mode 0600, owned by the runner user). Ops's responsibility, same shape as
+   the existing miren-runner credentials.
+2. systemd `EnvironmentFile=` for `make`-managed deployments.
+3. Cloud-provider instance metadata for hosted setups (later).
+
+The token is read once at runner startup, held in memory, never logged, never
+serialized.
+
 ## Failure modes
 
 | Scenario | Behavior |
 |---|---|
-| Resolver returns error at sandbox boot | Sandbox transitions to `failed`, error surfaced in `m sandbox describe`. **Don't** fall back to empty string — that's the silent-failure mode `port_timeout` validation was added to prevent. |
-| 1P API unreachable | Same as above unless cache is warm. |
-| Token missing/expired | Runner startup fails fast with a clear error pointing at the token file. Don't start the runner half-configured. |
-| Cache TTL expired during sandbox lifetime | No-op. Resolution happens at boot only; in-flight sandboxes keep their resolved env. Rotation happens on the next restart. |
+| Resolver returns error at sandbox boot, **cache hit** | Use cached value, emit `secrets.cache.stale_fallback` warning + metric. Sandbox boots. |
+| Resolver returns error at sandbox boot, **no cache** | Sandbox transitions to `failed`, error surfaced in `m sandbox describe`. **Don't** fall back to empty string — that's the silent-failure mode `port_timeout` validation was added to prevent. |
+| 1P API unreachable, runner just restarted | Disk cache survives the restart; resolution serves from cache. Same warning + metric as above. |
+| Token missing/expired at runner startup | Runner startup fails fast with a clear error pointing at the token file. Don't start the runner half-configured. |
+| Token expired *after* startup, cache hit | Sandbox boots from cache; the warning + metric is the operator's signal to rotate. |
+| In-memory TTL expired during sandbox lifetime | No-op. Resolution happens at boot only; in-flight sandboxes keep their resolved env. Rotation happens on the next restart. |
 | Required secret with `value_from` resolves to empty string | Treat as resolution failure (consistent with the existing `required: true` semantics on env vars). |
+| Disk cache file corrupted | Treat as miss; fall through to the live resolver. Log a warning. |
 
 ## Why not the alternatives
 
@@ -169,15 +242,23 @@ serialized.
    the spec is cleanest and survives schema migrations; a sentinel format
    (`"DATABASE_URL=value_from:op://..."`) is two fewer schema bumps. Lean
    toward the structured field — it's a one-time cost.
-2. **Caching policy.** Per-runner LRU keyed by URI, short TTL (default 30s)
-   so back-to-back sandbox starts during a deploy don't hammer the OP API.
-   Cache is purely a perf concern — correctness doesn't depend on it.
-3. **Multiple resolvers per scheme?** Probably not. One registered resolver
+2. **Disk cache encryption at rest.** The cache file is mode 0700, but the
+   values inside are plaintext. Options: (a) leave plaintext — same effective
+   exposure as the OP token already on the host; (b) AEAD-encrypt with a key
+   derived from `/etc/machine-id` + a runner-provisioned salt, so a stolen
+   disk image isn't readable on another host. (b) is a few hundred lines and
+   real defense-in-depth. Lean toward (a) for v1, file (b) as a follow-up.
+3. **Cache staleness ceiling.** Should there be a maximum disk-cache age
+   beyond which we refuse to serve stale even if the resolver fails? E.g.,
+   "cache older than 7 days hard-fails." Protects against indefinitely-stale
+   secrets after a key rotation that the runner never noticed. Probably yes,
+   default 7d, runner-configurable.
+4. **Multiple resolvers per scheme?** Probably not. One registered resolver
    per scheme keeps the dispatch trivial.
-4. **CLI ergonomics for non-OP users.** `value_from` with no registered
+5. **CLI ergonomics for non-OP users.** `value_from` with no registered
    resolver should be a clear error at deploy time, not a silent fallback to
    empty string. (Handled in #1 above.)
-5. **Audit logging.** Should resolution emit an audit event (which sandbox,
+6. **Audit logging.** Should resolution emit an audit event (which sandbox,
    which URI, which resolver) without including the value? Probably yes,
    structured-logging only — easy add, ignore for v1.
 
@@ -186,10 +267,12 @@ serialized.
 1. Land `value_from` field + parse-time validation in `appconfig` (no resolver
    yet — field is accepted but nothing reads it).
 2. Add `EnvFrom` to `SandboxSpec`, plumb through `build.go` and `launcher.go`.
-3. Add the empty `pkg/secrets` registry + the one call site in `sandbox.go`.
-   Now the runtime supports the *concept* of resolved env, with no providers.
+3. Add the empty `pkg/secrets` registry + the on-disk cache + the one call
+   site in `sandbox.go`. Now the runtime supports the *concept* of resolved
+   env (with cache + stale-fallback semantics), with no providers wired up.
 4. Add `pkg/secrets/onepassword/` (Shape A) + runner config + token bootstrap.
-5. Docs + a minimal integration test using the OP CLI in a fixture.
+5. Docs + a minimal integration test using the OP CLI in a fixture, plus a
+   cache-fallback test that simulates resolver failure with a warm cache.
 
 Steps 1–3 are the "core" change and are independently useful (e.g., a Vault
 provider could be added by anyone without touching core again). Step 4 is the
