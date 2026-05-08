@@ -312,12 +312,7 @@ serialized.
 
 ## Open questions
 
-1. **CLI ergonomics for non-OP users.** `value_from` with no registered
-   resolver should be a clear error at deploy time, not a silent fallback to
-   empty string. The structured-field plumbing (resolved decision below)
-   makes this trivial: validation walks `EnvFrom` entries and errors on any
-   scheme without a registered resolver.
-2. **Audit logging.** Beyond the WARN-level resolver/value-unavailable logs,
+1. **Audit logging.** Beyond the WARN-level resolver/value-unavailable logs,
    should every successful resolution also emit a structured audit event
    (which sandbox, which URI, which resolver, never the value)? Easy add;
    probably wait for a compliance ask before turning it on by default.
@@ -330,6 +325,15 @@ serialized.
   formats become a maintenance liability when a third value source shows up.
 - **Multiple resolvers per scheme.** No — one resolver per scheme. Per-tenant
   routing belongs *inside* the URI, not in the registry.
+- **Deploy-time validation of unknown schemes.** Server-side. The build
+  server validates every `value_from` URI against the cluster's union of
+  registered schemes and rejects upfront with a clear error naming the
+  available schemes. Mirrors how `AppConfig.Validate()` already catches
+  `port_timeout` typos at deploy time rather than sandbox boot. Per-runner
+  heterogeneity (only some runners have a given resolver registered) is
+  handled by making *runners* refuse to start when they see a scheme they
+  can't handle — the misconfigured runner fails its own startup, deploy
+  validation against the union stays simple.
 
 ## Rough sequencing
 
