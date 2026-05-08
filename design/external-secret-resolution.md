@@ -131,6 +131,36 @@ provider (Vault, AWS Secrets Manager) or a credible threat model that warrants
 process isolation. The interface is the same either way — Shape B is a
 non-breaking upgrade.
 
+### Mixed-maturity clusters: complementary low-ceremony resolvers
+
+A single Miren cluster will run apps at very different levels of secrets
+maturity — a production app fully wired to 1Password next to a Tuesday-afternoon
+spike whose author hasn't created an OP vault yet. The design accommodates
+this on two axes without ever needing multiple resolvers per scheme:
+
+1. **Literal `value` keeps working.** Apps that don't want any backend just
+   write `value = "..."` as today. No resolver path, no token required.
+2. **Other schemes can register alongside `op://`.** Two natural complements
+   to file as easy follow-ups, each as their own tiny in-tree package:
+
+   - **`env://VAR_NAME`** — read from the runner host's environment. Useful
+     for spike apps where the operator wants to drop a value into the
+     runner's systemd unit and not bother with 1Password yet. No upstream
+     dependency, no token.
+   - **`file:///path/on/runner`** — read from a file the operator placed on
+     the runner. Same use case as `env://`, different ergonomics; pairs
+     well with config-management tools.
+
+   Both are ~50 lines each and reuse the same registry, cache, and
+   stale-fallback machinery as the OP resolver. They're not v1 scope, but
+   the design admits them cleanly when someone wants them.
+
+The case that *would* require multi-resolver-per-scheme is per-tenant routing
+(App A's `op://` URIs hit account A; App B's hit account B). That's better
+solved by encoding the discriminator in the URI itself
+(`op://account=team-a@Production/...`) and letting the single OP resolver
+route internally.
+
 ## Token bootstrap (the unavoidable secret)
 
 The OP service-account token has to live somewhere on each runner host. This
@@ -282,19 +312,24 @@ serialized.
 
 ## Open questions
 
-1. **`SandboxSpec.EnvFrom` field vs. URI sentinel.** A new `EnvFrom` slice on
-   the spec is cleanest and survives schema migrations; a sentinel format
-   (`"DATABASE_URL=value_from:op://..."`) is two fewer schema bumps. Lean
-   toward the structured field — it's a one-time cost.
-2. **Multiple resolvers per scheme?** Probably not. One registered resolver
-   per scheme keeps the dispatch trivial.
-3. **CLI ergonomics for non-OP users.** `value_from` with no registered
+1. **CLI ergonomics for non-OP users.** `value_from` with no registered
    resolver should be a clear error at deploy time, not a silent fallback to
-   empty string. (Handled in #1 above.)
-4. **Audit logging.** Beyond the WARN-level resolver/value-unavailable logs,
+   empty string. The structured-field plumbing (resolved decision below)
+   makes this trivial: validation walks `EnvFrom` entries and errors on any
+   scheme without a registered resolver.
+2. **Audit logging.** Beyond the WARN-level resolver/value-unavailable logs,
    should every successful resolution also emit a structured audit event
    (which sandbox, which URI, which resolver, never the value)? Easy add;
    probably wait for a compliance ask before turning it on by default.
+
+## Resolved decisions
+
+- **`SandboxSpec.EnvFrom` field vs. URI sentinel.** Structured field. New
+  `env_from` component on the sandbox spec carrying `{ key, value_from }`.
+  Schema bump in `api/compute/schema.yml` is a one-time cost; sentinel
+  formats become a maintenance liability when a third value source shows up.
+- **Multiple resolvers per scheme.** No — one resolver per scheme. Per-tenant
+  routing belongs *inside* the URI, not in the registry.
 
 ## Rough sequencing
 
