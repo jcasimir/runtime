@@ -1,8 +1,15 @@
 # External Secret Resolution (Sketch)
 
-**Status:** sketch
+**Status:** sketch — paused 2026-05-11, one open question remaining
 **Branch:** `jcasimir/op-secrets-sketch`
 **Author:** jcasimir
+
+**Where this left off.** The structural decisions are settled (see [Resolved
+decisions](#resolved-decisions)). Only the audit-logging default is still
+open — see the single item under [Open questions](#open-questions). When you
+resume, the next step is picking option 1, 2, or 3 there and then moving to
+implementation step 1 in [Rough sequencing](#rough-sequencing) (the
+`value_from` field + parse-time validation in `appconfig`).
 
 ## Goal
 
@@ -312,10 +319,31 @@ serialized.
 
 ## Open questions
 
-1. **Audit logging.** Beyond the WARN-level resolver/value-unavailable logs,
-   should every successful resolution also emit a structured audit event
-   (which sandbox, which URI, which resolver, never the value)? Easy add;
-   probably wait for a compliance ask before turning it on by default.
+1. **Audit logging — default behavior.** Beyond the WARN-level
+   resolver/value-unavailable logs (which are always on), should every
+   *successful* resolution also emit a structured event (sandbox ID, URI,
+   resolver name, cache hit/miss, duration — never the value)? Three real
+   options:
+
+   **Option 1 — off by default, runner-config flag to enable.**
+   `[secrets.audit] enabled = true`. Operators with a compliance ask flip it
+   on; everyone else avoids the log volume. Lean toward this.
+
+   **Option 2 — on by default at INFO.** Free forensics for everyone;
+   operators who don't want it filter at log aggregation. Aligns with "logs
+   are cheap, you'll regret not having them."
+
+   **Option 3 — on by default at DEBUG.** Compromise that mostly defeats the
+   forensics use case (data only appears when someone's already debugging).
+
+   Worth flagging on top of all three: URI strings *can* leak structural
+   info (`op://customer-acme/...` reveals a customer name). Not a true
+   secret, but a real privacy consideration for some environments. The
+   resolver could optionally hash URIs before logging for compliance setups
+   that care.
+
+   Implementation is identical regardless — same structured event, same
+   fields. Only the default value of one flag changes.
 
 ## Resolved decisions
 
