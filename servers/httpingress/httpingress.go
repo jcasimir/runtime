@@ -38,6 +38,8 @@ import (
 	"miren.dev/runtime/pkg/httputil"
 	"miren.dev/runtime/pkg/oidc"
 	"miren.dev/runtime/pkg/rpc"
+	"miren.dev/runtime/pkg/waf"
+	"miren.dev/runtime/pkg/workloadidentity"
 )
 
 // idleTimeoutConn wraps a net.Conn and sets a read deadline before each
@@ -72,6 +74,7 @@ const (
 type IngressConfig struct {
 	RequestTimeout time.Duration
 	DataPath       string
+	WorkloadIssuer *workloadidentity.Issuer
 }
 
 type Server struct {
@@ -95,6 +98,18 @@ type Server struct {
 	oidcSessionManager *oidc.SessionManager
 	oidcMu             sync.RWMutex
 	oidcHandlers       map[string]*oidcHandler
+
+	wafEngine       *waf.Engine
+	wafProfileMu    sync.RWMutex
+	wafProfileCache map[entity.Id]*wafProfileEntry
+
+	passwordMu       sync.RWMutex
+	passwordHandlers map[string]*passwordHandler
+
+	connectorMu       sync.RWMutex
+	connectorHandlers map[string]*connectorHandler
+
+	workloadIssuer *workloadidentity.Issuer
 }
 
 type appUsage struct {
@@ -155,6 +170,11 @@ func NewServer(
 		apps:               make(map[string]*appUsage),
 		oidcSessionManager: oidc.NewSessionManager(false, "", signingKey),
 		oidcHandlers:       make(map[string]*oidcHandler),
+		wafEngine:          waf.NewEngine(log.With("component", "waf")),
+		wafProfileCache:    make(map[entity.Id]*wafProfileEntry),
+		passwordHandlers:   make(map[string]*passwordHandler),
+		connectorHandlers:  make(map[string]*connectorHandler),
+		workloadIssuer:     config.WorkloadIssuer,
 	}
 
 	if httpMetrics == nil {
@@ -417,10 +437,21 @@ func (h *Server) handleRequest(w http.ResponseWriter, req *http.Request) {
 	defer span.End()
 	req = req.WithContext(ctx)
 
+	// Handle OIDC discovery — only on the issuer's own hostname to avoid
+	// shadowing apps that serve their own /.well-known/openid-configuration
+	if req.URL.Path == "/.well-known/openid-configuration" && h.isIssuerHost(req.Host) {
+		h.handleOIDCDiscovery(w, req)
+		return
+	}
+
 	// Handle Miren server health check endpoint before routing
 	// Using .well-known per RFC 8615 to avoid collision with app routes
 	if req.URL.Path == "/.well-known/miren/health" {
 		h.handleHealth(w, req)
+		return
+	}
+	if req.URL.Path == "/.well-known/miren/jwks" {
+		h.handleJWKS(w, req)
 		return
 	}
 
@@ -506,17 +537,6 @@ func (h *Server) serveHTTPWithMetrics(w http.ResponseWriter, req *http.Request, 
 
 		// Check for ephemeral subdomain label (only relevant for wildcard routes)
 		ephemeralLabel = ingress.ExtractSubdomainLabel(onlyHost, route.Host)
-
-		// Check if OIDC authentication is required
-		if !entity.Empty(route.OidcProvider) {
-			// Wrap the request handler with OIDC middleware
-			oidcWrapped := h.oidcMiddleware(route, func(w http.ResponseWriter, r *http.Request) {
-				// Continue with normal request handling after auth
-				h.serveAuthenticatedRequest(w, r, targetAppId, routeType, ephemeralLabel, appName)
-			})
-			oidcWrapped(w, req)
-			return
-		}
 	} else if label, baseRoute, err := h.lookupEphemeralRoute(ctx, onlyHost); err == nil && baseRoute != nil {
 		// No exact or wildcard match, but stripping the first subdomain label
 		// matched an existing route — this is an ephemeral subdomain request.
@@ -524,14 +544,6 @@ func (h *Server) serveHTTPWithMetrics(w http.ResponseWriter, req *http.Request, 
 		targetAppId = baseRoute.App
 		routeType = "route"
 		ephemeralLabel = label
-
-		if !entity.Empty(baseRoute.OidcProvider) {
-			oidcWrapped := h.oidcMiddleware(route, func(w http.ResponseWriter, r *http.Request) {
-				h.serveAuthenticatedRequest(w, r, targetAppId, routeType, ephemeralLabel, appName)
-			})
-			oidcWrapped(w, req)
-			return
-		}
 	} else {
 		// No route found, try to find a default route
 		h.Log.Debug("no http route found, checking for default route", "host", onlyHost)
@@ -549,26 +561,22 @@ func (h *Server) serveHTTPWithMetrics(w http.ResponseWriter, req *http.Request, 
 			return
 		}
 
-		// Use the default route
+		route = defaultRoute
 		targetAppId = defaultRoute.App
 		routeType = "default"
 		h.Log.Debug("using default route", "host", onlyHost, "app", targetAppId)
-
-		// Check if OIDC authentication is required for default route
-		if !entity.Empty(defaultRoute.OidcProvider) {
-			// Update route reference
-			route = defaultRoute
-			// Wrap with OIDC middleware
-			oidcWrapped := h.oidcMiddleware(route, func(w http.ResponseWriter, r *http.Request) {
-				h.serveAuthenticatedRequest(w, r, targetAppId, routeType, ephemeralLabel, appName)
-			})
-			oidcWrapped(w, req)
-			return
-		}
 	}
 
-	// Continue with normal request handling
-	h.serveAuthenticatedRequest(w, req, targetAppId, routeType, ephemeralLabel, appName)
+	// Compose middleware chain: WAF → auth → serve
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		h.serveAuthenticatedRequest(w, r, targetAppId, routeType, ephemeralLabel, appName)
+	}
+
+	handler = h.authMiddleware(route, handler)
+
+	handler = h.wafMiddleware(route, handler)
+
+	handler(w, req)
 }
 
 // lookupEphemeralRoute checks whether the request host is an ephemeral
@@ -596,6 +604,41 @@ func (h *Server) lookupEphemeralRoute(ctx context.Context, host string) (string,
 	}
 
 	return label, route, nil
+}
+
+func (h *Server) authMiddleware(route *ingress_v1alpha.HttpRoute, next http.HandlerFunc) http.HandlerFunc {
+	if entity.Empty(route.AuthProvider) {
+		return next
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		resp, err := h.eac.Get(r.Context(), string(route.AuthProvider))
+		if err != nil {
+			h.Log.Error("failed to get auth provider entity", "error", err, "provider", route.AuthProvider)
+			http.Error(w, "Authentication service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
+		ent := resp.Entity().Entity()
+
+		switch {
+		case entity.Is(ent, ingress_v1alpha.KindOidcProvider):
+			// The oidc_provider entity backs both OIDC discovery clients
+			// and connector-based providers; dispatch on connector_type.
+			var op ingress_v1alpha.OidcProvider
+			op.Decode(ent)
+			if op.ConnectorType != "" && op.ConnectorType != "oidc" {
+				h.connectorMiddleware(route, ent, next)(w, r)
+			} else {
+				h.oidcMiddleware(route, ent, next)(w, r)
+			}
+		case entity.Is(ent, ingress_v1alpha.KindPasswordProvider):
+			h.passwordMiddleware(route, ent, next)(w, r)
+		default:
+			h.Log.Error("unknown auth provider kind", "provider", route.AuthProvider)
+			http.Error(w, "Authentication service unavailable", http.StatusServiceUnavailable)
+		}
+	}
 }
 
 // serveAuthenticatedRequest handles the request after authentication (if any)
@@ -938,6 +981,7 @@ func isProxyConnectionError(err error) bool {
 		var syscallErr *os.SyscallError
 		if errors.As(opErr.Err, &syscallErr) {
 			if errno, ok := syscallErr.Err.(syscall.Errno); ok {
+				//exhaustive:ignore syscall.Errno has ~130 members; default handles the rest
 				switch errno {
 				case syscall.ECONNREFUSED: // connection refused
 					return true
@@ -1182,11 +1226,8 @@ func (h *Server) AcquireTunnel(ctx context.Context, hostname, path string) (*Tun
 	if route != nil {
 		targetAppId = route.App
 
-		// Reject tunnels to apps that require OIDC authentication.
-		// OIDC auth flows require browser redirects which can't work
-		// over a tunneled WebSocket connection.
-		if !entity.Empty(route.OidcProvider) {
-			return nil, fmt.Errorf("tunneling not supported for OIDC-protected routes (host: %s)", onlyHost)
+		if !entity.Empty(route.AuthProvider) {
+			return nil, fmt.Errorf("tunneling not supported for auth-protected routes (host: %s)", onlyHost)
 		}
 	} else {
 		defaultRoute, err := h.ingressClient.LookupDefault(ctx)
@@ -1196,8 +1237,8 @@ func (h *Server) AcquireTunnel(ctx context.Context, hostname, path string) (*Tun
 		if defaultRoute == nil {
 			return nil, fmt.Errorf("no route found for %s", onlyHost)
 		}
-		if !entity.Empty(defaultRoute.OidcProvider) {
-			return nil, fmt.Errorf("tunneling not supported for OIDC-protected routes (host: %s)", onlyHost)
+		if !entity.Empty(defaultRoute.AuthProvider) {
+			return nil, fmt.Errorf("tunneling not supported for auth-protected routes (host: %s)", onlyHost)
 		}
 		targetAppId = defaultRoute.App
 	}

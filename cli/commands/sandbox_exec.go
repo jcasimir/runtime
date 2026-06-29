@@ -1,23 +1,28 @@
 package commands
 
 import (
-	"io"
-	"os"
-	"os/signal"
+	"fmt"
 	"strings"
 
-	"github.com/containerd/console"
-	"golang.org/x/sys/unix"
 	"miren.dev/runtime/api/exec/exec_v1alpha"
 	"miren.dev/runtime/pkg/rpc/stream"
 )
 
 func SandboxExec(ctx *Context, opts struct {
 	ConfigCentric
-	Id string `short:"i" long:"id" description:"Sandbox ID" default:"miren-sandbox"`
+	Id string `short:"i" long:"id" description:"Sandbox ID"`
 
 	Args []string `rest:"true"`
 }) error {
+	id := opts.Id
+	args := opts.Args
+	if id == "" {
+		if len(args) == 0 {
+			return fmt.Errorf("sandbox ID is required (pass as first positional arg or via --id)")
+		}
+		id, args = args[0], args[1:]
+	}
+
 	cl, err := ctx.RPCClient("dev.miren.runtime/exec")
 	if err != nil {
 		return err
@@ -25,72 +30,20 @@ func SandboxExec(ctx *Context, opts struct {
 
 	sec := exec_v1alpha.NewSandboxExecClient(cl)
 
-	winCh := make(chan os.Signal, 1)
-	winUpdates := make(chan *exec_v1alpha.WindowSize, 1)
-
 	opt := new(exec_v1alpha.ShellOptions)
+	opt.SetCommand(args)
 
-	var (
-		in  io.Reader
-		out io.Writer
-	)
-
-	opt.SetCommand(opts.Args)
-
-	// Set up interactive console if available, otherwise use standard streams
-	if con, err := console.ConsoleFromFile(os.Stdin); err == nil {
-		in = con
-		out = con
-
-		if csz, err := con.Size(); err == nil {
-			ws := new(exec_v1alpha.WindowSize)
-			ws.SetHeight(int32(csz.Height))
-			ws.SetWidth(int32(csz.Width))
-			opt.SetWinSize(ws)
-		}
-
-		defer con.Reset()
-		con.SetRaw()
-
-		signal.Notify(winCh, unix.SIGWINCH)
-		defer signal.Stop(winCh)
-
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-winCh:
-					csz, err := con.Size()
-					if err != nil {
-						ctx.Log.Error("failed to get console size", "error", err)
-						continue
-					}
-
-					ws := new(exec_v1alpha.WindowSize)
-					ws.SetHeight(int32(csz.Height))
-					ws.SetWidth(int32(csz.Width))
-
-					winUpdates <- ws
-				}
-			}
-		}()
-	} else {
-		in = os.Stdin
-		out = os.Stdout
-	}
-
-	input := stream.ServeReader(ctx, in)
-	output := stream.ServeWriter(ctx, out)
-	winUS := stream.ChanReader(winUpdates)
+	in, out, winUpdates, cleanup := setupExecIO(ctx, opt)
+	defer cleanup()
 
 	res, err := sec.Exec(
 		ctx,
-		"id", opts.Id,
-		strings.Join(opts.Args, " "),
+		"id", id,
+		strings.Join(args, " "),
 		opt,
-		input, output,
-		winUS,
+		stream.ServeReader(ctx, in),
+		stream.ServeWriter(ctx, out),
+		stream.ChanReader(winUpdates),
 	)
 	if err != nil {
 		return err

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -38,6 +37,7 @@ import (
 	"miren.dev/runtime/pkg/imagerefs"
 	"miren.dev/runtime/pkg/netdb"
 	"miren.dev/runtime/pkg/netutil"
+	"miren.dev/runtime/pkg/workloadidentity"
 
 	compute "miren.dev/runtime/api/compute/compute_v1alpha"
 	"miren.dev/runtime/api/core/core_v1alpha"
@@ -52,6 +52,14 @@ const (
 )
 
 var sandboxImage = imagerefs.Pause
+
+// cleanupAttach is the cio.Attach to pass to container.Task when we're
+// retrieving a task purely to delete it. The non-nil attach makes containerd
+// populate t.io with a FIFO closer that removes /run/containerd/fifo/<n>;
+// passing nil leaves t.io nil and task.Delete silently leaks the directory.
+func cleanupAttach() cio.Attach {
+	return cio.NewAttach()
+}
 
 type containerPorts struct {
 	Ports []observability.BoundPort
@@ -75,6 +83,7 @@ type SandboxControllerDeps struct {
 	StatusMon      *observability.StatusMonitor
 	Resolver       netresolve.Resolver
 	Metrics        *Metrics
+	WorkloadIssuer workloadidentity.TokenIssuer
 }
 
 type SandboxController struct {
@@ -99,8 +108,12 @@ type SandboxController struct {
 
 	StatusMon *observability.StatusMonitor
 
-	Resolver netresolve.Resolver
-	Metrics  *Metrics
+	Resolver       netresolve.Resolver
+	Metrics        *Metrics
+	WorkloadIssuer workloadidentity.TokenIssuer
+
+	tokenRefresher *tokenRefresher
+	tokenSecrets   *tokenSecretRegistry
 
 	topCtx context.Context
 	cancel func()
@@ -118,6 +131,7 @@ type SandboxController struct {
 
 	watchdog      *ContainerWatchdog
 	imageWatchdog *ImageWatchdog
+	ipReconciler  *IPReconciler
 
 	// writeTracker tracks entity write revisions to skip self-generated watch events
 	writeTracker controller.WriteTracker
@@ -175,6 +189,7 @@ func NewSandboxController(cfg SandboxControllerDeps) (*SandboxController, error)
 		StatusMon:      cfg.StatusMon,
 		Resolver:       cfg.Resolver,
 		Metrics:        cfg.Metrics,
+		WorkloadIssuer: cfg.WorkloadIssuer,
 	}, nil
 }
 
@@ -204,6 +219,8 @@ func (c *SandboxController) SetPortStatus(id string, port observability.BoundPor
 		ports.Ports = slices.DeleteFunc(ports.Ports, func(p observability.BoundPort) bool {
 			return p == port
 		})
+	case observability.PortStatusActive:
+		// Liveness signal only; does not change the bound set.
 	}
 
 	c.portCond.Broadcast()
@@ -258,6 +275,17 @@ func (c *SandboxController) WaitForPort(ctx context.Context, id string, port int
 	}
 }
 
+// diagnoseListening reports the ports a container is actually listening on,
+// split into routable and loopback-only sets. Returns ok=false when the port
+// monitor is unavailable or the container's pid is unknown. Shared by the
+// legacy create flow and the saga ops wrapper.
+func (c *SandboxController) diagnoseListening(id string) (routable []int, loopback []int, ok bool) {
+	if c.portMonitor == nil {
+		return nil, nil, false
+	}
+	return c.portMonitor.DiagnoseListening(id)
+}
+
 // mapLegacyProtocol converts legacy PortProtocol values to SandboxSpecContainerPortProtocol
 func mapLegacyProtocol(legacy compute.PortProtocol) compute.SandboxSpecContainerPortProtocol {
 	switch legacy {
@@ -303,9 +331,11 @@ func (c *SandboxController) reconcileSandboxesOnBoot(ctx context.Context) error 
 		}
 		runningCount++
 
+		shortID := entityShortID(e.Entity())
+
 		// Reattach logs to pause container
 		pauseID := pauseContainerId(sb.ID)
-		if err := c.reattachLogs(ctx, &sb, pauseID, ""); err != nil {
+		if err := c.reattachLogs(ctx, &sb, pauseID, "", shortID); err != nil {
 			c.Log.Warn("failed to reattach logs to pause container",
 				"sandbox_id", sb.ID,
 				"pause_container_id", pauseID,
@@ -329,7 +359,7 @@ func (c *SandboxController) reconcileSandboxesOnBoot(ctx context.Context) error 
 			containerID := fmt.Sprintf("%s-%s", containerPrefix(sb.ID), container.Name)
 
 			// Reattach logs for this subcontainer
-			if err := c.reattachLogs(ctx, &sb, containerID, container.Name); err != nil {
+			if err := c.reattachLogs(ctx, &sb, containerID, container.Name, shortID); err != nil {
 				c.Log.Warn("failed to reattach logs to subcontainer",
 					"sandbox_id", sb.ID,
 					"container_name", container.Name,
@@ -378,6 +408,41 @@ func (c *SandboxController) reconcileSandboxesOnBoot(ctx context.Context) error 
 						c.Log.Debug("re-reserved IP for surviving sandbox",
 							"sandbox_id", sb.ID, "ip", addr)
 					}
+				}
+			}
+
+			// Re-register with token refresher so tokens keep getting renewed. Only
+			// sandboxes that actually use workload identity have an identity-token file;
+			// skip the rest so the refresh loop doesn't spew write errors for sandboxes
+			// that predate workload identity.
+			if c.tokenRefresher != nil {
+				tokenPath := c.sandboxPath(&sb, "identity-token")
+				if _, err := os.Stat(tokenPath); err == nil {
+					appName := c.resolveAppName(ctx, &sb)
+					c.tokenRefresher.register(sb.ID.String(), tokenPath, appName)
+					c.Log.Debug("re-registered sandbox for token refresh",
+						"sandbox_id", sb.ID, "app", appName)
+				}
+			}
+
+			// Re-register the token-request secret so the still-running sandbox keeps
+			// authenticating to the token server. The in-memory registry starts empty
+			// after a restart; without this the sandbox's token requests 403 forever
+			// until it is restarted (MIR-1235).
+			if c.tokenSecrets != nil {
+				secretPath := c.sandboxPath(&sb, tokenSecretFilename)
+				secret, ok, err := loadTokenSecret(secretPath)
+				switch {
+				case err != nil:
+					c.Log.Warn("failed to load persisted token secret during boot reconciliation",
+						"sandbox_id", sb.ID, "error", err)
+				case !ok:
+					c.Log.Debug("no persisted token secret for surviving sandbox; cannot re-register",
+						"sandbox_id", sb.ID)
+				default:
+					c.tokenSecrets.register(sb.ID.String(), secret)
+					c.Log.Debug("re-registered token secret for surviving sandbox",
+						"sandbox_id", sb.ID)
 				}
 			}
 		}
@@ -438,6 +503,16 @@ func (c *SandboxController) Init(ctx context.Context) error {
 		return err
 	}
 
+	// Drop any bridge addresses, NAT rules, or POSTROUTING jumps left over
+	// from a previous flannel lease era. Without this, a runner whose lease
+	// rotated (typically after >24h offline) ends up with two pod subnets
+	// pinned to the same bridge and a NAT chain whose ACCEPT rules end up
+	// after the catch-all MASQUERADE (MIR-1108).
+	err = network.ReconcileBridgeAddresses(c.Log, link, bc.Addresses)
+	if err != nil {
+		return err
+	}
+
 	err = network.MasqueradeEndpoint(ep)
 	if err != nil {
 		return err
@@ -446,6 +521,13 @@ func (c *SandboxController) Init(ctx context.Context) error {
 	err = c.NetServ.SetupDNS(c.topCtx, bc)
 	if err != nil {
 		return err
+	}
+
+	// Initialize token refresh state before reconcile so surviving sandboxes
+	// can be re-registered during boot reconciliation.
+	if c.WorkloadIssuer != nil {
+		c.tokenRefresher = newTokenRefresher()
+		c.tokenSecrets = newTokenSecretRegistry()
 	}
 
 	// Reconcile sandboxes after containerd restart
@@ -485,6 +567,28 @@ func (c *SandboxController) Init(ctx context.Context) error {
 	}
 	c.imageWatchdog.Start(c.topCtx)
 
+	// Initialize and start the IP reconciler, which keeps netdb lease bookkeeping
+	// in agreement with the addresses actually live on the bridge (MIR-1238). Its
+	// initial run also re-reserves the IPs of containers that survived a restart.
+	if c.Subnet != nil {
+		c.ipReconciler = &IPReconciler{
+			Log:    c.Log.With("module", "ip-reconciler"),
+			Subnet: c.Subnet,
+			LiveIPs: func(ctx context.Context) (map[netip.Addr]bool, error) {
+				return c.liveBridgeIPs(ctx)
+			},
+			// CheckInterval is left at the IPReconciler default (see Start).
+		}
+		c.ipReconciler.Start(c.topCtx)
+	}
+
+	// Start workload identity token refresh loop and token request server
+	// (tokenRefresher and tokenSecrets were created earlier, before reconcile)
+	if c.WorkloadIssuer != nil {
+		go c.runTokenRefresh(c.topCtx)
+		go c.startTokenServer(c.topCtx)
+	}
+
 	return nil
 }
 
@@ -513,6 +617,10 @@ func (c *SandboxController) Close() error {
 
 	if c.imageWatchdog != nil {
 		c.imageWatchdog.Stop()
+	}
+
+	if c.ipReconciler != nil {
+		c.ipReconciler.Stop()
 	}
 
 	c.running.Wait()
@@ -672,77 +780,127 @@ func (c *SandboxController) isContainerHealthy(ctx context.Context, containerID 
 		// We don't expect paused sandboxes in normal operation
 		c.Log.Debug("task in paused/pausing state, marking unhealthy", "id", containerID, "status", status.Status)
 		return false
+	case containerd.Unknown:
+		// Unknown status is unhealthy.
+		fallthrough
 	default:
-		// Unknown or any other status is unhealthy
+		// Any other status is unhealthy
 		c.Log.Debug("task in unknown/unhealthy state", "id", containerID, "status", status.Status)
 		return false
 	}
 }
 
-// checkNetworkHealth verifies that a sandbox is reachable on its network address
-// Returns true if the sandbox has no ports (background workers) or if at least one port is reachable
-// Returns false if the sandbox has ports but none are reachable
+// checkNetworkHealth verifies that a sandbox's app is still listening on at
+// least one declared TCP port. Returns true for sandboxes with no exposed
+// TCP ports (background workers, UDP-only) or no allocated network. Returns
+// false if TCP ports are declared but none are in LISTEN state inside the
+// pause container's network namespace.
+//
+// The check reads /proc/<pause-pid>/net/tcp{,6} rather than dialing the pod
+// IP from the host. Host-to-pod TCP dials traverse the bridge's POSTROUTING
+// chain and can be intercepted by MASQUERADE, breaking connection tracking
+// on the dialing host. PortMonitor switched away from dials for the same
+// reason (commit 63661df3); MIR-1108 is the same class of bug here.
+//
+// Only TCP ports are probed because /proc/net/tcp does not expose UDP
+// listeners; a UDP-only sandbox would be wrongly killed if we treated UDP
+// ports as health-relevant.
 func (c *SandboxController) checkNetworkHealth(ctx context.Context, sb *compute.Sandbox) bool {
-	// Skip if sandbox has no network allocated
 	if len(sb.Network) == 0 {
 		c.Log.Debug("sandbox has no network, skipping network health check", "sandbox_id", sb.ID)
 		return true
 	}
 
-	// Parse network address to get IP
-	addr := sb.Network[0].Address
-	ip, err := netutil.ParseNetworkAddress(addr)
+	hasTCPPorts := false
+	for _, container := range sb.Spec.Container {
+		for _, p := range container.Port {
+			if portIsTCP(p) {
+				hasTCPPorts = true
+				break
+			}
+		}
+		if hasTCPPorts {
+			break
+		}
+	}
+	if !hasTCPPorts {
+		c.Log.Debug("sandbox has no exposed TCP ports, skipping network health check", "sandbox_id", sb.ID)
+		return true
+	}
+
+	pauseID := pauseContainerId(sb.ID)
+	pid, err := c.pauseContainerPID(ctx, pauseID)
 	if err != nil {
-		c.Log.Debug("failed to parse sandbox address", "sandbox_id", sb.ID, "address", addr, "error", err)
+		c.Log.Debug("failed to resolve pause container PID for health check",
+			"sandbox_id", sb.ID, "pause_id", pauseID, "error", err)
 		return false
 	}
 
-	// Iterate over containers, trying each container's first port until one succeeds
-	checkedCount := 0
-	dialer := &net.Dialer{
-		Timeout: 2 * time.Second,
-	}
-
 	for _, container := range sb.Spec.Container {
-		if len(container.Port) == 0 {
-			continue
+		for _, p := range container.Port {
+			if !portIsTCP(p) {
+				continue
+			}
+			port := int(p.Port)
+			if checkPort(pid, port) {
+				c.Log.Debug("network health check passed",
+					"sandbox_id", sb.ID, "container_name", container.Name, "port", port)
+				return true
+			}
+			c.Log.Debug("network health check found no listener for port",
+				"sandbox_id", sb.ID, "container_name", container.Name, "port", port)
 		}
-
-		// Check first port for this container
-		port := container.Port[0].Port
-		address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
-		checkedCount++
-
-		conn, err := dialer.DialContext(ctx, "tcp", address)
-		if err != nil {
-			c.Log.Debug("network health check failed for port",
-				"sandbox_id", sb.ID,
-				"container_name", container.Name,
-				"address", address,
-				"error", err)
-			continue
-		}
-		conn.Close()
-
-		// At least one port is reachable, network is healthy
-		c.Log.Debug("network health check passed", "sandbox_id", sb.ID, "address", address)
-		return true
 	}
 
-	// If no ports were checked (background worker), consider it healthy
-	if checkedCount == 0 {
-		c.Log.Debug("sandbox has no exposed ports, skipping network health check", "sandbox_id", sb.ID)
-		return true
+	// An app that ignored $PORT and bound a different port has that port
+	// recorded as an observed bound_port (and we route to it). Treat that port
+	// as health-relevant too, or the periodic check would kill a sandbox that is
+	// running fine on the port we're actually sending traffic to.
+	for _, bp := range sb.BoundPort {
+		port := int(bp.Port)
+		if checkPort(pid, port) {
+			c.Log.Debug("network health check passed on observed bound port",
+				"sandbox_id", sb.ID, "port", port)
+			return true
+		}
+		c.Log.Debug("network health check found no listener for observed bound port",
+			"sandbox_id", sb.ID, "port", port)
 	}
 
-	// All checked ports failed
 	return false
+}
+
+// portIsTCP returns true for ports declared as TCP. Empty Protocol defaults
+// to TCP (matches mapLegacyProtocol), so ports without a protocol set are
+// treated as TCP as well.
+func portIsTCP(p compute.SandboxSpecContainerPort) bool {
+	return p.Protocol == "" || p.Protocol == compute.SandboxSpecContainerPortTCP
+}
+
+// pauseContainerPID returns the PID of the pause container's task. The
+// pause container shares its network namespace with all sub-containers,
+// so its /proc/<pid>/net/tcp{,6} reflects the listening sockets of the
+// app processes inside the sandbox.
+func (c *SandboxController) pauseContainerPID(ctx context.Context, pauseID string) (int, error) {
+	ctx = namespaces.WithNamespace(ctx, c.Namespace)
+
+	container, err := c.CC.LoadContainer(ctx, pauseID)
+	if err != nil {
+		return 0, fmt.Errorf("loading pause container: %w", err)
+	}
+
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("getting pause task: %w", err)
+	}
+
+	return int(task.Pid()), nil
 }
 
 // reattachLogs reattaches log consumers to a container's task after controller restart.
 // This is critical to prevent stdout/stderr buffers from filling up and blocking the process.
 // containerName should be empty string for the pause container, or the subcontainer name otherwise.
-func (c *SandboxController) reattachLogs(ctx context.Context, sb *compute.Sandbox, containerID string, containerName string) error {
+func (c *SandboxController) reattachLogs(ctx context.Context, sb *compute.Sandbox, containerID, containerName, shortID string) error {
 	ctx = namespaces.WithNamespace(ctx, c.Namespace)
 
 	container, err := c.CC.LoadContainer(ctx, containerID)
@@ -751,7 +909,7 @@ func (c *SandboxController) reattachLogs(ctx context.Context, sb *compute.Sandbo
 	}
 
 	// Create log consumer for this container
-	sl := c.logConsumer(sb, containerName)
+	sl := c.logConsumer(sb, containerName, shortID)
 
 	// Reattach to the existing task with our log consumer
 	// This drains stdout/stderr and prevents the process from blocking on writes
@@ -870,6 +1028,9 @@ func (c *SandboxController) Create(ctx context.Context, co *compute.Sandbox, met
 		}
 
 		return c.createSandbox(ctx, co, meta, false)
+	case compute.NOT_READY:
+		// Transient boot state; nothing to reconcile until it resolves.
+		fallthrough
 	default:
 		c.Log.Warn("ignoring sandbox status", "status", co.Status)
 		return nil
@@ -886,6 +1047,21 @@ func (c *SandboxController) createSandbox(ctx context.Context, co *compute.Sandb
 			c.Log.Error("sandbox boot failed, marking DEAD", "id", co.ID, "err", err)
 			co.Status = compute.DEAD
 			meta.Update(co.Encode())
+
+			// Boot can fail after we've already bound a disk lease (e.g. a
+			// later port health check fails). Unlike the graceful StopSandbox
+			// path, this defer doesn't tear the sandbox down, so release any
+			// leases here — otherwise the lease stays status.bound pointing at
+			// a dead sandbox and wedges every replacement until it times out.
+			// Use a non-cancelled context: the boot error may itself be a
+			// cancellation, and we still want the lease freed. Bound it with a
+			// timeout so a hung release can't pin the reconcile worker, matching
+			// the cleanup defer below.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if relErr := c.ReleaseDiskLeases(cleanupCtx, co.ID); relErr != nil {
+				c.Log.Error("failed to release disk leases after boot failure", "id", co.ID, "err", relErr)
+			}
 		}
 	}()
 
@@ -964,7 +1140,7 @@ func (c *SandboxController) createSandbox(ctx context.Context, co *compute.Sandb
 		}
 	}()
 
-	task, err := c.BootInitialTask(ctx, co, ep, container)
+	task, err := c.BootInitialTask(ctx, co, ep, container, meta.ShortId())
 	if err != nil {
 		return err
 	}
@@ -989,11 +1165,11 @@ func (c *SandboxController) createSandbox(ctx context.Context, co *compute.Sandb
 	}
 
 	attrs := map[string]string{
-		"sandbox": co.ID.String(),
+		"miren.sandbox": co.ID.String(),
 	}
 
 	if co.Spec.Version != "" {
-		attrs["version"] = co.Spec.Version.String()
+		attrs["miren.version"] = co.Spec.Version.String()
 	}
 
 	for _, lbl := range co.Spec.LogAttribute {
@@ -1008,15 +1184,51 @@ func (c *SandboxController) createSandbox(ctx context.Context, co *compute.Sandb
 	c.Log.Info("sandbox started", "id", co.ID, "namespace", c.Namespace)
 
 	// Wait for ports to verify network connectivity before marking RUNNING.
-	// Fail-hard: if ports never bind, fail the sandbox so pool can retry.
+	// Fail-hard: if ports never bind, fail the sandbox so pool can retry. An app
+	// that ignored $PORT and bound a different port is detected here and routed
+	// to its actual port instead of being killed.
 	// Default 15s; spec.PortWaitTimeout overrides for slow-cold-init images.
 	portTimeout := resolvePortWaitTimeout(co.Spec.PortWaitTimeout)
+	var remapped bool
 	for _, wp := range waitPorts {
 		c.Log.Info("waiting for ports to be bound", "id", cid, "port", wp.Port, "timeout", portTimeout)
-		if err := c.WaitForPort(ctx, wp.ID, wp.Port, portTimeout); err != nil {
-			return fmt.Errorf("sandbox failed network health check: port %d not reachable after %v: %w",
-				wp.Port, portTimeout, err)
+		err := c.WaitForPort(ctx, wp.ID, wp.Port, portTimeout)
+		if err == nil {
+			continue // configured port bound — the normal case
 		}
+		if ctx.Err() != nil {
+			// We're shutting down, not looking at a port mismatch — skip
+			// diagnosis so we don't emit misleading "listening elsewhere" events.
+			return err
+		}
+
+		// The configured port never bound within the timeout. See what the app
+		// actually listened on: route to it if it bound a single other port, or
+		// fail with a message that names the real port.
+		routable, loopback, ok := c.diagnoseListening(wp.ID)
+		if alt, single := singleAlternativePort(routable, wp.Port); ok && single {
+			if remapped {
+				// A second configured port diverged. Routing only follows one
+				// observed port, so don't guess — fail loudly instead.
+				msg := fmt.Sprintf("more than one configured port came up on a different port; "+
+					"can't safely auto-route (latest was :%d)", alt)
+				c.EmitSandboxEvent(co, meta.ShortId(), msg)
+				return fmt.Errorf("sandbox failed network health check: %s", msg)
+			}
+			remapped = true
+			c.Log.Warn("app bound a port other than the configured one; routing to it",
+				"id", co.ID, "configured_port", wp.Port, "observed_port", alt)
+			c.EmitSandboxEvent(co, meta.ShortId(), fmt.Sprintf(
+				"app is listening on :%d, not the configured :%d; routing to :%d. "+
+					"Set $PORT or [services.web] port to :%d to silence this.",
+				alt, wp.Port, alt, alt))
+			co.BoundPort = append(co.BoundPort, compute.BoundPort{Port: int64(alt)})
+			continue
+		}
+
+		msg := describePortFailure(wp.Port, routable, loopback)
+		c.EmitSandboxEvent(co, meta.ShortId(), msg)
+		return fmt.Errorf("sandbox failed network health check: %s", msg)
 	}
 
 	// If we're doing a recreate, then we know it's safe to set it to running.
@@ -1235,7 +1447,9 @@ func (c *SandboxController) AllocateNetwork(
 		}
 
 	} else {
-		ep, err = network.AllocateOnBridge(c.Bridge, c.Subnet)
+		ep, err = network.AllocateOnBridge(c.Log, c.Bridge, c.Subnet, func() (map[netip.Addr]bool, error) {
+			return c.liveBridgeIPs(ctx)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -1249,6 +1463,48 @@ func (c *SandboxController) AllocateNetwork(
 	c.Log.Debug("allocated network endpoint", "bridge", c.Bridge, "addresses", ep.Addresses)
 
 	return ep, nil
+}
+
+// liveBridgeIPs returns the set of bridge IP addresses currently assigned to
+// sandbox containers, read from their containerd labels. It is the in-use set
+// used by AllocateOnBridge to avoid handing out an address that netdb's lease
+// bookkeeping has lost track of but a sandbox is still using (MIR-1238). The
+// labels are the same source the watchdog trusts and require no netns entry.
+//
+// It does not inspect task state, so a container whose task has exited but whose
+// containerd record still exists (e.g. between SIGKILL and removeContainer)
+// still contributes its IP. This is deliberately conservative: counting a
+// not-quite-gone address as live at worst keeps it reserved for one extra
+// reconciler cycle, whereas missing a live address risks a duplicate assignment.
+func (c *SandboxController) liveBridgeIPs(ctx context.Context) (map[netip.Addr]bool, error) {
+	ctx = namespaces.WithNamespace(ctx, c.Namespace)
+
+	containerList, err := c.CC.Containers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	live := make(map[netip.Addr]bool)
+	for _, cont := range containerList {
+		labels, err := cont.Labels(ctx)
+		if err != nil {
+			c.Log.Warn("failed to read container labels while enumerating live IPs", "id", cont.ID(), "error", err)
+			continue
+		}
+		for label, value := range labels {
+			if !strings.HasPrefix(label, "runtime.computer/ip") {
+				continue
+			}
+			addr, err := netip.ParseAddr(value)
+			if err != nil {
+				c.Log.Warn("failed to parse IP from container label", "id", cont.ID(), "label", label, "value", value, "error", err)
+				continue
+			}
+			live[addr] = true
+		}
+	}
+
+	return live, nil
 }
 
 func (c *SandboxController) setupHosts(sb *compute.Sandbox, name string, ep *network.EndpointConfig) error {
@@ -1481,23 +1737,34 @@ func (c *SandboxController) writeResolve(path string, ep *network.EndpointConfig
 // streaming (via logConsumer) and runtime lifecycle events (via
 // EmitSandboxEvent) share this so the two sources appear with the
 // same identity and metadata in the log stream.
-func sandboxLogMeta(sb *compute.Sandbox, container string) (string, map[string]string) {
+func entityShortID(e entity.AttrGetter) string {
+	if attr, ok := e.Get(entity.DBShortId); ok {
+		return attr.Value.String()
+	}
+	return ""
+}
+
+func sandboxLogMeta(sb *compute.Sandbox, container, shortID string) (string, map[string]string) {
 	le := sb.Spec.LogEntity
 	if le == "" {
 		le = sb.ID.String()
 	}
 
 	attrs := map[string]string{
-		"sandbox": sb.ID.String(),
-		"source":  strings.TrimPrefix(sb.ID.String(), "sandbox/"),
+		"miren.sandbox": sb.ID.String(),
+		"source":        strings.TrimPrefix(sb.ID.String(), "sandbox/"),
+	}
+
+	if shortID != "" {
+		attrs["miren.short_id"] = shortID
 	}
 
 	if container != "" {
-		attrs["container"] = container
+		attrs["miren.container"] = container
 	}
 
 	if sb.Spec.Version != "" {
-		attrs["version"] = sb.Spec.Version.String()
+		attrs["miren.version"] = sb.Spec.Version.String()
 	}
 
 	for _, lbl := range sb.Spec.LogAttribute {
@@ -1507,8 +1774,8 @@ func sandboxLogMeta(sb *compute.Sandbox, container string) (string, map[string]s
 	return le, attrs
 }
 
-func (c *SandboxController) logConsumer(sb *compute.Sandbox, container string) *SandboxLogs {
-	le, attrs := sandboxLogMeta(sb, container)
+func (c *SandboxController) logConsumer(sb *compute.Sandbox, container, shortID string) *SandboxLogs {
+	le, attrs := sandboxLogMeta(sb, container, shortID)
 	return NewSandboxLogs(c.Log, le, attrs, c.LogWriter)
 }
 
@@ -1517,8 +1784,8 @@ func (c *SandboxController) logConsumer(sb *compute.Sandbox, container string) *
 // stdio pipeline uses. Events go on the Stderr stream so operators see
 // them in `miren logs sandbox <id>` and can distinguish them from
 // application output via the [miren] prefix.
-func (c *SandboxController) EmitSandboxEvent(sb *compute.Sandbox, line string) {
-	le, attrs := sandboxLogMeta(sb, "")
+func (c *SandboxController) EmitSandboxEvent(sb *compute.Sandbox, shortID, line string) {
+	le, attrs := sandboxLogMeta(sb, "", shortID)
 	err := c.LogWriter.WriteEntry(le, observability.LogEntry{
 		Timestamp:  time.Now(),
 		Stream:     observability.Stderr,
@@ -1536,10 +1803,11 @@ func (c *SandboxController) BootInitialTask(
 	sb *compute.Sandbox,
 	ep *network.EndpointConfig,
 	container containerd.Container,
+	shortID string,
 ) (containerd.Task, error) {
 	c.Log.Info("booting sandbox task")
 
-	sl := c.logConsumer(sb, "")
+	sl := c.logConsumer(sb, "", shortID)
 
 	task, err := container.NewTask(ctx, cio.NewCreator(
 		cio.WithStreams(nil, sl, sl.Stderr())))
@@ -1602,8 +1870,7 @@ func (c *SandboxController) CleanupContainer(ctx context.Context, cont container
 		c.portMonitor.StopMonitoring(containerID)
 	}
 
-	// Try to kill and delete any task first
-	task, err := cont.Task(ctx, nil)
+	task, err := cont.Task(ctx, cleanupAttach())
 	if err == nil && task != nil {
 		task.Kill(ctx, unix.SIGKILL)
 		_, err = task.Delete(ctx, containerd.WithProcessKill)
@@ -1710,7 +1977,7 @@ func (c *SandboxController) BootContainers(
 
 		cgroups[container.Name] = spec.Linux.CgroupsPath
 
-		sl := c.logConsumer(sb, container.Name)
+		sl := c.logConsumer(sb, container.Name, meta.ShortId())
 
 		// Build cio options based on container spec
 		var cioOpts []cio.Opt
@@ -1992,6 +2259,30 @@ func (c *SandboxController) buildSubContainerSpec(
 		})
 	}
 
+	// Inject workload identity token
+	if c.WorkloadIssuer != nil {
+		appName := c.resolveAppName(ctx, sb)
+		token, tokenErr := c.WorkloadIssuer.IssueToken(appName, sb.ID.String())
+		if tokenErr != nil {
+			c.Log.Warn("failed to generate workload identity token", "sandbox", sb.ID, "error", tokenErr)
+		} else {
+			tokenPath := c.sandboxPath(sb, "identity-token")
+			if writeErr := atomicWriteFile(tokenPath, []byte(token), 0644); writeErr != nil {
+				c.Log.Warn("failed to write workload identity token", "sandbox", sb.ID, "error", writeErr)
+			} else {
+				mounts = append(mounts, specs.Mount{
+					Destination: "/var/run/miren/identity-token",
+					Type:        "bind",
+					Source:      tokenPath,
+					Options:     []string{"rbind", "ro"},
+				})
+				if c.tokenRefresher != nil {
+					c.tokenRefresher.register(sb.ID.String(), tokenPath, appName)
+				}
+			}
+		}
+	}
+
 	// Extract instance number from metadata labels and inject MIREN_INSTANCE_NUM
 	envVars := co.Env
 	var md core_v1alpha.Metadata
@@ -2000,6 +2291,31 @@ func (c *SandboxController) buildSubContainerSpec(
 	if instanceStr, ok := md.Labels.Get("instance"); ok {
 		envVars = append([]string{fmt.Sprintf("MIREN_INSTANCE_NUM=%s", instanceStr)}, envVars...)
 		c.Log.Debug("injected instance number into container env", "sandbox_id", sb.ID, "container", co.Name, "instance", instanceStr)
+	}
+
+	if c.WorkloadIssuer != nil {
+		envVars = append(envVars,
+			"MIREN_IDENTITY_TOKEN_PATH=/var/run/miren/identity-token",
+			fmt.Sprintf("MIREN_OIDC_ISSUER_URL=%s", c.WorkloadIssuer.IssuerURL()),
+			fmt.Sprintf("MIREN_IDENTITY_TOKEN_URL=http://%s:%d/v1/token", c.Subnet.Router().Addr(), tokenServerPort),
+		)
+		if c.tokenSecrets != nil && len(ep.Addresses) > 0 {
+			secret, secretErr := generateTokenSecret()
+			if secretErr != nil {
+				c.Log.Warn("failed to generate token request secret", "sandbox", sb.ID, "error", secretErr)
+			} else {
+				c.tokenSecrets.register(sb.ID.String(), secret)
+				envVars = append(envVars, fmt.Sprintf("MIREN_IDENTITY_TOKEN_SECRET=%s", secret))
+
+				// Persist the secret host-side so it can be re-registered after a
+				// controller/token-server restart. Without this the running sandbox's
+				// token requests 403 forever once the in-memory registry is lost.
+				secretPath := c.sandboxPath(sb, tokenSecretFilename)
+				if writeErr := writeTokenSecret(secretPath, secret); writeErr != nil {
+					c.Log.Warn("failed to persist token request secret", "sandbox", sb.ID, "error", writeErr)
+				}
+			}
+		}
 	}
 
 	specOpts := []oci.SpecOpts{
@@ -2170,7 +2486,7 @@ func (c *SandboxController) DestroySubContainers(ctx context.Context, id entity.
 
 	for i := range containers {
 		info := &containers[i]
-		task, err := info.container.Task(ctx, nil)
+		task, err := info.container.Task(ctx, cleanupAttach())
 		if err != nil {
 			c.Log.Debug("no task found for container", "id", info.id)
 			continue
@@ -2287,6 +2603,19 @@ cleanup:
 
 func (c *SandboxController) Delete(ctx context.Context, id entity.Id, sb *compute.Sandbox) error {
 	c.Log.Debug("delete callback received, cleaning up sandbox", "id", id)
+	if c.tokenRefresher != nil {
+		c.tokenRefresher.unregister(id.String())
+	}
+	if c.tokenSecrets != nil {
+		c.tokenSecrets.unregister(id.String())
+		// Best-effort removal of the persisted secret. StopSandbox also wipes the whole
+		// sandbox dir, but removing the sensitive secret here ensures it doesn't linger
+		// if StopSandbox errors out before reaching its dir cleanup.
+		secretPath := filepath.Join(c.Tempdir, "containerd", id.PathSafe(), tokenSecretFilename)
+		if err := os.Remove(secretPath); err != nil && !os.IsNotExist(err) {
+			c.Log.Warn("failed to remove persisted token secret", "sandbox", id, "error", err)
+		}
+	}
 	if sb != nil {
 		c.UnconfigureFirewall(sb)
 	}
@@ -2390,7 +2719,7 @@ func (c *SandboxController) StopSandbox(ctx context.Context, id entity.Id) error
 	// Delete pause container
 	c.Log.Debug("deleting pause container", "id", id)
 	if container != nil {
-		task, err := container.Task(ctx, nil)
+		task, err := container.Task(ctx, cleanupAttach())
 		if err != nil {
 			if !errdefs.IsNotFound(err) {
 				c.Log.Error("failed to get pause task", "id", id, "err", err)
@@ -2565,4 +2894,31 @@ func (c *SandboxController) Periodic(ctx context.Context, timeHorizon time.Durat
 	}
 
 	return nil
+}
+
+func (c *SandboxController) resolveAppName(ctx context.Context, sb *compute.Sandbox) string {
+	if sb.Spec.Version == "" {
+		return ""
+	}
+
+	versionResp, err := c.EAC.Get(ctx, sb.Spec.Version.String())
+	if err != nil {
+		return ""
+	}
+
+	var version core_v1alpha.AppVersion
+	version.Decode(versionResp.Entity().Entity())
+
+	if version.App == "" {
+		return ""
+	}
+
+	appResp, err := c.EAC.Get(ctx, version.App.String())
+	if err != nil {
+		return ""
+	}
+
+	var appMeta core_v1alpha.Metadata
+	appMeta.Decode(appResp.Entity().Entity())
+	return appMeta.Name
 }

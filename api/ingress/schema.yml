@@ -15,9 +15,12 @@ kinds:
       type: bool
       indexed: true
       doc: Whether this is the default route for routing
-    oidc_provider:
+    waf_profile:
       type: ref
-      doc: Reference to an OIDC provider for authentication
+      doc: Reference to a WAF profile for request filtering
+    auth_provider:
+      type: ref
+      doc: Reference to an auth provider (OIDC or password) for authentication
       indexed: true
     claim_mappings:
       type: component
@@ -30,14 +33,26 @@ kinds:
         header:
           type: string
           doc: The HTTP header name to inject (e.g. X-User-Email)
+  password_provider:
+    name:
+      type: string
+      doc: A unique name for this password provider
+      indexed: true
+    password_hash:
+      type: string
+      doc: bcrypt hash of the shared password
   oidc_provider:
     name:
       type: string
-      doc: A unique name for this OIDC provider
+      doc: A unique name for this auth provider. Despite the kind name, this entity backs all OAuth2-flavored providers (OIDC discovery, GitHub, and other connector-based ones). Kept under the `oidc_provider` kind for backward compatibility with existing v0.8.0 entities.
+      indexed: true
+    connector_type:
+      type: string
+      doc: 'The provider implementation. Empty or "oidc" uses the built-in OIDC discovery client (consumes provider_url + scopes). Any other value names a Dex-backed connector (e.g. "github") and uses config_json for connector-specific configuration.'
       indexed: true
     provider_url:
       type: string
-      doc: The OIDC provider URL (e.g. https://accounts.google.com)
+      doc: The OIDC provider URL (e.g. https://accounts.google.com). Only meaningful when connector_type is empty or "oidc".
       indexed: true
     client_id:
       type: string
@@ -47,4 +62,11 @@ kinds:
       doc: The OAuth2 client secret
     scopes:
       type: string
-      doc: Space-separated list of OAuth2 scopes (e.g. "openid email profile")
+      doc: Space-separated list of OAuth2 scopes (e.g. "openid email profile"). Only meaningful when connector_type is empty or "oidc"; connectors choose their own scopes.
+    config_json:
+      type: string
+      doc: Connector-specific configuration as a JSON object (e.g. {"orgs":[{"name":"mirendev"}]}). Only meaningful when connector_type is non-empty and not "oidc".
+  waf_profile:
+    paranoia_level:
+      type: int
+      doc: OWASP CRS paranoia level (1-4)

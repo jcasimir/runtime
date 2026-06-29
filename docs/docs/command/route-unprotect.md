@@ -8,10 +8,6 @@ description: "Remove identity-provider protection from an HTTP route"
 
 Remove identity-provider protection from an HTTP route
 
-:::note
-This command requires the `routeoidc` [labs feature](/labs) to be enabled.
-:::
-
 ## Usage
 
 ```bash

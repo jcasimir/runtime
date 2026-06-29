@@ -468,13 +468,6 @@ func TestSandbox(t *testing.T) {
 			resp.Body.Close()
 			return resp.StatusCode == http.StatusOK
 		}, 10*time.Second, 200*time.Millisecond, "HTTP server should become reachable")
-
-		resp, err := hc.Get("http://127.0.0.1:31001")
-		r.NoError(err)
-
-		defer resp.Body.Close()
-
-		r.Equal(http.StatusOK, resp.StatusCode)
 	})
 
 	t.Run("sets up host paths as volumes", func(t *testing.T) {
@@ -1225,7 +1218,7 @@ func TestSandbox(t *testing.T) {
 
 		// Now test the reattach function directly by calling it
 		// This simulates what happens during controller restart
-		err = co1.reattachLogs(ctx, &tco, containerID, "logger")
+		err = co1.reattachLogs(ctx, &tco, containerID, "logger", "")
 		r.NoError(err, "should be able to reattach logs to running container")
 
 		// Verify task stays running after reattach and logs are collected.
@@ -1334,36 +1327,10 @@ func TestSandbox(t *testing.T) {
 		r.True(healthy, "sandbox without network should be considered healthy")
 	})
 
-	t.Run("checkNetworkHealth returns false for unreachable ports", func(t *testing.T) {
-		r := require.New(t)
-
-		c := &SandboxController{
-			Log: slog.Default(),
-		}
-
-		ctx := context.Background()
-
-		// Sandbox with network and ports, but ports are unreachable
-		sb := &compute.Sandbox{
-			ID: entity.Id("test-sb"),
-			Network: []compute.Network{
-				{Address: "192.0.2.1/32"}, // TEST-NET-1, should be unreachable
-			},
-			Spec: compute.SandboxSpec{
-				Container: []compute.SandboxSpecContainer{
-					{
-						Name: "app",
-						Port: []compute.SandboxSpecContainerPort{
-							{Port: 9999}, // Unreachable port
-						},
-					},
-				},
-			},
-		}
-
-		healthy := c.checkNetworkHealth(ctx, sb)
-		r.False(healthy, "sandbox with unreachable ports should be considered unhealthy")
-	})
+	// The "unreachable ports" check that used to live here verified the old
+	// TCP-dial behavior, which checkNetworkHealth no longer does (MIR-1108).
+	// The current implementation reads /proc/<pause-pid>/net/tcp via
+	// checkPort; that path is exercised end-to-end by portmonitor_test.go.
 
 	t.Run("PENDING sandbox with running containers should transition to RUNNING", func(t *testing.T) {
 		r := require.New(t)

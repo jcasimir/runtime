@@ -1341,13 +1341,13 @@ tail = "logs app -f"
 	assert.Equal(t, 6, lines["x console"])
 }
 
-func TestServicePortWaitTimeoutParsing(t *testing.T) {
+func TestServicePortTimeoutParsing(t *testing.T) {
 	config := `name = "test-app"
 
 [services.web]
 command = "bin/start"
 port = 4000
-port_wait_timeout = "120s"
+port_timeout = "120s"
 
 [services.worker]
 command = "bin/worker"
@@ -1355,13 +1355,13 @@ command = "bin/worker"
 	ac, err := Parse([]byte(config))
 	require.NoError(t, err)
 	require.NotNil(t, ac.Services["web"])
-	assert.Equal(t, "120s", ac.Services["web"].PortWaitTimeout)
+	assert.Equal(t, "120s", ac.Services["web"].PortTimeout)
 
 	require.NotNil(t, ac.Services["worker"])
-	assert.Empty(t, ac.Services["worker"].PortWaitTimeout, "unspecified field should be empty, not defaulted at parse time")
+	assert.Empty(t, ac.Services["worker"].PortTimeout, "unspecified field should be empty, not defaulted at parse time")
 }
 
-func TestServicePortWaitTimeoutValidation(t *testing.T) {
+func TestServicePortTimeoutValidation(t *testing.T) {
 	t.Run("invalid duration is rejected at parse time", func(t *testing.T) {
 		// "120" is missing a unit suffix — the kind of typo we want to catch
 		// at deploy time rather than silently falling back to the 15s default.
@@ -1370,11 +1370,11 @@ func TestServicePortWaitTimeoutValidation(t *testing.T) {
 [services.web]
 command = "bin/start"
 port = 4000
-port_wait_timeout = "120"
+port_timeout = "120"
 `
 		_, err := Parse([]byte(config))
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), `service web: invalid port_wait_timeout "120"`)
+		assert.Contains(t, err.Error(), `service web: invalid port_timeout "120"`)
 	})
 
 	t.Run("valid duration parses cleanly", func(t *testing.T) {
@@ -1383,10 +1383,10 @@ port_wait_timeout = "120"
 [services.web]
 command = "bin/start"
 port = 4000
-port_wait_timeout = "2m"
+port_timeout = "2m"
 `
 		ac, err := Parse([]byte(config))
 		require.NoError(t, err)
-		assert.Equal(t, "2m", ac.Services["web"].PortWaitTimeout)
+		assert.Equal(t, "2m", ac.Services["web"].PortTimeout)
 	})
 }

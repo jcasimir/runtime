@@ -290,3 +290,57 @@ func (sm *SessionManager) ClearState(w http.ResponseWriter) {
 		SameSite: http.SameSiteLaxMode,
 	})
 }
+
+// GetNamedCookie reads and decrypts a cookie by name, returning the raw plaintext.
+// Returns nil, nil if the cookie is not present.
+func (sm *SessionManager) GetNamedCookie(r *http.Request, name string) ([]byte, error) {
+	cookie, err := r.Cookie(name)
+	if err != nil {
+		if err == http.ErrNoCookie {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read cookie %s: %w", name, err)
+	}
+
+	data, err := sm.openCookie(cookie.Value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cookie %s: %w", name, err)
+	}
+
+	return data, nil
+}
+
+// SetNamedCookie encrypts data and stores it in a cookie with the given name and expiry.
+func (sm *SessionManager) SetNamedCookie(w http.ResponseWriter, name string, data []byte, expiry time.Time) error {
+	sealed, err := sm.sealCookie(data)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt cookie %s: %w", name, err)
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    sealed,
+		Path:     "/",
+		Domain:   sm.cookieDomain,
+		Expires:  expiry,
+		Secure:   sm.cookieSecure,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	return nil
+}
+
+// ClearNamedCookie removes a cookie by name.
+func (sm *SessionManager) ClearNamedCookie(w http.ResponseWriter, name string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    "",
+		Path:     "/",
+		Domain:   sm.cookieDomain,
+		MaxAge:   -1,
+		Secure:   sm.cookieSecure,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}

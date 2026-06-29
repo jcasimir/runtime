@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +67,7 @@ import (
 	"miren.dev/runtime/pkg/rpc"
 	"miren.dev/runtime/pkg/saga"
 	"miren.dev/runtime/pkg/sysstats"
+	"miren.dev/runtime/pkg/workloadidentity"
 	"miren.dev/runtime/servers/admin"
 	"miren.dev/runtime/servers/app"
 	"miren.dev/runtime/servers/build"
@@ -99,8 +99,7 @@ type CoordinatorConfig struct {
 	TempDir         string              `json:"temp_dir" yaml:"temp_dir"`
 	DataPath        string              `json:"data_path" yaml:"data_path"`
 	AdditionalNames []string            `json:"additional_names" yaml:"additional_names"`
-	AdditionalIPs   []net.IP            `json:"additional_ips" yaml:"additional_ips"`
-	DiscoveredIPs   []net.IP            `json:"discovered_ips" yaml:"discovered_ips"`
+	IPs             *IPSet              `json:"ips" yaml:"ips"`
 
 	// ACME certificate configuration
 	AcmeEmail       string `json:"acme_email" yaml:"acme_email"`
@@ -131,6 +130,9 @@ type CoordinatorConfig struct {
 
 	// HTTPRequestTimeout is the timeout for HTTP requests to app sandboxes
 	HTTPRequestTimeout time.Duration
+
+	// WorkloadIssuer signs workload identity tokens for sandbox containers
+	WorkloadIssuer *workloadidentity.Issuer
 }
 
 // CloudAuthConfig contains cloud authentication settings
@@ -483,8 +485,7 @@ func (c *Coordinator) LoadAPICert(ctx context.Context) error {
 		net.ParseIP("::1"),
 	}
 
-	ips = append(ips, c.AdditionalIPs...)
-	ips = append(ips, c.DiscoveredIPs...)
+	ips = append(ips, c.IPs.RawIPs()...)
 
 	cert := filepath.Join(c.DataPath, "server", "api.crt")
 	keyPath := filepath.Join(c.DataPath, "server", "api.key")
@@ -936,19 +937,17 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	)
 	c.cm.AddController(launcherController)
 
-	if labs.Addons() {
-		// Watch AddonAssociation changes to re-trigger launcher when addons become ready
-		addonLauncherController := controller.NewReconcileController(
-			"deploymentlauncher-addons",
-			c.Log,
-			entity.Ref(entity.EntityKind, addon_v1alpha.KindAddonAssociation),
-			eac,
-			launcher.AddonAssociationHandler(),
-			0, // No resync — driven entirely by watch events
-			1,
-		)
-		c.cm.AddController(addonLauncherController)
-	}
+	// Watch AddonAssociation changes to re-trigger launcher when addons become ready
+	addonLauncherController := controller.NewReconcileController(
+		"deploymentlauncher-addons",
+		c.Log,
+		entity.Ref(entity.EntityKind, addon_v1alpha.KindAddonAssociation),
+		eac,
+		launcher.AddonAssociationHandler(),
+		0, // No resync — driven entirely by watch events
+		1,
+	)
+	c.cm.AddController(addonLauncherController)
 
 	// Add sandbox pool controller (reconciles pool desired_instances to actual sandboxes)
 	poolController := controller.NewReconcileController(
@@ -999,11 +998,17 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	)
 	c.cm.AddController(nodeHealthRC)
 
+	// Collect cluster-level hostnames for TLS cert provisioning (e.g., cloud-provisioned DNS).
+	var clusterHostnames []string
+	if c.CloudAuth.DNSHostname != "" {
+		clusterHostnames = append(clusterHostnames, c.CloudAuth.DNSHostname)
+	}
+
 	// Add certificate controller — DNS-01 when a DNS provider is configured,
 	// otherwise HTTP-01 via autocert for eager cert provisioning on route set.
 	if c.AcmeDNSProvider != "" {
 		c.Log.Info("enabling ACME DNS challenge certificate controller", "provider", c.AcmeDNSProvider)
-		dnsController := certctrl.NewController(c.Log, c.DataPath, c.AcmeEmail, c.AcmeDNSProvider)
+		dnsController := certctrl.NewController(c.Log, c.DataPath, c.AcmeEmail, c.AcmeDNSProvider, clusterHostnames)
 		if err := dnsController.Init(ctx); err != nil {
 			c.Log.Error("failed to initialize certificate controller", "error", err)
 			return err
@@ -1023,11 +1028,12 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	} else {
 		c.Log.Info("enabling ACME HTTP-01 certificate controller (autocert)")
 		autocertController := certctrl.NewAutocertController(certctrl.AutocertControllerOpts{
-			Log:       c.Log,
-			EAC:       eac,
-			DataPath:  c.DataPath,
-			Email:     c.AcmeEmail,
-			PublicIPs: c.PublicIPs,
+			Log:              c.Log,
+			EAC:              eac,
+			DataPath:         c.DataPath,
+			Email:            c.AcmeEmail,
+			PublicIPs:        c.PublicIPs,
+			ClusterHostnames: clusterHostnames,
 		})
 		if err := autocertController.Init(ctx); err != nil {
 			c.Log.Error("failed to initialize autocert controller", "error", err)
@@ -1048,28 +1054,26 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		c.cm.AddController(certRC)
 	}
 
-	if labs.Addons() {
-		// Add addon controller (reconciles addon associations for provisioning/deprovisioning)
-		addonController := addonctrl.NewController(c.Log, ec, eac, addonRegistry)
-		if err := addonController.Init(ctx); err != nil {
-			c.Log.Error("failed to initialize addon controller", "error", err)
-			return err
-		}
-
-		addonReconciler := controller.NewReconcileController(
-			"addon",
-			c.Log,
-			entity.Ref(entity.EntityKind, addon_v1alpha.KindAddonAssociation),
-			eac,
-			controller.AdaptReconcileController[addon_v1alpha.AddonAssociation](addonController),
-			time.Minute,
-			// Multiple workers so a long-running provisioning saga for one
-			// association does not block reconciliation of others. Same-entity
-			// concurrency is already prevented by ReconcileController.inFlight.
-			4,
-		)
-		c.cm.AddController(addonReconciler)
+	// Add addon controller (reconciles addon associations for provisioning/deprovisioning)
+	addonController := addonctrl.NewController(c.Log, ec, eac, addonRegistry)
+	if err := addonController.Init(ctx); err != nil {
+		c.Log.Error("failed to initialize addon controller", "error", err)
+		return err
 	}
+
+	addonReconciler := controller.NewReconcileController(
+		"addon",
+		c.Log,
+		entity.Ref(entity.EntityKind, addon_v1alpha.KindAddonAssociation),
+		eac,
+		controller.AdaptReconcileController[addon_v1alpha.AddonAssociation](addonController),
+		time.Minute,
+		// Multiple workers so a long-running provisioning saga for one
+		// association does not block reconciliation of others. Same-entity
+		// concurrency is already prevented by ReconcileController.inFlight.
+		4,
+	)
+	c.cm.AddController(addonReconciler)
 
 	// Start the controller manager
 	if err := c.cm.Start(ctx); err != nil {
@@ -1100,24 +1104,32 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	server.ExposeValue("dev.miren.runtime/app", app_v1alpha.AdaptCrud(ai))
 	server.ExposeValue("dev.miren.runtime/app-status", app_v1alpha.AdaptAppStatus(ai))
 
-	var addonsClient *app_v1alpha.AddonsClient
-	if labs.Addons() {
-		addonsServer := app.NewAddonsServer(c.Log, ec, addonRegistry, addon.NewRegistryImageChecker())
-		server.ExposeValue("dev.miren.runtime/addons", app_v1alpha.AdaptAddons(addonsServer))
+	addonsServer := app.NewAddonsServer(c.Log, ec, addonRegistry, addon.NewRegistryImageChecker())
+	server.ExposeValue("dev.miren.runtime/addons", app_v1alpha.AdaptAddons(addonsServer))
 
-		addonsLoopback, err := rs.Connect(rs.LoopbackAddr(), "dev.miren.runtime/addons")
-		if err != nil {
-			c.Log.Error("failed to connect to addons RPC service", "error", err)
-			return err
-		}
-		addonsClient = app_v1alpha.NewAddonsClient(addonsLoopback)
+	addonsLoopback, err := rs.Connect(rs.LoopbackAddr(), "dev.miren.runtime/addons")
+	if err != nil {
+		c.Log.Error("failed to connect to addons RPC service", "error", err)
+		return err
 	}
+	addonsClient := app_v1alpha.NewAddonsClient(addonsLoopback)
 
 	// Create app client for the builder
 	appClient := appclient.NewClient(c.Log, loopback)
 
 	bs := build.NewBuilder(c.Log, eac, appClient, addonsClient, c.Resolver, c.TempDir, c.LogWriter, c.CloudAuth.DNSHostname, c.BuildKit, c.DataPath)
-	server.ExposeValue("dev.miren.runtime/build", build_v1alpha.AdaptBuilder(bs))
+
+	var buildHandler build_v1alpha.Builder = bs
+	if labs.Sagas() {
+		sagaStorage := saga.NewEntityStorage(etcdStore, c.Log)
+		sagaBuilder := build.NewSagaBuilder(bs, sagaStorage, c.Log)
+		if err := sagaBuilder.Init(ctx); err != nil {
+			c.Log.Error("failed to initialize saga builder", "error", err)
+			return err
+		}
+		buildHandler = sagaBuilder
+	}
+	server.ExposeValue("dev.miren.runtime/build", build_v1alpha.AdaptBuilder(buildHandler))
 
 	ls := logs.NewServer(c.Log, ec, c.Logs)
 	server.ExposeValue("dev.miren.runtime/logs", app_v1alpha.AdaptLogs(ls))
@@ -1143,13 +1155,12 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	ingressConfig := httpingress.IngressConfig{
 		RequestTimeout: c.HTTPRequestTimeout,
 		DataPath:       c.DataPath,
+		WorkloadIssuer: c.WorkloadIssuer,
 	}
 	c.hs = httpingress.NewServer(ctx, c.Log, ingressConfig, loopback, aa, c.HTTP, c.LogWriter)
 
 	adminServer := admin.NewServer(c.Log, ec, c.hs, c.LogWriter)
-	if labs.AdminAPI() {
-		server.ExposeValue("dev.miren.runtime/admin", admin_v1alpha.AdaptAdmin(adminServer))
-	}
+	server.ExposeValue("dev.miren.runtime/admin", admin_v1alpha.AdaptAdmin(adminServer))
 
 	runnerReg := runnerserver.NewRegistrationServer(runnerserver.RegistrationServerConfig{
 		Log:                    c.Log,
@@ -1161,6 +1172,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		NetworkBackend:         c.NetworkBackend,
 		VictoriametricsAddress: c.VictoriametricsAddress,
 		VictorialogsAddress:    c.VictorialogsAddress,
+		WorkloadIssuer:         c.WorkloadIssuer,
 	})
 	server.ExposeValue(rpc.ServiceRunner, runner_v1alpha.AdaptRunnerRegistration(runnerReg))
 
@@ -1288,133 +1300,68 @@ func (c *Coordinator) runNetcheck(ctx context.Context) {
 	}
 }
 
-// publicAddresses returns addresses derived from the cached dual-stack netcheck result.
-// Returns nil if no netcheck has been done or the cluster isn't publicly reachable.
-func (c *Coordinator) publicAddresses() []string {
-	c.netcheckMu.RLock()
-	result := c.netcheckResult
-	c.netcheckMu.RUnlock()
-
-	if result == nil {
-		return nil
-	}
-
-	seen := make(map[string]struct{})
-	var addrs []string
-
-	for _, resp := range []*cloudauth.NetcheckResponse{result.IPv4, result.IPv6} {
-		if resp == nil || resp.SourceAddress == "" {
-			continue
-		}
-		if net.ParseIP(resp.SourceAddress) == nil {
-			continue
-		}
-		for _, r := range resp.Results {
-			if !r.Reachable {
-				continue
-			}
-			hp := net.JoinHostPort(resp.SourceAddress, strconv.Itoa(r.Port))
-			if _, ok := seen[hp]; ok {
-				continue
-			}
-			seen[hp] = struct{}{}
-			addrs = append(addrs, hp)
-		}
-	}
-
-	return addrs
-}
-
-// PublicIPs returns the cluster's known public IP addresses from netcheck,
-// falling back to user-provided AdditionalIPs and auto-discovered IPs
-// (filtered to global unicast, non-private) if netcheck hasn't run yet.
+// PublicIPs returns the cluster's known public IP addresses, applying the
+// same filtering rules as the advertised API addresses. Routes through
+// ComputeAdvertise so the AutocertController's DNS sanity check honors
+// per-family netcheck state (no leaking the source IP when its family has
+// zero reachable ports) and the CGNAT filter (no advertising tailnet
+// addresses as "public").
 func (c *Coordinator) PublicIPs() []net.IP {
 	c.netcheckMu.RLock()
-	result := c.netcheckResult
+	netcheck := c.netcheckResult
 	c.netcheckMu.RUnlock()
+
+	cands, _ := ComputeAdvertise(AdvertiseInput{
+		IPs:      c.IPs.All(),
+		Netcheck: netcheck,
+	})
 
 	seen := make(map[string]struct{})
 	var ips []net.IP
-
-	if result != nil {
-		for _, resp := range []*cloudauth.NetcheckResponse{result.IPv4, result.IPv6} {
-			if resp == nil || resp.SourceAddress == "" {
-				continue
-			}
-			ip := net.ParseIP(resp.SourceAddress)
-			if ip == nil {
-				continue
-			}
-			if _, ok := seen[resp.SourceAddress]; !ok {
-				seen[resp.SourceAddress] = struct{}{}
-				ips = append(ips, ip)
-			}
+	for _, cand := range cands {
+		if !cand.Included || cand.IP == nil {
+			continue
 		}
-	}
-
-	if len(ips) == 0 {
-		for _, ip := range append(c.AdditionalIPs, c.DiscoveredIPs...) {
-			if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
-				continue
-			}
-			s := ip.String()
-			if _, ok := seen[s]; !ok {
-				seen[s] = struct{}{}
-				ips = append(ips, ip)
-			}
+		if cand.Classification != "global-unicast" {
+			continue
 		}
+		s := cand.IP.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		ips = append(ips, cand.IP)
 	}
-
 	return ips
 }
 
-// apiAddresses builds the list of API addresses for status reports.
-// User-provided AdditionalIPs are always included. For auto-discovered IPs,
-// netcheck results replace discovered public IPs when reachable addresses
-// are found. If netcheck ran but found nothing reachable, discovered public
-// IPs are kept as a fallback.
+// apiAddresses builds the list of API addresses the server should advertise.
+// The heavy lifting lives in ComputeAdvertise so the same rules can be
+// exercised by the 'miren debug advertise' command.
 func (c *Coordinator) apiAddresses() []string {
-	var addrs []string
+	c.netcheckMu.RLock()
+	netcheck := c.netcheckResult
+	c.netcheckMu.RUnlock()
 
-	// Only include c.Address if it contains a valid IP host.
-	if host, _, err := net.SplitHostPort(c.Address); err == nil && net.ParseIP(host) != nil {
-		addrs = append(addrs, c.Address)
-	}
-
-	// Add localhost addresses
-	addrs = append(addrs, "127.0.0.1:8443", "[::1]:8443")
-
-	// User-provided IPs are always included.
-	for _, ip := range c.AdditionalIPs {
-		addrs = append(addrs, net.JoinHostPort(ip.String(), "8443"))
-	}
-
-	// For discovered IPs, netcheck results replace discovered public IPs
-	// when netcheck found reachable addresses. If netcheck ran but found
-	// nothing reachable (e.g., firewalled), keep discovered public IPs
-	// as a fallback.
-	pubAddrs := c.publicAddresses()
-	for _, ip := range c.DiscoveredIPs {
-		if len(pubAddrs) > 0 && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() {
-			continue
-		}
-		addrs = append(addrs, net.JoinHostPort(ip.String(), "8443"))
-	}
-	addrs = append(addrs, pubAddrs...)
-
-	c.logAddressesOnce.Do(func() {
-		additional := []string{}
-		for _, ip := range c.AdditionalIPs {
-			additional = append(additional, ip.String())
-		}
-		discovered := []string{}
-		for _, ip := range c.DiscoveredIPs {
-			discovered = append(discovered, ip.String())
-		}
-		c.Log.Info("reporting API addresses", "listen", c.Address, "configured", additional, "discovered", discovered, "result", addrs)
+	_, final := ComputeAdvertise(AdvertiseInput{
+		ListenAddr: c.Address,
+		IPs:        c.IPs.All(),
+		Netcheck:   netcheck,
 	})
 
-	return addrs
+	c.logAddressesOnce.Do(func() {
+		var explicit, discovered []string
+		for _, sip := range c.IPs.All() {
+			if sip.Explicit {
+				explicit = append(explicit, sip.IP.String())
+			} else {
+				discovered = append(discovered, sip.IP.String())
+			}
+		}
+		c.Log.Info("reporting API addresses", "listen", c.Address, "configured", explicit, "discovered", discovered, "result", final)
+	})
+
+	return final
 }
 
 // ReportStatus reports the current cluster status to miren.cloud

@@ -65,8 +65,15 @@ func (s *EACStorage) Save(ctx context.Context, exec *Execution) error {
 		sagaEntity.Encode(),
 	)
 
-	_, err = s.eac.Ensure(ctx, ent.Attrs())
-	if err != nil {
+	// Put is an upsert (update-then-create): unlike Ensure, it applies our
+	// attributes even when the entity already exists. Ensure is create-if-absent
+	// and would silently drop every save after the first, freezing the saga at
+	// its initial pending state.
+	rpcEnt := &es.Entity{}
+	rpcEnt.SetId(exec.ID)
+	rpcEnt.SetAttrs(ent.Attrs())
+
+	if _, err = s.eac.Put(ctx, rpcEnt); err != nil {
 		return fmt.Errorf("saving saga entity via EAC: %w", err)
 	}
 

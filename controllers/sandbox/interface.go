@@ -46,13 +46,19 @@ type SandboxContainerRuntime interface {
 	CreateContainer(ctx context.Context, id string, opts ...containerd.NewContainerOpts) (string, error)
 	LoadContainer(ctx context.Context, id string) (containerd.Container, error)
 	CleanupContainer(ctx context.Context, cont containerd.Container)
-	BootInitialTask(ctx context.Context, sb *compute.Sandbox, ep *network.EndpointConfig, container containerd.Container) (containerd.Task, error)
+	BootInitialTask(ctx context.Context, sb *compute.Sandbox, ep *network.EndpointConfig, container containerd.Container, shortID string) (containerd.Task, error)
 	ConfigureVolumes(ctx context.Context, sb *compute.Sandbox, meta *entity.Meta) (map[string]string, error)
 	BootContainers(ctx context.Context, sb *compute.Sandbox, ep *network.EndpointConfig, sbPid int, cgroups map[string]string, meta *entity.Meta, volumeMounts map[string]string) ([]WaitPort, error)
 	DestroySubContainers(ctx context.Context, id entity.Id) error
 	ReleaseDiskLeases(ctx context.Context, sandboxID entity.Id) error
 	UnconfigureFirewall(sb *compute.Sandbox)
 	WaitForPort(ctx context.Context, id string, port int, timeout time.Duration) error
+	// DiagnoseListening reports which ports a container is actually listening
+	// on, split into routable (reachable from the host) and loopback-only sets.
+	// Used on the port-wait timeout path to detect an app that bound a port
+	// other than the one Miren configured. ok is false when the container is no
+	// longer monitored and its pid is unknown.
+	DiagnoseListening(id string) (routable []int, loopback []int, ok bool)
 }
 
 // SandboxObservability provides metrics and service management.
@@ -65,5 +71,5 @@ type SandboxObservability interface {
 	// surfaces it alongside container output. Intended for startup
 	// or teardown events where a container never produced logs of
 	// its own (e.g. volume mount failures).
-	LogSandboxEvent(sb *compute.Sandbox, line string)
+	LogSandboxEvent(sb *compute.Sandbox, shortID, line string)
 }

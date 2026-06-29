@@ -12,9 +12,6 @@ import (
 const (
 	FeatureGlobalRouter       = "globalrouter"
 	FeatureDistributedRunners = "distributedrunners"
-	FeatureAdminAPI           = "adminapi"
-	FeatureRouteOIDC          = "routeoidc"
-	FeatureAddons             = "addons"
 	FeatureSagas              = "sagas"
 )
 
@@ -23,9 +20,6 @@ func AllFeatures() []string {
 	return []string{
 		FeatureGlobalRouter,
 		FeatureDistributedRunners,
-		FeatureAdminAPI,
-		FeatureRouteOIDC,
-		FeatureAddons,
 		FeatureSagas,
 	}
 }
@@ -35,10 +29,7 @@ func FeatureDescriptions() map[string]string {
 	return map[string]string{
 		FeatureGlobalRouter:       "Use global NAT traversal router for connectivity",
 		FeatureDistributedRunners: "Schedule jobs across multiple runner nodes",
-		FeatureAdminAPI:           "Enable the admin API for application management functions",
-		FeatureRouteOIDC:          "Protect HTTP routes with identity-provider login",
-		FeatureAddons:             "Enable the addon system for managed backing services",
-		FeatureSagas:              "Use saga-based crash-recoverable workflows for sandbox lifecycle",
+		FeatureSagas:              "Use saga-based crash-recoverable workflows",
 	}
 }
 
@@ -51,9 +42,6 @@ var (
 var featureDefaults = map[string]bool{
 	FeatureGlobalRouter:       false,
 	FeatureDistributedRunners: false,
-	FeatureAdminAPI:           false,
-	FeatureRouteOIDC:          false,
-	FeatureAddons:             true,
 	FeatureSagas:              false,
 }
 
@@ -154,26 +142,8 @@ func DistributedRunners() bool {
 	return IsEnabled(FeatureDistributedRunners)
 }
 
-// AdminAPI returns whether the adminapi feature is enabled.
-// Enable the admin API for application management functions
-func AdminAPI() bool {
-	return IsEnabled(FeatureAdminAPI)
-}
-
-// RouteOIDC returns whether the routeoidc feature is enabled.
-// Protect HTTP routes with identity-provider login
-func RouteOIDC() bool {
-	return IsEnabled(FeatureRouteOIDC)
-}
-
-// Addons returns whether the addons feature is enabled.
-// Enable the addon system for managed backing services
-func Addons() bool {
-	return IsEnabled(FeatureAddons)
-}
-
 // Sagas returns whether the sagas feature is enabled.
-// Use saga-based crash-recoverable workflows for sandbox lifecycle
+// Use saga-based crash-recoverable workflows
 func Sagas() bool {
 	return IsEnabled(FeatureSagas)
 }

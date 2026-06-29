@@ -8,10 +8,6 @@ description: "Show an identity provider"
 
 Show an identity provider
 
-:::note
-This command requires the `routeoidc` [labs feature](/labs) to be enabled.
-:::
-
 ## Usage
 
 ```bash

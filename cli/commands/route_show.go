@@ -55,15 +55,46 @@ func RouteShow(ctx *Context, opts struct {
 		routeLabel = opts.Host
 	}
 
-	protected := !entity.Empty(route.OidcProvider)
-	var provider *ingress_v1alpha.OidcProvider
-	if protected {
-		provider = &ingress_v1alpha.OidcProvider{}
-		if err := ic.GetEntityStore().GetById(ctx, route.OidcProvider, provider); err != nil {
+	wafEnabled := !entity.Empty(route.WafProfile)
+	var wafProfile *ingress_v1alpha.WafProfile
+	if wafEnabled {
+		wafProfile = &ingress_v1alpha.WafProfile{}
+		if err := ic.GetEntityStore().GetById(ctx, route.WafProfile, wafProfile); err != nil {
 			if !errors.Is(err, cond.ErrNotFound{}) {
-				return fmt.Errorf("failed to get identity provider: %w", err)
+				return fmt.Errorf("failed to get WAF profile: %w", err)
 			}
-			provider = nil
+			wafProfile = nil
+		}
+	}
+
+	protected := !entity.Empty(route.AuthProvider)
+
+	var oidcProvider *ingress_v1alpha.OidcProvider
+	var pwProvider *ingress_v1alpha.PasswordProvider
+	protectionType := "none"
+
+	if protected {
+		providerEnt, err := ic.GetEntityStore().GetByIdWithEntity(ctx, route.AuthProvider, &ingress_v1alpha.OidcProvider{})
+		if err != nil {
+			if !errors.Is(err, cond.ErrNotFound{}) {
+				return fmt.Errorf("failed to get auth provider: %w", err)
+			}
+		} else {
+			raw := providerEnt.Entity()
+			switch {
+			case entity.Is(raw, ingress_v1alpha.KindOidcProvider):
+				oidcProvider = &ingress_v1alpha.OidcProvider{}
+				oidcProvider.Decode(raw)
+				if isConnector(oidcProvider) {
+					protectionType = "connector"
+				} else {
+					protectionType = "oidc"
+				}
+			case entity.Is(raw, ingress_v1alpha.KindPasswordProvider):
+				pwProvider = &ingress_v1alpha.PasswordProvider{}
+				pwProvider.Decode(raw)
+				protectionType = "password"
+			}
 		}
 	}
 
@@ -73,33 +104,48 @@ func RouteShow(ctx *Context, opts struct {
 			App             string              `json:"app"`
 			Default         bool                `json:"default"`
 			Protected       bool                `json:"protected"`
-			OIDCEnabled     bool                `json:"oidc_enabled"`
+			ProtectionType  string              `json:"protection_type"`
 			ProviderName    string              `json:"provider_name,omitempty"`
 			ProviderURL     string              `json:"provider_url,omitempty"`
+			ConnectorType   string              `json:"connector_type,omitempty"`
 			ProviderMissing bool                `json:"provider_missing,omitempty"`
 			ClaimMappings   []map[string]string `json:"claim_mappings,omitempty"`
+			WafLevel        int                 `json:"waf_level"`
+		}
+
+		wafLevel := 0
+		if wafProfile != nil {
+			wafLevel = int(wafProfile.ParanoiaLevel)
 		}
 
 		r := RouteJSON{
-			Host:        routeLabel,
-			App:         ui.CleanEntityID(string(route.App)),
-			Default:     route.Default,
-			Protected:   protected,
-			OIDCEnabled: protected,
+			Host:           routeLabel,
+			App:            ui.CleanEntityID(string(route.App)),
+			Default:        route.Default,
+			Protected:      protected,
+			ProtectionType: protectionType,
+			WafLevel:       wafLevel,
 		}
 
 		if protected {
-			if provider != nil {
-				r.ProviderName = provider.Name
-				r.ProviderURL = provider.ProviderUrl
-			} else {
+			switch {
+			case oidcProvider != nil:
+				r.ProviderName = oidcProvider.Name
+				if isConnector(oidcProvider) {
+					r.ConnectorType = oidcProvider.ConnectorType
+				} else {
+					r.ProviderURL = oidcProvider.ProviderUrl
+				}
+				for _, m := range route.ClaimMappings {
+					r.ClaimMappings = append(r.ClaimMappings, map[string]string{
+						"claim":  m.Claim,
+						"header": m.Header,
+					})
+				}
+			case pwProvider != nil:
+				r.ProviderName = pwProvider.Name
+			default:
 				r.ProviderMissing = true
-			}
-			for _, m := range route.ClaimMappings {
-				r.ClaimMappings = append(r.ClaimMappings, map[string]string{
-					"claim":  m.Claim,
-					"header": m.Header,
-				})
 			}
 		}
 
@@ -110,10 +156,46 @@ func RouteShow(ctx *Context, opts struct {
 	ctx.Printf("  App:       %s\n", ui.CleanEntityID(string(route.App)))
 	ctx.Printf("  Default:   %v\n", route.Default)
 	ctx.Printf("  Protected: %v\n", protected)
+	if wafProfile != nil {
+		ctx.Printf("  WAF Level: %d\n", wafProfile.ParanoiaLevel)
+	}
 
-	if protected {
-		if provider != nil {
-			ctx.Printf("  Provider:  %s (%s)\n", provider.Name, provider.ProviderUrl)
+	switch protectionType {
+	case "oidc":
+		ctx.Printf("  Type:      oidc\n")
+		if oidcProvider != nil {
+			ctx.Printf("  Provider:  %s (%s)\n", oidcProvider.Name, oidcProvider.ProviderUrl)
+		} else {
+			ctx.Printf("  Provider:  <missing — provider has been deleted>\n")
+		}
+
+		if len(route.ClaimMappings) > 0 {
+			var rows []ui.Row
+			for _, m := range route.ClaimMappings {
+				rows = append(rows, ui.Row{m.Claim, m.Header})
+			}
+
+			headers := []string{"CLAIM", "HEADER"}
+			columns := ui.AutoSizeColumns(headers, rows, ui.Columns().NoTruncate(0).NoTruncate(1))
+			table := ui.NewTable(
+				ui.WithTableTitle("Claim Mappings"),
+				ui.WithColumns(columns),
+				ui.WithRows(rows),
+			)
+
+			ctx.Printf("\n%s\n", table.Render())
+		}
+	case "password":
+		ctx.Printf("  Type:      password\n")
+		if pwProvider != nil {
+			ctx.Printf("  Provider:  %s\n", pwProvider.Name)
+		} else {
+			ctx.Printf("  Provider:  <missing — provider has been deleted>\n")
+		}
+	case "connector":
+		ctx.Printf("  Type:      connector\n")
+		if oidcProvider != nil {
+			ctx.Printf("  Provider:  %s (%s)\n", oidcProvider.Name, oidcProvider.ConnectorType)
 		} else {
 			ctx.Printf("  Provider:  <missing — provider has been deleted>\n")
 		}

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"miren.dev/runtime/clientconfig"
 	"miren.dev/runtime/pkg/ui"
 )
@@ -75,6 +78,12 @@ func DoctorServer(ctx *Context, opts struct {
 	// Check HTTP (port 80)
 	httpStatus, httpDetail := checkHTTP(host)
 	printEndpointStatus(ctx, "HTTP", httpStatus, httpDetail)
+
+	// Check QUIC (the API port — UDP). The HTTPS/HTTP probes above only
+	// cover TCP; a host firewall that allows TCP but not UDP will pass
+	// those checks while silently dropping every API request.
+	quicStatus, quicDetail := checkQUIC(cluster.Hostname)
+	printEndpointStatus(ctx, "QUIC", quicStatus, quicDetail)
 
 	// Show suggestions when not connected
 	if !connected {
@@ -210,6 +219,52 @@ func describeHTTPError(err error) string {
 		return opErr.Err.Error()
 	}
 	return err.Error()
+}
+
+// checkQUIC verifies that the cluster's API port (UDP/QUIC) is reachable.
+// Failure here when HTTPS/HTTP succeed almost always means a host firewall
+// allowing TCP but not UDP on the same port (a common UFW/firewalld pitfall).
+func checkQUIC(addr string) (bool, string) {
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		addr = net.JoinHostPort(addr, "8443")
+	}
+	_, port, _ := net.SplitHostPort(addr)
+
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return false, fmt.Sprintf("resolve failed: %s", err)
+	}
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero, Port: 0})
+	if err != nil {
+		udpConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			return false, fmt.Sprintf("local udp socket: %s", err)
+		}
+	}
+	defer udpConn.Close()
+
+	transport := &quic.Transport{Conn: udpConn}
+	defer transport.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := transport.Dial(ctx, udpAddr, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{http3.NextProtoH3},
+	}, &quic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		MaxIdleTimeout:       10 * time.Second,
+	})
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "no recent network activity") {
+			return false, fmt.Sprintf("no response on udp/%s (host firewall may be blocking inbound UDP)", port)
+		}
+		return false, err.Error()
+	}
+	_ = conn.CloseWithError(0, "doctor")
+	return true, "handshake ok"
 }
 
 // checkHTTP verifies HTTP connectivity (typically redirects to HTTPS)

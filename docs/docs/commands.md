@@ -13,11 +13,11 @@ Complete reference for all `miren` CLI commands.
 | Command | Description |
 |---------|-------------|
 | [`miren addon`](/command/addon) | Addon management commands |
-| [`miren addon create`](/command/addon-create) | Attach an addon to an application _(`addons`)_ |
-| [`miren addon destroy`](/command/addon-destroy) | Remove an addon from an application _(`addons`)_ |
-| [`miren addon list`](/command/addon-list) | List addons attached to an application _(`addons`)_ |
-| [`miren addon list-available`](/command/addon-list-available) | List available addons _(`addons`)_ |
-| [`miren addon variants`](/command/addon-variants) | Show variants for an addon _(`addons`)_ |
+| [`miren addon create`](/command/addon-create) | Attach an addon to an application |
+| [`miren addon destroy`](/command/addon-destroy) | Remove an addon from an application |
+| [`miren addon list`](/command/addon-list) | List addons attached to an application |
+| [`miren addon list-available`](/command/addon-list-available) | List available addons |
+| [`miren addon variants`](/command/addon-variants) | Show variants for an addon |
 
 ## admin
 
@@ -29,7 +29,7 @@ Complete reference for all `miren` CLI commands.
 
 | Command | Description |
 |---------|-------------|
-| [`miren alias`](/command/alias) |  |
+| [`miren alias`](/command/alias) | CLI alias management |
 | [`miren alias list`](/command/alias-list) | List configured CLI aliases |
 
 ## app
@@ -62,10 +62,13 @@ Complete reference for all `miren` CLI commands.
 | [`miren auth ci remove`](/command/auth-ci-remove) | Remove a CI authentication binding |
 | [`miren auth generate`](/command/auth-generate) | Generate authentication config file |
 | [`miren auth provider`](/command/auth-provider) | Identity provider management |
-| [`miren auth provider add`](/command/auth-provider-add) | Add an identity provider for route protection _(`routeoidc`)_ |
-| [`miren auth provider list`](/command/auth-provider-list) | List identity providers _(`routeoidc`)_ |
-| [`miren auth provider remove`](/command/auth-provider-remove) | Remove an identity provider _(`routeoidc`)_ |
-| [`miren auth provider show`](/command/auth-provider-show) | Show an identity provider _(`routeoidc`)_ |
+| [`miren auth provider add`](/command/auth-provider-add) | Add an identity provider for route protection |
+| [`miren auth provider add github`](/command/auth-provider-add-github) | Add a GitHub identity provider |
+| [`miren auth provider add oidc`](/command/auth-provider-add-oidc) | Add an OIDC identity provider |
+| [`miren auth provider add password`](/command/auth-provider-add-password) | Add a shared-password identity provider |
+| [`miren auth provider list`](/command/auth-provider-list) | List identity providers |
+| [`miren auth provider remove`](/command/auth-provider-remove) | Remove an identity provider |
+| [`miren auth provider show`](/command/auth-provider-show) | Show an identity provider |
 
 ## cluster
 
@@ -98,7 +101,7 @@ Complete reference for all `miren` CLI commands.
 
 | Command | Description |
 |---------|-------------|
-| [`miren disk`](/command/disk) |  |
+| [`miren disk`](/command/disk) | Disk backup and recovery |
 | [`miren disk backup`](/command/disk-backup) | Backup a disk to a snapshot file |
 | [`miren disk list-deleted`](/command/disk-list-deleted) | List deleted disks available for recovery |
 | [`miren disk restore`](/command/disk-restore) | Restore a disk from a snapshot file |
@@ -135,7 +138,6 @@ Complete reference for all `miren` CLI commands.
 | Command | Description |
 |---------|-------------|
 | [`miren help`](/command/help) | Show help for one or more commands |
-| [`miren help alias`](/command/help-alias) | Learn how to define and use CLI aliases |
 
 ## init
 
@@ -177,13 +179,14 @@ Complete reference for all `miren` CLI commands.
 |---------|-------------|
 | [`miren route`](/command/route) | List all HTTP routes |
 | [`miren route list`](/command/route-list) | List all HTTP routes |
-| [`miren route protect`](/command/route-protect) | Protect an HTTP route with an identity provider _(`routeoidc`)_ |
+| [`miren route protect`](/command/route-protect) | Protect an HTTP route with an identity provider |
 | [`miren route remove`](/command/route-remove) | Remove an HTTP route |
 | [`miren route set`](/command/route-set) | Create or update an HTTP route |
 | [`miren route set-default`](/command/route-set-default) | Set an app as the default route |
 | [`miren route show`](/command/route-show) | Show details of an HTTP route |
-| [`miren route unprotect`](/command/route-unprotect) | Remove identity-provider protection from an HTTP route _(`routeoidc`)_ |
+| [`miren route unprotect`](/command/route-unprotect) | Remove identity-provider protection from an HTTP route |
 | [`miren route unset-default`](/command/route-unset-default) | Remove the default route |
+| [`miren route waf`](/command/route-waf) | Manage WAF protection on an HTTP route |
 
 ## runner
 
@@ -272,6 +275,7 @@ These commands are intended for advanced debugging and troubleshooting. They may
 | Command | Description |
 |---------|-------------|
 | [`miren debug`](/command/debug) | Debug and troubleshooting commands |
+| [`miren debug advertise`](/command/debug-advertise) | Show which addresses the server would advertise and why |
 | [`miren debug bundle`](/command/debug-bundle) | Create a support bundle with system debug information |
 | [`miren debug colors`](/command/debug-colors) | Print some colors |
 | [`miren debug connection`](/command/debug-connection) | Test connectivity and authentication with a server |

@@ -11,8 +11,88 @@ All notable changes to Miren Runtime will be documented in this file.
 ## Unreleased
 *main*
 
+---
+
+## v0.10.0
+*2026-06-09*
+
 **Features**
+- **Workload identity tokens for sandboxes** - Every sandbox now receives a signed OIDC workload identity token (GitHub Actions-style) at `/var/run/miren/identity-token`, with `MIREN_IDENTITY_TOKEN_PATH`, `MIREN_OIDC_ISSUER_URL`, and `MIREN_IDENTITY_TOKEN_URL` injected into the environment. Your cluster publishes standard `/.well-known/openid-configuration` and JWKS endpoints, so external systems like AWS STS can verify tokens and federate access — no long-lived cloud credentials baked into your app. Tokens default to RS256 (universally supported by federation verifiers), auto-refresh on a background loop, and an on-demand endpoint lets a sandbox request tokens with a custom audience or TTL. Works on both embedded and distributed runners. ([#834](https://github.com/mirendev/runtime/pull/834), [#846](https://github.com/mirendev/runtime/pull/846), [#852](https://github.com/mirendev/runtime/pull/852))
+- **Admin API is now GA** - The admin API graduates out of Miren Labs and is always on — no more `--labs adminapi` flag needed. Expose and call admin methods on your app over JSON-RPC; see the [admin interface docs](https://miren.md/admin-interface) for the security model, auditing, and per-language examples. ([#832](https://github.com/mirendev/runtime/pull/832))
+- **Automatic TLS for cloud-provisioned cluster hostnames** - When a cluster has a cloud-provisioned `*.miren.systems` hostname, Miren now provisions a real ACME certificate for it on startup instead of serving the self-signed fallback. The hostname is pinned in the allowed-hosts set so route deletions can't strip its cert. ([#836](https://github.com/mirendev/runtime/pull/836))
+
+**Improvements**
+- **Cleaner `miren logs` output** - Structured JSON log lines from your app are now parsed at ingress: the message becomes the log body, `time`/`level` noise is stripped, and your own fields are promoted to first-class attributes. Internal bookkeeping is namespaced under `miren.*` and hidden from text output, and log brackets show the real short ID (e.g. `[CBZ]`) instead of a truncated entity key. Existing `--service` / `sandbox` filters keep working against both old and new entries. ([#838](https://github.com/mirendev/runtime/pull/838))
+- **`logs -f` collapses repeated lines** - When following logs, consecutive lines that differ only by their timestamp (e.g. a once-a-second health ping) now collapse into a single live-updated `[ Repeated 14x over 14s ]` summary instead of burying new output. Only engages for interactive text follow — JSON, piped, and non-follow output stay verbatim, so `grep` and machine consumers are unaffected. ([#845](https://github.com/mirendev/runtime/pull/845))
+
+**Bug Fixes**
+- **Fixed TLS failures reaching recreated distributed runners** - `miren app run` and `miren sandbox exec` against a distributed runner could fail with `certificate is valid for ... not <ip>` after the runner VM was recreated with a new internal IP but a persisted certificate. Runners now detect a stale certificate on start and re-issue it from the coordinator, self-healing on the next restart. ([#848](https://github.com/mirendev/runtime/pull/848))
+
+**Documentation**
+- Expanded the [admin interface](https://miren.md/admin-interface) page with the full security model, auditing behavior, JSON-RPC shape, and CLI usage. ([#831](https://github.com/mirendev/runtime/pull/831))
+- Expanded the [terminology](https://miren.md/terminology) page from 12 to 35 canonical definitions. ([#850](https://github.com/mirendev/runtime/pull/850))
+
+---
+
+## v0.9.1
+*2026-06-04*
+
+**Bug Fixes**
+- **New services could come up without a network address** - If the cluster hit a brief internal hiccup (etcd compaction, a leader change, or a network blip), a service created right around that moment could be left without an IP and stay unreachable until the server was restarted. If you've seen a freshly deployed service that never became reachable for no obvious reason, this was a likely cause. ([#841](https://github.com/mirendev/runtime/pull/841))
+- **Ephemeral preview deploys would stop responding until a server restart** - A preview (ephemeral) deploy would work at first, then stop responding to requests, and never serve again until the miren server itself was restarted. That situation is now fixed; these deploys keep serving and recover on their own. ([#837](https://github.com/mirendev/runtime/pull/837))
+- **NodePort services accumulated duplicate firewall rules** - NodePort services piled up duplicate iptables rules over time, and HTTP services that declared a `node_port` didn't always get one. Both are fixed, and existing duplicate rules are cleaned up automatically as sandboxes recycle. ([#840](https://github.com/mirendev/runtime/pull/840))
+
+---
+
+## v0.9.0
+*2026-05-28*
+
+**Breaking Changes**
+- **`auth provider add` reshaped into per-type subcommands** - The asymmetric pair of `auth provider add NAME --provider-url ...` (OIDC) and the separate `auth provider add-password NAME ...` is gone, replaced by a single shape: `auth provider add oidc|github|password NAME [flags]`. Migration: prepend `oidc` to existing OIDC commands, and replace `add-password` with `add password` (with a space). The CLI now exposes three types directly instead of an "oidc with optional connector" indirection. ([#817](https://github.com/mirendev/runtime/pull/817))
+
+**Features**
+- **Route protection: native GitHub identity provider** - GitHub was the awkward gap in the v0.8.0 route protection story. It has no OIDC endpoint, so the answer was "stand up Dex yourself." Miren now talks to GitHub directly via an embedded Dex connector library, and adding a provider is just `miren auth provider add github my-gh --client-id $ID --client-secret $SECRET --org mirendev:platform,eng`. Org and team membership land in your app as `X-User-Login` and `X-User-Groups` headers. ([#817](https://github.com/mirendev/runtime/pull/817))
+
+**Improvements**
+- **`miren doctor server` checks QUIC reachability** - The endpoint probe now exercises QUIC alongside HTTPS/HTTP. A host firewall that allows TCP 8443 but blocks UDP 8443 (a common UFW misconfiguration) used to silently break every external `miren deploy` with all-green doctor output; the new probe surfaces it with a pointed "host firewall may be blocking inbound UDP" message. ([#819](https://github.com/mirendev/runtime/pull/819))
+- **`miren server register` restarts the systemd unit for you** - Re-registering against a live cluster used to print a "you must now restart miren server" warning that was easy to miss. The CLI now detects an active `miren.service` and restarts it itself, while fresh `miren install` flows stay quiet because install owns the lifecycle. ([#824](https://github.com/mirendev/runtime/pull/824))
+- **Better admin CLI per-method help** - `miren admin <method> --help` (or `-h`) now shows method help instead of erroring with `unknown parameter(s): help`. Calling a method that declares params with no args renders the help block instead of a raw JSON-RPC error. Missing-required and unknown-param errors embed the full method definition so you can see what was expected at the point of failure. ([#823](https://github.com/mirendev/runtime/pull/823))
+
+**Bug Fixes**
+- **Fixed `sandbox exec` stdout redirection and short-ID lookup** - `miren sandbox exec -i app cat /data/db > backup.db` used to print the database contents to the terminal because the TTY check only looked at stdin; redirected stdout now stays binary-clean and skips PTY allocation. The same command also now resolves short IDs like `7g7` (as displayed by `sandbox list`) instead of erroring with "no container found". ([#828](https://github.com/mirendev/runtime/pull/828))
+- **Fixed deploy panic leaving the server lock stuck for 30 minutes** - An explain-mode deploy could race RPC stream-handler goroutines against the main goroutine closing the status channel, panicking the deploy and leaving the server-side deploy lock held until its TTL. The status channel is now serialized behind a mutex, and a panic-recovery guard releases the lock immediately on crash. ([#822](https://github.com/mirendev/runtime/pull/822))
+- **Fixed ephemeral preview deploys scaling under load** - Ephemeral pools followed normal auto-mode scaling, so traffic bursts ratcheted the pool up instead of queuing on the single preview sandbox. Ephemeral pools are now pinned at `desired_instances = 1` and refuse to scale. The same PR fixes an activator race that returned leases with empty URLs (causing httpingress to fail with `unsupported protocol scheme ""`) and bumps the per-request wait cap from 50s to 120s to cover cold image pulls. ([#821](https://github.com/mirendev/runtime/pull/821))
+- **Fixed `tls.additional_names` / `tls.additional_ips` rejected in `behind-proxy-http` mode** - The validator refused these fields under `behind-proxy-http`, but they also feed the API server and etcd certs, which exist regardless of ingress mode. Operators had no way to set just the API cert SANs, which broke external `miren deploy` with `leaf cert SAN doesn't match`. ([#820](https://github.com/mirendev/runtime/pull/820))
+
+---
+
+## v0.8.0
+*2026-05-20*
+
+**Breaking Changes**
+- **Ingress configuration reshaped around named modes** - The ingress and TLS configuration is now organized as three explicit modes — `tls-autoprovision` (default, behavior unchanged), `behind-proxy-http`, and `behind-proxy-https` — with an optional `ingress.address` for custom bind addresses. The legacy `tls.standard_tls` knob is retired (dev environments already used `--self-signed-tls`). One small behavior change in autoprovision mode: requests to raw-IP or localhost Hosts on `:80` now follow the HTTPS redirect like any other request instead of being shortcut to the default route over plain HTTP. Pick `behind-proxy-http` if you want explicit plain-HTTP for a dev workflow. ([#799](https://github.com/mirendev/runtime/pull/799))
+
+**Features**
+- **Route protection: shared-password auth** - Protect any route behind a shared password. Run `miren auth provider add-password my-gate`, then `miren route protect blog.example.com --provider my-gate`, and your route gets a login form with a 24h encrypted session cookie on success. Good for staging gates, internal dashboards, and anywhere "the half-dozen people who know the password" is enough. ([#787](https://github.com/mirendev/runtime/pull/787))
+- **Route protection: OIDC single sign-on** - Plug your identity provider into a Miren route and the authenticated user's identity arrives at your app as plain HTTP headers like `X-User-Email`. No OAuth library, JWT validation, or callback handler needed in your code. Google, GitLab, and self-hosted Keycloak work directly; GitHub via a Dex federation layer. ([#764](https://github.com/mirendev/runtime/pull/764), [#788](https://github.com/mirendev/runtime/pull/788))
+- **Route protection: Web Application Firewall** - Inspect requests for attack payloads before they reach your app. `miren route waf <host> --level N` runs Coraza with the full OWASP Core Rule Set in front of any route, blocking SQL injection, XSS, path traversal, command injection, and friends. Levels 1-4 map to OWASP paranoia levels; level 1 is the right starting point for most apps. When both auth and WAF are on a route, WAF runs first. See the [route protection docs](https://miren.md/route-protect) and the [announcement post](https://miren.dev/blog/route-protection). ([#786](https://github.com/mirendev/runtime/pull/786))
+- **Ephemeral deployments** - Deploy a labeled, time-boxed version of your app that lives alongside the active version and is reachable at `<label>.<your-route>` without touching production traffic. `miren deploy --ephemeral pr-33 --ttl 24h` creates one; `miren app versions` shows what's live, what's ephemeral, and when each expires. Expired versions are cleaned up automatically, and TLS certs provision on first hit so ephemeral subdomains get real certificates instead of the cluster's self-signed fallback. ([#745](https://github.com/mirendev/runtime/pull/745), [#807](https://github.com/mirendev/runtime/pull/807))
 - **Smarter `miren init`** - `miren init` now scans your project for the environment variables your app actually needs and pre-sets them on the app before the first deploy, the same as if you'd run `miren config set` yourself. Generated secrets (Rails `SECRET_KEY_BASE`), file-backed keys (`RAILS_MASTER_KEY`), framework defaults, and source-detected reads across Python/Node/Bun/Go/Ruby/Rust are recognized; the ones we can resolve are picked up automatically by the first build. See [What `miren init` Does for You](/app-configuration#what-miren-init-does-for-you). ([#567](https://github.com/mirendev/runtime/pull/567))
+
+**Improvements**
+- **Automatic npm/bun installation for mixed-stack apps** - Rails, Django, Go, or Rust apps that ship a `package.json` (or `bun.lock`/`bun.lockb`) now get npm or bun installed onto the base image automatically and `npm install`/`bun install` run as the unprivileged `app` user. Apps that vendor their own `node_modules` still skip the install step. ([#810](https://github.com/mirendev/runtime/pull/810))
+- **Per-service `port_timeout` in app.toml** - Services that need longer than the default 15s to bind their port (Prisma migrations on first boot are a classic culprit) can now declare `port_timeout = "120s"` in their service block. Web and worker services in the same app can hold different timeouts so a slow-booting worker doesn't make web fail-fast change too. ([#792](https://github.com/mirendev/runtime/pull/792))
+- **Sandbox hostname in `/etc/hosts`** - Each sandbox now gets a real IP→hostname entry in `/etc/hosts` so processes that resolve their own hostname (e.g. Erlang's EPMD) see their sandbox IP instead of loopback. ([#784](https://github.com/mirendev/runtime/pull/784))
+- **CLI top-level help grouped by user intent** - `miren --help` now organizes its 30+ top-level commands into five named buckets (Getting started, Monitoring your app, Configuring your app, Client operations, Server operations) so deployers don't have to scan past server-administration commands to find `deploy` and `rollback`. ([#812](https://github.com/mirendev/runtime/pull/812))
+- **Honest upload progress and ETA in `miren deploy`** - The "total" in the upload progress line is no longer fictional and the line now shows a time-domain ETA (`eta ~8h 15m`) instead of a fluctuating projected total. ([#804](https://github.com/mirendev/runtime/pull/804))
+- **`sandbox exec` accepts a positional sandbox ID** - `miren sandbox exec yKm -- hostname` now works the way you'd expect from copying the ID out of `sandbox list`. ([#800](https://github.com/mirendev/runtime/pull/800))
+- **Trustworthy public-address advertising** - The coordinator now trusts per-family netcheck results so an IPv4 success doesn't drop IPv6 reachability, and CGNAT/Tailscale addresses in `100.64.0.0/10` are filtered out of discovered IPs by default. Operators who actually want a CGNAT address advertised can set it explicitly via `AdditionalIPs`. ([#808](https://github.com/mirendev/runtime/pull/808), [#809](https://github.com/mirendev/runtime/pull/809))
+- **Better `.gitignore` handling in source uploads** - Switched the source-bundler to go-git's gitignore matcher, which correctly handles negations like Bridgetown's default `!/tmp/pids/` pattern. Vanilla `bridgetown new` apps now deploy without a missing-pidfile crash. ([#777](https://github.com/mirendev/runtime/pull/777))
+
+**Bug Fixes**
+- **Fixed containerd FIFO directory leak on sandbox teardown** - Sandbox cleanup paths now attach a non-nil `cio.NewAttach()` when fetching tasks for deletion so containerd actually removes its FIFO directories. The leak was exhausting `/run`'s inode budget on long-lived hosts. ([#797](https://github.com/mirendev/runtime/pull/797))
+- **Fixed `miren upgrade --check --channel` ignoring `--channel`** - The version/channel resolution happened after the `--check` early return, so `miren upgrade --check --channel main` was silently reporting against `latest`. Resolution is now shared across `miren upgrade`, `server upgrade`, and `runner upgrade` so they can't drift apart again. ([#798](https://github.com/mirendev/runtime/pull/798))
+- **Fixed `miren login` cancel being reported as a timeout** - Hitting Ctrl-C during login now distinguishes cancellation from `context.DeadlineExceeded` and reports it accordingly. ([#773](https://github.com/mirendev/runtime/pull/773))
 
 ---
 

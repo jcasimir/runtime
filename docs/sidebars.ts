@@ -19,21 +19,45 @@ const sidebars: SidebarsConfig = {
     'getting-started',
     {
       type: 'category',
-      label: 'Features',
+      label: 'Deploy',
       collapsed: false,
       items: [
         'deployment',
         'app-configuration',
         'languages',
         'services',
-        'addons',
-        'traffic-routing',
-        'scaling',
+        'ci-deploy',
+        'pr-environments',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Data & Storage',
+      collapsed: false,
+      items: [
         'disks',
+        'addons',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Networking & Security',
+      collapsed: false,
+      items: [
+        'traffic-routing',
         'tls',
         'firewall',
+        'waf',
         'route-protect',
-        'ci-deploy',
+        'workload-identity',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Run & Scale',
+      collapsed: false,
+      items: [
+        'scaling',
         'admin-interface',
         'observability',
         'logs',
@@ -82,6 +106,7 @@ const sidebars: SidebarsConfig = {
       label: 'Resources',
       collapsed: false,
       items: [
+        'agent-skills',
         'troubleshooting',
         'terminology',
         'labs',

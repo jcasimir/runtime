@@ -22,7 +22,7 @@ func readInfo(e AttrGetter, val any) error {
 	// Use reflection to populate a struct point from the attrs
 
 	rv := reflect.ValueOf(val)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return fmt.Errorf("val must be a non-nil pointer to a struct")
 	}
 
@@ -57,6 +57,7 @@ func readInfo(e AttrGetter, val any) error {
 			continue
 		}
 
+		//exhaustive:ignore reflect.Kind has ~27 members; default handles the rest
 		switch fieldVal.Kind() {
 		case reflect.String:
 			fieldVal.SetString(val.String())

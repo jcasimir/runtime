@@ -28,6 +28,10 @@ type MockStore struct {
 	// Index watchers - maps index key (attr.CAS()) to list of channels to notify
 	indexWatchersMu sync.RWMutex
 	indexWatchers   map[string][]chan clientv3.WatchResponse
+
+	// WatchFromRevs records the fromRev argument of every WatchIndex call, in
+	// order, so tests can assert resume behavior.
+	WatchFromRevs []int64
 }
 
 var _ Store = &MockStore{}
@@ -125,6 +129,35 @@ func (m *MockStore) validateSessionAttrs(ctx context.Context, attrs []Attr, opts
 	return nil
 }
 
+// ensureShortIdLocked mirrors the real store's auto-allocation of db/short-id
+// on kinded entities that don't already carry one. Without this, tests that
+// resolve entities by their short id would have to inject one by hand.
+//
+// The caller must hold m.mu for writing so that candidate uniqueness and the
+// subsequent insert are serialized; otherwise two concurrent CreateEntity
+// calls could each see a candidate as free and both commit it.
+func (m *MockStore) ensureShortIdLocked(entity *Entity) error {
+	if _, hasKind := entity.Get(EntityKind); !hasKind {
+		return nil
+	}
+	if _, hasShortId := entity.Get(DBShortId); hasShortId {
+		return nil
+	}
+	shortId, err := AllocateShortId(string(entity.Id()), func(candidate string) (bool, error) {
+		for _, ent := range m.Entities {
+			if attr, ok := ent.Get(DBShortId); ok && attr.Value.String() == candidate {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to allocate short-id: %w", err)
+	}
+	entity.Set(String(DBShortId, shortId))
+	return nil
+}
+
 func (m *MockStore) CreateEntity(ctx context.Context, entity *Entity, opts ...EntityOption) (*Entity, error) {
 	if err := m.validateSessionAttrs(ctx, entity.attrs, opts); err != nil {
 		return nil, err
@@ -138,6 +171,10 @@ func (m *MockStore) CreateEntity(ctx context.Context, entity *Entity, opts ...En
 	entity.SetRevision(1)
 
 	m.mu.Lock()
+	if err := m.ensureShortIdLocked(entity); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	m.Entities[entity.Id()] = entity
 	m.mu.Unlock()
 
@@ -152,6 +189,21 @@ func (m *MockStore) UpdateEntity(ctx context.Context, id Id, entity *Entity, opt
 		return nil, err
 	}
 
+	// Determine which incoming attr IDs should replace existing values
+	// (cardinality=one) vs accumulate alongside them (cardinality=many).
+	// Mirrors EtcdStore.UpdateEntity (store.go:687) so mock-backed tests
+	// observe the same merge semantics production does.
+	replaceIds := make(map[Id]bool)
+	for _, attr := range entity.attrs {
+		schema, err := m.GetAttributeSchema(ctx, attr.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get attribute schema: %w", err)
+		}
+		if !schema.AllowMany {
+			replaceIds[attr.ID] = true
+		}
+	}
+
 	m.mu.Lock()
 	e, ok := m.Entities[id]
 	if !ok {
@@ -159,22 +211,16 @@ func (m *MockStore) UpdateEntity(ctx context.Context, id Id, entity *Entity, opt
 		return nil, cond.NotFound("entity", id)
 	}
 
-	// Build combined attribute list
-	combinedAttrs := make([]Attr, 0, len(e.attrs))
-
-	// First, copy over existing attributes that aren't being updated
-	attrMap := make(map[Id]Attr)
-	for _, attr := range entity.attrs {
-		attrMap[attr.ID] = attr
-	}
-
+	// Keep existing attrs except those being replaced (cardinality=one IDs
+	// present in the incoming change). Cardinality=many attrs are preserved
+	// so the new incoming values append to the existing set.
+	combinedAttrs := make([]Attr, 0, len(e.attrs)+len(entity.attrs))
 	for _, existing := range e.attrs {
-		if _, isUpdated := attrMap[existing.ID]; !isUpdated {
+		if !replaceIds[existing.ID] {
 			combinedAttrs = append(combinedAttrs, existing)
 		}
 	}
 
-	// Then add the new/updated attributes
 	combinedAttrs = append(combinedAttrs, entity.attrs...)
 
 	// Create a copy to avoid modifying the original
@@ -280,7 +326,19 @@ func (m *MockStore) DeleteEntity(ctx context.Context, id Id) error {
 	return nil
 }
 
-func (m *MockStore) WatchIndex(ctx context.Context, attr Attr) (clientv3.WatchChan, error) {
+// WatchFromRevsCopy returns a snapshot of the fromRev arguments seen by
+// WatchIndex, for tests asserting resume behavior.
+func (m *MockStore) WatchFromRevsCopy() []int64 {
+	m.indexWatchersMu.Lock()
+	defer m.indexWatchersMu.Unlock()
+	return append([]int64(nil), m.WatchFromRevs...)
+}
+
+func (m *MockStore) WatchIndex(ctx context.Context, attr Attr, fromRev int64) (clientv3.WatchChan, error) {
+	m.indexWatchersMu.Lock()
+	m.WatchFromRevs = append(m.WatchFromRevs, fromRev)
+	m.indexWatchersMu.Unlock()
+
 	if m.OnWatchIndex != nil {
 		return m.OnWatchIndex(ctx, attr)
 	}
@@ -462,6 +520,27 @@ func (m *MockStore) ListIndex(ctx context.Context, attr Attr) ([]Id, error) {
 	}
 
 	return ids, nil
+}
+
+// ListIndexRevision returns the matching ids along with a revision. The mock
+// uses the highest entity revision currently in the store as a monotonic proxy
+// for the cluster revision, which is sufficient for resume-cursor tests.
+func (m *MockStore) ListIndexRevision(ctx context.Context, attr Attr) ([]Id, int64, error) {
+	ids, err := m.ListIndex(ctx, attr)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	m.mu.RLock()
+	var rev int64
+	for _, e := range m.Entities {
+		if r := e.GetRevision(); r > rev {
+			rev = r
+		}
+	}
+	m.mu.RUnlock()
+
+	return ids, rev, nil
 }
 
 func (m *MockStore) ListCollection(ctx context.Context, collection string) ([]Id, error) {

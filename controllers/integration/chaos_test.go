@@ -84,6 +84,9 @@ func (r *chaosReport) collectEntityStats(t *testing.T, ctx context.Context, h *T
 			r.provisionedDisks++
 		case storage.ERROR:
 			r.errorDisks++
+		case storage.PROVISIONING, storage.ATTACHED, storage.DETACHED, storage.DELETING, storage.RESTORING:
+			// Counted together as "other".
+			fallthrough
 		default:
 			r.otherDisks++
 		}
@@ -108,6 +111,9 @@ func (r *chaosReport) collectEntityStats(t *testing.T, ctx context.Context, h *T
 			r.mountedMounts++
 		case storage.DM_DETACHED:
 			r.detachedMounts++
+		case storage.DM_PENDING, storage.DM_ATTACHING, storage.DM_ATTACHED, storage.DM_MOUNTING, storage.DM_UNMOUNTING, storage.DM_DETACHING, storage.DM_ERROR:
+			// Counted together as "other".
+			fallthrough
 		default:
 			r.otherMounts++
 		}
@@ -129,8 +135,8 @@ func (r *chaosReport) emit(t *testing.T) {
 	fmt.Fprintf(&b, "Sandboxes spawned mid-test: %d\n", r.sandboxSpawns)
 
 	b.WriteString("\n── Fault Injection ─────────────────────────────\n")
-	b.WriteString(fmt.Sprintf("  %-25s %8s %8s %7s\n", "Fault", "Attempts", "Injected", "Rate"))
-	b.WriteString(fmt.Sprintf("  %-25s %8s %8s %7s\n", "─────", "────────", "────────", "────"))
+	fmt.Fprintf(&b, "  %-25s %8s %8s %7s\n", "Fault", "Attempts", "Injected", "Rate")
+	fmt.Fprintf(&b, "  %-25s %8s %8s %7s\n", "─────", "────────", "────────", "────")
 
 	// Sort fault names for deterministic output
 	var names []string

@@ -54,12 +54,6 @@ import (
 	"miren.dev/runtime/pkg/rpc/stream"
 )
 
-const (
-	// MaxPoolSize is the maximum number of sandboxes allowed in a pool
-	// This prevents runaway growth even if there are bugs in scaling logic
-	MaxPoolSize = 20
-)
-
 // extractHTTPPort extracts the HTTP port from a sandbox spec's container ports.
 // Returns the port number and true if found, or 0 and false if no HTTP port exists.
 func extractHTTPPort(spec *compute_v1alpha.SandboxSpec) (int64, bool) {
@@ -77,6 +71,19 @@ func extractHTTPPort(spec *compute_v1alpha.SandboxSpec) (int64, bool) {
 	}
 
 	return 0, false
+}
+
+// routePort returns the port the activator should route to. When an app bound a
+// port other than the one Miren configured, the sandbox controller records the
+// observed port as a bound_port on the entity; that observation wins so traffic
+// reaches where the app is actually listening. bound_port is written only on
+// divergence and holds a single entry, so the first one is the route target.
+// Otherwise we fall back to configuredPort (the caller's spec-derived default).
+func routePort(boundPorts []compute_v1alpha.BoundPort, configuredPort int64) int64 {
+	if len(boundPorts) > 0 && boundPorts[0].Port > 0 {
+		return boundPorts[0].Port
+	}
+	return configuredPort
 }
 
 type Lease struct {
@@ -298,7 +305,10 @@ func (a *localActivator) AcquireLease(ctx context.Context, ver *core_v1alpha.App
 		return a.waitForSandbox(ctx, ver, service, false)
 	}
 
-	// No RUNNING or PENDING sandboxes - need to scale up via pool
+	// No RUNNING or PENDING sandboxes - need to scale up via pool.
+	// Ephemeral preview deploys are capped at one instance by EphemeralStrategy
+	// (MaxInstances=1), so requestPoolCapacity won't scale them past their single
+	// sandbox — it returns the at-cap pool and the caller waits for it.
 	a.log.Info("no available sandboxes, requesting capacity from pool",
 		"app", ver.App,
 		"version", ver.Version,
@@ -384,12 +394,17 @@ func (a *localActivator) waitForSandbox(ctx context.Context, ver *core_v1alpha.A
 		close(notifyChan)
 	}()
 
-	pollCtx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	// Cap the per-request wait at 120s. The default PortWaitTimeout is 15s and
+	// a first-time image pull on a node that hasn't seen the image can run
+	// 30-90s, plus container setup. The previous 50s cap was too aggressive
+	// for cold starts and would return ErrPoolTimeout while sandboxes were
+	// still booting. Stay under httpingress' leaseAcquisitionTimeout (2m).
+	pollCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	// Fallback ticker at 30s interval as safety net
+	// Fallback ticker at 60s interval as safety net
 	// If this fires, it means channel notification failed somehow
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	// Helper to check for available sandbox
@@ -401,11 +416,15 @@ func (a *localActivator) waitForSandbox(ctx context.Context, ver *core_v1alpha.A
 			// Look up the pool's sandboxes
 			ps, poolOk := a.poolSandboxes[versionRef.poolID]
 			if poolOk && len(ps.sandboxes) > 0 {
-				// Try to find a sandbox with capacity
+				// Try to find a sandbox with capacity.
+				// Require url != "" — a sandbox can briefly be tracked as RUNNING
+				// before the watcher has populated its URL, and returning a Lease
+				// with an empty URL would cause the proxy to fail downstream.
+				// Mirrors the predicate in AcquireLease.
 				start := rand.Int() % len(ps.sandboxes)
 				for i := 0; i < len(ps.sandboxes); i++ {
 					s := ps.sandboxes[(start+i)%len(ps.sandboxes)]
-					if s.sandbox.Status == compute_v1alpha.RUNNING && s.tracker.HasCapacity() {
+					if s.sandbox.Status == compute_v1alpha.RUNNING && s.tracker.HasCapacity() && s.url != "" {
 						candidateSandbox = s
 						break
 					}
@@ -416,9 +435,10 @@ func (a *localActivator) waitForSandbox(ctx context.Context, ver *core_v1alpha.A
 
 		if candidateSandbox != nil {
 			a.mu.Lock()
-			// Double-check status and capacity (may have changed between locks)
+			// Double-check status, capacity, and URL (may have changed between locks)
 			if candidateSandbox.sandbox.Status == compute_v1alpha.RUNNING &&
-				candidateSandbox.tracker.HasCapacity() {
+				candidateSandbox.tracker.HasCapacity() &&
+				candidateSandbox.url != "" {
 				leaseSize := candidateSandbox.tracker.AcquireLease()
 				candidateSandbox.lastRenewal = time.Now()
 				a.mu.Unlock()
@@ -522,7 +542,7 @@ func (a *localActivator) waitForSandbox(ctx context.Context, ver *core_v1alpha.A
 
 		select {
 		case <-pollCtx.Done():
-			return nil, fmt.Errorf("%w: no sandbox became available within 50 seconds", ErrPoolTimeout)
+			return nil, fmt.Errorf("%w: no sandbox became available within 120 seconds", ErrPoolTimeout)
 		case <-notifyChan:
 			// Notified of new sandbox availability, loop back to check
 		case <-ticker.C:
@@ -534,12 +554,69 @@ func (a *localActivator) waitForSandbox(ctx context.Context, ver *core_v1alpha.A
 	}
 }
 
+// registerVersionPoolLocked records the version->pool mapping and ensures an
+// (initially empty) poolSandboxes entry exists for the pool. The caller must
+// hold a.mu for writing.
+//
+// It is idempotent: existing entries are left untouched, since the watcher and
+// recovery own the contents of poolSandboxes[*].sandboxes. It deliberately does
+// not touch a.pools — each caller sets that with its own entity revision.
+//
+// This consolidates the bookkeeping that requestPoolCapacity must do whenever it
+// resolves a pool for a version. Without it, the on-demand creation path (used by
+// ephemeral versions, which the DeploymentLauncher never pre-creates a pool for)
+// would seed a.pools but not a.versions, leaving the version untracked until the
+// watcher happened to discover a sandbox — so AcquireLease would report
+// "tracked: false" and never hand out a lease (MIR-1198).
+func (a *localActivator) registerVersionPoolLocked(
+	key verKey,
+	ver *core_v1alpha.AppVersion,
+	pool *compute_v1alpha.SandboxPool,
+	service string,
+	strategy concurrency.ConcurrencyStrategy,
+) {
+	if _, exists := a.versions[key]; !exists {
+		a.versions[key] = &versionPoolRef{
+			ver:      ver,
+			poolID:   pool.ID,
+			service:  service,
+			strategy: strategy,
+		}
+	}
+
+	if _, ok := a.poolSandboxes[pool.ID]; !ok {
+		a.poolSandboxes[pool.ID] = &poolSandboxes{
+			pool:      pool,
+			sandboxes: []*sandbox{},
+			service:   service,
+			strategy:  strategy,
+		}
+	}
+}
+
 // requestPoolCapacity finds the SandboxPool created by DeploymentLauncher and increments DesiredInstances.
 // It uses retry logic with exponential backoff to handle the race where Activator receives
 // a request before DeploymentLauncher has finished creating the pool.
 // Uses a sentinel pattern to prevent duplicate capacity requests from concurrent callers.
 func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1alpha.AppVersion, service string) (*compute_v1alpha.SandboxPool, error) {
 	key := verKey{ver.ID.String(), service}
+
+	// Resolve config and build the strategy once at entry: the cap comes from
+	// strategy.MaxInstances(), and the same strategy is reused below when we
+	// register a freshly-discovered pool on the cache-miss path. This is the
+	// scale-up path (only reached when no sandbox has capacity), so the extra
+	// entity store reads are acceptable.
+	spec, err := coreutil.ResolveConfig(ctx, a.eac, ver)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve config: %w", err)
+	}
+	svcConcurrency, err := coreutil.GetServiceConcurrency(spec, service)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get service concurrency: %w", err)
+	}
+	sc := core_v1alpha.ServiceConcurrency(svcConcurrency)
+	strategy := concurrency.NewStrategyForVersion(ver, service, &sc)
+	maxInstances := int64(strategy.MaxInstances())
 
 	for {
 		// Check if pool exists or is being created (read lock)
@@ -566,6 +643,16 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 				continue
 			}
 
+			// state.pool is now a real (non-sentinel) cached pool. Ensure the
+			// version->pool mapping exists before we increment and return: a pool
+			// created on-demand seeds a.pools but not a.versions, so without this
+			// a cached ephemeral pool would stay untracked and AcquireLease would
+			// never resolve its sandbox (MIR-1198). Seeding here also self-heals
+			// pools created before this fix shipped, on the next lease request.
+			a.mu.Lock()
+			a.registerVersionPoolLocked(key, ver, state.pool, service, strategy)
+			a.mu.Unlock()
+
 			// Check if pool is in crash cooldown before attempting to increment
 			if !state.pool.CooldownUntil.IsZero() && time.Now().Before(state.pool.CooldownUntil) {
 				return state.pool, fmt.Errorf("%w: application in crash cooldown until %s (consecutive crashes: %d)",
@@ -586,12 +673,13 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 			poolDeleted := false
 			for attempt := 0; attempt < maxRetries; attempt++ {
 				a.mu.Lock()
-				if state.pool.DesiredInstances >= MaxPoolSize {
+				if state.pool.DesiredInstances >= maxInstances {
 					poolIDForMaxCheck := state.pool.ID
 					a.mu.Unlock()
 
 					// Cache says we're at max, but it may be stale. Re-read from entity store
-					// to break potential deadlock where pool manager reset DesiredInstances externally.
+					// to detect whether the pool manager scaled down (giving us headroom) or
+					// whether the pool was deleted entirely.
 					freshPoolEnt, getErr := a.eac.Get(ctx, poolIDForMaxCheck.String())
 					if getErr != nil {
 						if errors.Is(getErr, cond.ErrNotFound{}) {
@@ -604,24 +692,26 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 							poolDeleted = true
 							break
 						}
-						a.log.Warn("pool at maximum size, cannot increment further (re-read failed)",
+						a.log.Warn("pool at maximum size, re-read failed; returning cached pool",
 							"pool", poolIDForMaxCheck,
-							"max_size", MaxPoolSize,
+							"max_size", maxInstances,
 							"error", getErr)
-						return state.pool, fmt.Errorf("pool has reached maximum size of %d", MaxPoolSize)
+						// Caller will poll waitForSandbox for an existing sandbox.
+						return state.pool, nil
 					}
 
 					var freshPool compute_v1alpha.SandboxPool
 					freshPool.Decode(freshPoolEnt.Entity().Entity())
 
 					a.mu.Lock()
-					if freshPool.DesiredInstances >= MaxPoolSize {
+					if freshPool.DesiredInstances >= maxInstances {
 						a.mu.Unlock()
-						a.log.Warn("pool at maximum size, cannot increment further (confirmed by re-read)",
-							"pool", poolIDForMaxCheck,
-							"max_size", MaxPoolSize,
-							"current", freshPool.DesiredInstances)
-						return &freshPool, fmt.Errorf("pool has reached maximum size of %d", MaxPoolSize)
+						// The pool is legitimately at its strategy's cap (e.g. an ephemeral
+						// pool at DesiredInstances=1). Don't error — the caller will wait on
+						// the existing sandbox via waitForSandbox's polling loop. For Auto
+						// pools at MaxPoolSize this is the runaway-prevention case; the wait
+						// will eventually time out via ErrPoolTimeout.
+						return &freshPool, nil
 					}
 
 					// Fresh state is below max - update cache and recalculate target
@@ -806,60 +896,33 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 		}
 
 		if foundPoolWithRev != nil {
-			// Found pool created by DeploymentLauncher - increment with OCC
+			// Found pool created by DeploymentLauncher - register in caches and
+			// then either increment with OCC or skip if already at cap.
 			foundPool := foundPoolWithRev.pool
 			currentRevision := foundPoolWithRev.revision
-
-			if foundPool.DesiredInstances >= MaxPoolSize {
-				a.mu.Unlock()
-				a.log.Warn("launcher-created pool at maximum size, cannot increment further",
-					"pool", foundPool.ID,
-					"max_size", MaxPoolSize,
-					"current", foundPool.DesiredInstances)
-				return foundPool, fmt.Errorf("pool has reached maximum size of %d", MaxPoolSize)
-			}
-
-			newDesired := foundPool.DesiredInstances + 1
 			poolID := foundPool.ID
 
-			// Get service concurrency and create strategy for version->pool mapping
-			spec, err := coreutil.ResolveConfig(ctx, a.eac, ver)
-			if err != nil {
-				a.mu.Unlock()
-				return nil, fmt.Errorf("failed to resolve config: %w", err)
-			}
-			svcConcurrency, err := coreutil.GetServiceConcurrency(spec, service)
-			if err != nil {
-				a.mu.Unlock()
-				return nil, fmt.Errorf("failed to get service concurrency: %w", err)
-			}
-			sc := core_v1alpha.ServiceConcurrency(svcConcurrency)
-			strategy := concurrency.NewStrategy(&sc)
-
-			// Cache the pool state before releasing lock
+			// Cache the pool state and register strategy before doing anything
+			// else: even when we're at cap and won't patch, the caller needs
+			// to find the pool through the cache for subsequent operations.
 			a.pools[key] = &poolState{
 				pool:       foundPool,
 				revision:   currentRevision,
 				inProgress: false,
 			}
 
-			// Create version->pool mapping
-			a.versions[key] = &versionPoolRef{
-				ver:      ver,
-				poolID:   poolID,
-				service:  service,
-				strategy: strategy,
+			a.registerVersionPoolLocked(key, ver, foundPool, service, strategy)
+
+			// If the pool is already at its strategy's cap, there's nothing
+			// to patch (e.g. ephemeral pools seed at DesiredInstances=1 with
+			// MaxInstances=1). Return the cached pool; the caller will poll
+			// for the existing sandbox via waitForSandbox.
+			if foundPool.DesiredInstances >= maxInstances {
+				a.mu.Unlock()
+				return foundPool, nil
 			}
 
-			// Initialize poolSandboxes entry if needed
-			if _, ok := a.poolSandboxes[poolID]; !ok {
-				a.poolSandboxes[poolID] = &poolSandboxes{
-					pool:      foundPool,
-					sandboxes: []*sandbox{},
-					service:   service,
-					strategy:  strategy,
-				}
-			}
+			newDesired := foundPool.DesiredInstances + 1
 
 			a.mu.Unlock()
 
@@ -971,6 +1034,7 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 					pool:     foundPool.pool,
 					revision: foundPool.revision,
 				}
+				a.registerVersionPoolLocked(key, ver, foundPool.pool, service, strategy)
 			}
 			a.mu.Unlock()
 			close(sentinel.done)
@@ -1105,10 +1169,62 @@ func (a *localActivator) Invalidations() <-chan SandboxInvalidation {
 	return a.invalidationCh
 }
 
+// resyncFromStore re-reads pools and sandboxes from the entity store and adopts
+// any that the in-memory caches are missing. WatchIndex only streams new ops from
+// the current revision — it does not replay existing entities on (re)connect — so a
+// watch reconnect (compaction, leader change, network blip) silently drops every
+// event during the gap. Without a re-sync those changes are lost until the process
+// restarts, which is how an ephemeral version ends up permanently untracked even
+// though a healthy sandbox exists for it (MIR-1198). recoverPools and
+// recoverSandboxes are additive (create-only / dedupe by sandbox ID) and lock per
+// item, so this is safe to run repeatedly against live state and from either watch.
+//
+// Both watchSandboxes and watchPools call this on their own reconnect, so a single
+// etcd blip (which usually trips both watches at once) runs the reconcile twice,
+// roughly concurrently. That's intentional: the redundant pass is idempotent and
+// bounded, and accepting it is cheaper than adding cross-goroutine debounce state
+// to coordinate the two watchers.
+func (a *localActivator) resyncFromStore(ctx context.Context) {
+	a.log.Info("re-syncing activator state from store after watch reconnect")
+	if err := a.recoverPools(ctx); err != nil {
+		a.log.Error("failed to re-sync pools after watch reconnect", "error", err)
+	}
+	if err := a.recoverSandboxes(ctx); err != nil {
+		a.log.Error("failed to re-sync sandboxes after watch reconnect", "error", err)
+	}
+
+	// Recovery adopts sandboxes by appending to poolSandboxes directly, bypassing
+	// the per-sandbox notify the watcher does, so wake parked waiters to re-check
+	// rather than making them wait out the 60s fallback ticker.
+	a.wakeAllWaiters()
+}
+
+// wakeAllWaiters signals every parked waitForSandbox goroutine to re-check its
+// pool. resyncFromStore calls this after a reconnect reconcile: recoverSandboxes
+// adopts sandboxes by appending to poolSandboxes directly, bypassing the
+// per-sandbox notify the watcher does (see watchSandboxes), so without this an
+// already-parked waiter wouldn't see an adopted sandbox until the 60s fallback
+// ticker — and would log a misleading "channel notification may have failed" when
+// it finally woke. A spurious wake is harmless: the waiter re-scans and re-parks
+// if its sandbox still isn't there.
+func (a *localActivator) wakeAllWaiters() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, chans := range a.newSandboxChans {
+		for _, ch := range chans {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
 func (a *localActivator) watchSandboxes(ctx context.Context) {
 	// Watch for sandbox changes: update status AND discover new RUNNING sandboxes
 	// This is the single source of sandbox discovery for the activator
 	// Retry loop to handle transient failures
+	firstWatch := true
 	for {
 		select {
 		case <-ctx.Done():
@@ -1117,9 +1233,16 @@ func (a *localActivator) watchSandboxes(ctx context.Context) {
 		default:
 		}
 
+		// NewLocalActivator already ran the initial recovery, so only re-sync on
+		// reconnects (see resyncFromStore for why this is necessary).
+		if !firstWatch {
+			a.resyncFromStore(ctx)
+		}
+		firstWatch = false
+
 		a.log.Info("starting sandbox discovery watch")
 
-		_, err := a.eac.WatchIndex(ctx, entity.Ref(entity.EntityKind, compute_v1alpha.KindSandbox), stream.Callback(func(op *entityserver_v1alpha.EntityOp) error {
+		_, err := a.eac.WatchIndex(ctx, entity.Ref(entity.EntityKind, compute_v1alpha.KindSandbox), 0, stream.Callback(func(op *entityserver_v1alpha.EntityOp) error {
 			if op.IsDelete() {
 				// Entity was deleted - clean up from tracking
 				// The ID should still be available in the operation even without the entity
@@ -1163,6 +1286,7 @@ func (a *localActivator) watchSandboxes(ctx context.Context) {
 					if !found {
 						port = 3000 // Default fallback
 					}
+					port = routePort(sb.BoundPort, port)
 
 					if addr, err := netutil.BuildHTTPURL(sb.Network[0].Address, port); err == nil {
 						newURL = addr
@@ -1172,6 +1296,7 @@ func (a *localActivator) watchSandboxes(ctx context.Context) {
 				// Now acquire write lock to update shared state
 				a.mu.Lock()
 				oldStatus := trackedSandbox.sandbox.Status
+				oldURL := trackedSandbox.url
 				trackedSandbox.sandbox.Status = sb.Status
 
 				// Re-check conditions under lock and update URL if still needed
@@ -1184,12 +1309,17 @@ func (a *localActivator) watchSandboxes(ctx context.Context) {
 				// They will be cleaned up later by periodic reconciliation or when
 				// new RUNNING sandboxes are discovered
 
-				// Notify waiters when sandbox status changes to RUNNING, STOPPED, or DEAD
-				// RUNNING: sandbox is ready to serve traffic
-				// STOPPED: sandbox process exited, will be cleaned up by reconciliation
-				// DEAD: sandbox cleaned up, only entity remains
-				// Notify ALL versions that reference this pool
-				if oldStatus != sb.Status && (sb.Status == compute_v1alpha.RUNNING || sb.Status == compute_v1alpha.STOPPED || sb.Status == compute_v1alpha.DEAD) {
+				// Notify waiters when:
+				//  - sandbox status changes to RUNNING/STOPPED/DEAD, OR
+				//  - a RUNNING sandbox's URL transitions from empty to populated
+				//    (the sandbox may have been marked RUNNING in a prior watch
+				//    event before its network address was visible; waiters that
+				//    saw RUNNING but no URL were effectively stuck until this
+				//    follow-up event arrives).
+				statusChanged := oldStatus != sb.Status &&
+					(sb.Status == compute_v1alpha.RUNNING || sb.Status == compute_v1alpha.STOPPED || sb.Status == compute_v1alpha.DEAD)
+				urlBecameAvailable := sb.Status == compute_v1alpha.RUNNING && oldURL == "" && trackedSandbox.url != ""
+				if statusChanged || urlBecameAvailable {
 					// Notify all versions that reference this pool
 					// Find all version->service mappings that use this pool
 					for key, versionRef := range a.versions {
@@ -1299,6 +1429,7 @@ func (a *localActivator) watchSandboxes(ctx context.Context) {
 						break
 					}
 				}
+				port = routePort(sb.BoundPort, port)
 
 				var err error
 				addr, err = netutil.BuildHTTPURL(sb.Network[0].Address, port)
@@ -1315,7 +1446,7 @@ func (a *localActivator) watchSandboxes(ctx context.Context) {
 				return nil
 			}
 			sc := core_v1alpha.ServiceConcurrency(svcConcurrency)
-			strategy := concurrency.NewStrategy(&sc)
+			strategy := concurrency.NewStrategyForVersion(&appVer, service, &sc)
 			tracker := strategy.InitializeTracker()
 
 			lsb := &sandbox{
@@ -1474,6 +1605,7 @@ func (a *localActivator) recoverSandboxes(ctx context.Context) error {
 		if !found {
 			port = 3000 // Default fallback
 		}
+		port = routePort(sb.BoundPort, port)
 
 		// Build HTTP URL from address and port
 		if len(sb.Network) == 0 {
@@ -1494,7 +1626,7 @@ func (a *localActivator) recoverSandboxes(ctx context.Context) error {
 			continue
 		}
 		sc := core_v1alpha.ServiceConcurrency(svcConcurrency)
-		strategy := concurrency.NewStrategy(&sc)
+		strategy := concurrency.NewStrategyForVersion(&appVer, service, &sc)
 
 		// Initialize tracker for recovered sandbox (starts empty)
 		tracker := strategy.InitializeTracker()
@@ -1589,16 +1721,31 @@ func (a *localActivator) recoverPools(ctx context.Context) error {
 			continue
 		}
 		sc := core_v1alpha.ServiceConcurrency(svcConcurrency)
-		strategy := concurrency.NewStrategy(&sc)
+		strategy := concurrency.NewStrategyForVersion(&appVer, pool.Service, &sc)
 
 		a.mu.Lock()
 
-		// Cache pool state (for sentinel pattern in requestPoolCapacity)
+		// Cache pool state (for sentinel pattern in requestPoolCapacity).
+		// Create-only: at startup the map is empty so this seeds every pool, but
+		// when recoverPools runs again as a live re-sync (watch reconnect) we must
+		// not clobber an in-progress creation sentinel or a freshly-patched
+		// revision held by a concurrent requestPoolCapacity. watchPools keeps
+		// existing entries' DesiredInstances fresh; here we only fill gaps.
+		//
+		// Deliberately we do NOT refresh an already-cached entry here, even though
+		// the missed-event window is exactly when its DesiredInstances/revision
+		// could have gone stale. A refresh is unsafe: this re-sync's store read can
+		// itself be older than an in-memory revision a concurrent requestPoolCapacity
+		// just patched, so overwriting could move the cache backward. The stale case
+		// self-heals instead — the next increment hits a revision conflict on Patch,
+		// clears the entry, and re-reads (see the ErrConflict path above).
 		key := verKey{versionID.String(), pool.Service}
-		a.pools[key] = &poolState{
-			pool:       &pool,
-			revision:   ent.Revision(),
-			inProgress: false,
+		if _, ok := a.pools[key]; !ok {
+			a.pools[key] = &poolState{
+				pool:       &pool,
+				revision:   ent.Revision(),
+				inProgress: false,
+			}
 		}
 
 		// Initialize empty poolSandboxes entry (sandboxes will be added by recoverSandboxes)
@@ -1871,6 +2018,7 @@ func (a *localActivator) removePoolFromTracking(poolID entity.Id) {
 // watchPools watches for pool entity changes and keeps the in-memory cache in sync.
 // Handles deletions (cleanup stale entries) and updates (refresh DesiredInstances, etc.).
 func (a *localActivator) watchPools(ctx context.Context) {
+	firstWatch := true
 	for {
 		select {
 		case <-ctx.Done():
@@ -1879,9 +2027,17 @@ func (a *localActivator) watchPools(ctx context.Context) {
 		default:
 		}
 
+		// Like watchSandboxes, the pool watch streams only new ops from the current
+		// revision, so re-sync from the store on reconnect to recover pool/version
+		// mappings missed while the watch was down (see resyncFromStore).
+		if !firstWatch {
+			a.resyncFromStore(ctx)
+		}
+		firstWatch = false
+
 		a.log.Info("starting pool watch")
 
-		_, err := a.eac.WatchIndex(ctx, entity.Ref(entity.EntityKind, compute_v1alpha.KindSandboxPool), stream.Callback(func(op *entityserver_v1alpha.EntityOp) error {
+		_, err := a.eac.WatchIndex(ctx, entity.Ref(entity.EntityKind, compute_v1alpha.KindSandboxPool), 0, stream.Callback(func(op *entityserver_v1alpha.EntityOp) error {
 			if op.IsDelete() {
 				// Pool was deleted - clean up all related cache entries
 				if op.HasEntityId() {

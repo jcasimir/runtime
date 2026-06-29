@@ -372,7 +372,7 @@ func TestActivatorRecoveryIntegration(t *testing.T) {
 	assert.Len(t, ps.sandboxes, 3, "should recover all 3 sandboxes")
 
 	// Verify strategy configuration
-	assert.Equal(t, 0, ps.strategy.DesiredInstances()) // Auto mode scales to zero
+	assert.Equal(t, 0, ps.strategy.MinInstances()) // Auto mode scales to zero
 }
 
 // TestActivatorAcquireLeaseFromDeadSandbox verifies that DEAD sandboxes
@@ -2512,7 +2512,7 @@ func TestActivatorRefreshesStaleMaxPoolSizeCache(t *testing.T) {
 
 	// Set up activator with a STALE cache that thinks DesiredInstances = MaxPoolSize
 	stalePool := *pool
-	stalePool.DesiredInstances = MaxPoolSize
+	stalePool.DesiredInstances = concurrency.MaxPoolSize
 
 	activator := &localActivator{
 		log: log,
@@ -2667,4 +2667,849 @@ func TestWatchPoolsUpdatesDesiredInstances(t *testing.T) {
 	activator.mu.RUnlock()
 	assert.Equal(t, int64(2), ps.pool.DesiredInstances,
 		"poolSandboxes pool pointer should reflect the updated DesiredInstances")
+}
+
+// TestRequestPoolCapacityScalesNormalPool is a regression guard for the
+// normal scale-up path: a non-ephemeral cached pool should still get its
+// DesiredInstances incremented on capacity requests.
+func TestRequestPoolCapacityScalesNormalPool(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+
+	testVer := &core_v1alpha.AppVersion{
+		App:      appID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Services: []core_v1alpha.Services{
+				{Name: "web"},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", testVer)
+	require.NoError(t, err)
+	testVer.ID = verID
+
+	pool := &compute_v1alpha.SandboxPool{
+		Service:              "web",
+		SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		ReferencedByVersions: []entity.Id{testVer.ID},
+		DesiredInstances:     1,
+		// Ephemeral defaults to false.
+	}
+	poolID, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+	pool.ID = poolID
+
+	getRes, err := server.EAC.Get(ctx, poolID.String())
+	require.NoError(t, err)
+	initialRevision := getRes.Entity().Revision()
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	key := verKey{testVer.ID.String(), "web"}
+	activator.pools[key] = &poolState{
+		pool:       pool,
+		revision:   initialRevision,
+		inProgress: false,
+	}
+
+	resultPool, err := activator.requestPoolCapacity(ctx, testVer, "web")
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), resultPool.DesiredInstances,
+		"non-ephemeral pool should still scale up normally")
+}
+
+// TestRequestPoolCapacityAtMaxReturnsExistingPool verifies that when a cached
+// pool is already at its strategy-enforced cap (e.g. an ephemeral pool seeded
+// at DesiredInstances=1 with MaxInstances=1), requestPoolCapacity returns the
+// pool without erroring. The original "at cap" check was a runaway guard that
+// errored; with type-driven caps, "at cap" is the normal operating point for
+// ephemeral pools and must not surface as a lease-acquisition failure.
+func TestRequestPoolCapacityAtMaxReturnsExistingPool(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+
+	testVer := &core_v1alpha.AppVersion{
+		App:            appID,
+		Version:        "v1",
+		ImageUrl:       "test:latest",
+		EphemeralLabel: "feat-x",
+		Config: core_v1alpha.Config{
+			Services: []core_v1alpha.Services{
+				{Name: "web"},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", testVer)
+	require.NoError(t, err)
+	testVer.ID = verID
+
+	pool := &compute_v1alpha.SandboxPool{
+		Service:              "web",
+		SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		ReferencedByVersions: []entity.Id{testVer.ID},
+		DesiredInstances:     1,
+	}
+	poolID, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+	pool.ID = poolID
+
+	getRes, err := server.EAC.Get(ctx, poolID.String())
+	require.NoError(t, err)
+	initialRevision := getRes.Entity().Revision()
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	key := verKey{testVer.ID.String(), "web"}
+	activator.pools[key] = &poolState{
+		pool:       pool,
+		revision:   initialRevision,
+		inProgress: false,
+	}
+
+	for i := 0; i < 5; i++ {
+		resultPool, err := activator.requestPoolCapacity(ctx, testVer, "web")
+		require.NoError(t, err, "iteration %d: at-cap pool must not error", i)
+		require.NotNil(t, resultPool)
+		assert.Equal(t, int64(1), resultPool.DesiredInstances,
+			"iteration %d: pool must not be incremented past EphemeralStrategy's MaxInstances=1", i)
+	}
+
+	finalRes, err := server.EAC.Get(ctx, poolID.String())
+	require.NoError(t, err)
+	assert.Equal(t, initialRevision, finalRes.Entity().Revision(),
+		"no Patch should have been issued; entity revision should not advance")
+}
+
+// TestWaitForSandboxSkipsEmptyURL verifies that checkForSandbox does not
+// return a Lease for a sandbox that is RUNNING but whose URL has not yet
+// been populated. Returning such a lease would cause the proxy to fail
+// with "unsupported protocol scheme """ on an empty target URL.
+func TestWaitForSandboxSkipsEmptyURL(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	testVer := &core_v1alpha.AppVersion{
+		App:      app.ID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Services: []core_v1alpha.Services{
+				{
+					Name: "web",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+						Mode:                "auto",
+						RequestsPerInstance: 10,
+					},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", testVer)
+	require.NoError(t, err)
+	testVer.ID = verID
+
+	log := testutils.TestLogger(t)
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	strategy := concurrency.NewStrategy(&testVer.Config.Services[0].ServiceConcurrency)
+	tracker := strategy.InitializeTracker()
+
+	// A sandbox that has flipped to RUNNING but whose URL is not yet populated.
+	// This mimics the window where watchSandboxes observed the status change
+	// in one watch event but the network address has not yet arrived.
+	sb := &sandbox{
+		sandbox: &compute_v1alpha.Sandbox{
+			ID:     entity.Id("sandbox/test-sb"),
+			Status: compute_v1alpha.RUNNING,
+			Spec:   compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		},
+		ent:         entity.Blank(),
+		lastRenewal: time.Now(),
+		url:         "", // intentionally empty
+		tracker:     tracker,
+	}
+
+	poolID := entity.Id("pool-1")
+	key := verKey{testVer.ID.String(), "web"}
+	activator.mu.Lock()
+	activator.versions[key] = &versionPoolRef{
+		ver:      testVer,
+		poolID:   poolID,
+		service:  "web",
+		strategy: strategy,
+	}
+	activator.poolSandboxes[poolID] = &poolSandboxes{
+		pool:      &compute_v1alpha.SandboxPool{ID: poolID},
+		sandboxes: []*sandbox{sb},
+		service:   "web",
+		strategy:  strategy,
+	}
+	activator.mu.Unlock()
+
+	// Use incrementPool=false so we don't try to patch a pool; we just want
+	// to exercise the polling helper. Give it a short outer context so the
+	// test does not have to wait for the 120s internal timeout.
+	waitCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+
+	lease, err := activator.waitForSandbox(waitCtx, testVer, "web", false)
+	require.Error(t, err, "should not return a Lease for an empty-URL sandbox")
+	assert.Nil(t, lease)
+}
+
+// TestAcquireLeaseSucceedsAfterURLArrives verifies the full path: a sandbox is
+// tracked as RUNNING with an empty URL; a waiter is blocked in waitForSandbox;
+// once the URL becomes available and the notification fires, the waiter wakes
+// and receives a Lease pointing at the real URL.
+func TestAcquireLeaseSucceedsAfterURLArrives(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	testVer := &core_v1alpha.AppVersion{
+		App:      app.ID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Services: []core_v1alpha.Services{
+				{
+					Name: "web",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+						Mode:                "auto",
+						RequestsPerInstance: 10,
+					},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", testVer)
+	require.NoError(t, err)
+	testVer.ID = verID
+
+	log := testutils.TestLogger(t)
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	strategy := concurrency.NewStrategy(&testVer.Config.Services[0].ServiceConcurrency)
+	tracker := strategy.InitializeTracker()
+
+	sb := &sandbox{
+		sandbox: &compute_v1alpha.Sandbox{
+			ID:     entity.Id("sandbox/late-url"),
+			Status: compute_v1alpha.RUNNING,
+			Spec:   compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		},
+		ent:         entity.Blank(),
+		lastRenewal: time.Now(),
+		url:         "", // arrives later
+		tracker:     tracker,
+	}
+
+	poolID := entity.Id("pool-1")
+	key := verKey{testVer.ID.String(), "web"}
+	activator.mu.Lock()
+	activator.versions[key] = &versionPoolRef{
+		ver:      testVer,
+		poolID:   poolID,
+		service:  "web",
+		strategy: strategy,
+	}
+	activator.poolSandboxes[poolID] = &poolSandboxes{
+		pool:      &compute_v1alpha.SandboxPool{ID: poolID},
+		sandboxes: []*sandbox{sb},
+		service:   "web",
+		strategy:  strategy,
+	}
+	activator.mu.Unlock()
+
+	// Populate the URL after a short delay and notify waiters — this is
+	// what Fix 2 would arrange when a watch event populates the URL on a
+	// sandbox that was already RUNNING.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		activator.mu.Lock()
+		sb.url = "http://10.0.0.1:3000"
+		chans := activator.newSandboxChans[key]
+		for _, ch := range chans {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+		activator.mu.Unlock()
+	}()
+
+	// Bound the wait so a regression in the URL-arrival notification path
+	// fails fast (within 2s) rather than hanging for the full 120s internal
+	// timeout on waitForSandbox.
+	waitCtx, cancelWait := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelWait()
+
+	start := time.Now()
+	lease, err := activator.waitForSandbox(waitCtx, testVer, "web", false)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	assert.Equal(t, "http://10.0.0.1:3000", lease.URL, "lease should carry the populated URL")
+	assert.Greater(t, elapsed, 50*time.Millisecond, "should have waited for the URL to arrive")
+	assert.Less(t, elapsed, 2*time.Second, "should not have timed out")
+}
+
+// fakePoolCreator is a test PoolCreator that delegates to a closure, letting a
+// test control when and how the on-demand pool is created.
+type fakePoolCreator struct {
+	create func(ctx context.Context, ver *core_v1alpha.AppVersion, service string) (entity.Id, error)
+}
+
+func (f *fakePoolCreator) CreatePoolForVersion(ctx context.Context, ver *core_v1alpha.AppVersion, service string) (entity.Id, error) {
+	return f.create(ctx, ver, service)
+}
+
+func newEphemeralVersion(t *testing.T, server *testutils.InMemEntityServer, ctx context.Context) *core_v1alpha.AppVersion {
+	t.Helper()
+
+	app := &core_v1alpha.App{}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+
+	ver := &core_v1alpha.AppVersion{
+		App:            appID,
+		Version:        "v1",
+		ImageUrl:       "test:latest",
+		EphemeralLabel: "feat-x",
+		Config: core_v1alpha.Config{
+			Services: []core_v1alpha.Services{
+				{Name: "web"},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", ver)
+	require.NoError(t, err)
+	ver.ID = verID
+	return ver
+}
+
+// TestRequestPoolCapacityOnDemandSeedsVersionMapping is the direct MIR-1198
+// regression test. Ephemeral versions have no pool pre-created by the launcher,
+// so requestPoolCapacity creates one on demand via the PoolCreator. That branch
+// used to seed only a.pools, leaving a.versions empty — so AcquireLease reported
+// "tracked: false" and never handed out a lease even though the pool (and later a
+// sandbox) existed. It must now seed a.versions and a.poolSandboxes too.
+func TestRequestPoolCapacityOnDemandSeedsVersionMapping(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	testVer := newEphemeralVersion(t, server, ctx)
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	var createdPoolID entity.Id
+	activator.poolCreator = &fakePoolCreator{
+		create: func(ctx context.Context, ver *core_v1alpha.AppVersion, service string) (entity.Id, error) {
+			pool := &compute_v1alpha.SandboxPool{
+				Service:              service,
+				SandboxSpec:          compute_v1alpha.SandboxSpec{Version: ver.ID},
+				ReferencedByVersions: []entity.Id{ver.ID},
+				DesiredInstances:     1,
+			}
+			id, err := server.Client.Create(ctx, "ondemand-pool", pool)
+			if err != nil {
+				return "", err
+			}
+			createdPoolID = id
+			return id, nil
+		},
+	}
+
+	resultPool, err := activator.requestPoolCapacity(ctx, testVer, "web")
+	require.NoError(t, err)
+	require.NotNil(t, resultPool)
+
+	key := verKey{testVer.ID.String(), "web"}
+
+	activator.mu.RLock()
+	defer activator.mu.RUnlock()
+
+	versionRef, ok := activator.versions[key]
+	require.True(t, ok, "on-demand pool creation must seed a.versions for the ephemeral version (MIR-1198)")
+	assert.Equal(t, createdPoolID, versionRef.poolID)
+
+	_, ok = activator.poolSandboxes[createdPoolID]
+	require.True(t, ok, "on-demand pool creation must seed an a.poolSandboxes entry")
+}
+
+// TestRequestPoolCapacityCachedSeedsVersionMapping covers the self-heal path: a
+// pool created on-demand before this fix shipped (or one whose watcher mapping was
+// lost) leaves a.pools cached but a.versions empty. Every subsequent call hits the
+// cached-pool branch, which must now seed a.versions so the version becomes
+// resolvable without requiring a process restart.
+func TestRequestPoolCapacityCachedSeedsVersionMapping(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	testVer := newEphemeralVersion(t, server, ctx)
+
+	pool := &compute_v1alpha.SandboxPool{
+		Service:              "web",
+		SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		ReferencedByVersions: []entity.Id{testVer.ID},
+		DesiredInstances:     1,
+	}
+	poolID, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+	pool.ID = poolID
+
+	getRes, err := server.EAC.Get(ctx, poolID.String())
+	require.NoError(t, err)
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	key := verKey{testVer.ID.String(), "web"}
+	// Mimic a pool created on-demand before the fix: a.pools is cached but
+	// a.versions was never seeded.
+	activator.pools[key] = &poolState{
+		pool:       pool,
+		revision:   getRes.Entity().Revision(),
+		inProgress: false,
+	}
+
+	_, err = activator.requestPoolCapacity(ctx, testVer, "web")
+	require.NoError(t, err)
+
+	activator.mu.RLock()
+	defer activator.mu.RUnlock()
+
+	versionRef, ok := activator.versions[key]
+	require.True(t, ok, "cached-pool path must self-heal by seeding a.versions (MIR-1198)")
+	assert.Equal(t, poolID, versionRef.poolID)
+}
+
+// TestAcquireLeaseEphemeralOnDemand exercises the full lease path for an ephemeral
+// version end-to-end: AcquireLease -> waitForSandbox -> requestPoolCapacity creates
+// the pool on demand (seeding a.versions), then the watcher (simulated here) injects
+// the booted sandbox. Before the fix the version stayed untracked, so AcquireLease
+// would hang until the 120s cap; this test bounds the wait to 2s so a regression
+// fails fast.
+func TestAcquireLeaseEphemeralOnDemand(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	testVer := newEphemeralVersion(t, server, ctx)
+	strategy := concurrency.NewStrategyForVersion(testVer, "web", &testVer.Config.Services[0].ServiceConcurrency)
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	activator.poolCreator = &fakePoolCreator{
+		create: func(ctx context.Context, ver *core_v1alpha.AppVersion, service string) (entity.Id, error) {
+			pool := &compute_v1alpha.SandboxPool{
+				Service:              service,
+				SandboxSpec:          compute_v1alpha.SandboxSpec{Version: ver.ID},
+				ReferencedByVersions: []entity.Id{ver.ID},
+				DesiredInstances:     1,
+			}
+			return server.Client.Create(ctx, "ondemand-pool", pool)
+		},
+	}
+
+	key := verKey{testVer.ID.String(), "web"}
+
+	// Simulate the watcher discovering the booted sandbox shortly after the pool
+	// is created on-demand: poll until the version becomes tracked, then inject a
+	// RUNNING sandbox with a URL and notify waiters.
+	go func() {
+		for {
+			activator.mu.RLock()
+			versionRef, ok := activator.versions[key]
+			activator.mu.RUnlock()
+			if ok {
+				activator.mu.Lock()
+				ps := activator.poolSandboxes[versionRef.poolID]
+				ent := entity.Blank()
+				ent.SetID("eph-sandbox")
+				ps.sandboxes = append(ps.sandboxes, &sandbox{
+					sandbox: &compute_v1alpha.Sandbox{
+						ID:     entity.Id("eph-sandbox"),
+						Status: compute_v1alpha.RUNNING,
+						Spec:   compute_v1alpha.SandboxSpec{Version: testVer.ID},
+					},
+					ent:         ent,
+					lastRenewal: time.Now(),
+					url:         "http://10.0.0.7:3000",
+					tracker:     strategy.InitializeTracker(),
+				})
+				if chans, ok := activator.newSandboxChans[key]; ok {
+					for _, ch := range chans {
+						select {
+						case ch <- struct{}{}:
+						default:
+						}
+					}
+				}
+				activator.mu.Unlock()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	acqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	lease, err := activator.AcquireLease(acqCtx, testVer, "web")
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	assert.Equal(t, "http://10.0.0.7:3000", lease.URL)
+}
+
+// TestRecoverPoolsPreservesInProgressSentinel verifies recoverPools is safe to run
+// as a live re-sync (on watch reconnect): it must not clobber an in-progress
+// creation sentinel held by a concurrent requestPoolCapacity, which would strand
+// the sentinel's waiters on the abandoned done channel.
+func TestRecoverPoolsPreservesInProgressSentinel(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	testVer := newEphemeralVersion(t, server, ctx)
+
+	pool := &compute_v1alpha.SandboxPool{
+		Service:              "web",
+		SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		ReferencedByVersions: []entity.Id{testVer.ID},
+		DesiredInstances:     1,
+	}
+	_, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	key := verKey{testVer.ID.String(), "web"}
+	sentinel := &poolState{inProgress: true, done: make(chan struct{})}
+	activator.pools[key] = sentinel
+
+	require.NoError(t, activator.recoverPools(ctx))
+
+	activator.mu.RLock()
+	got := activator.pools[key]
+	activator.mu.RUnlock()
+	assert.Same(t, sentinel, got, "recoverPools must not replace an in-progress creation sentinel")
+	assert.True(t, got.inProgress, "sentinel must remain in-progress")
+}
+
+// TestReSyncRecoversUntrackedEphemeralSandbox reproduces the steady state the
+// activator lands in after a watch reconnect drops events (MIR-1198): a pool and a
+// RUNNING sandbox exist in the store for an ephemeral version, but the activator
+// tracks nothing (WatchIndex never replayed them). The re-sync that watchSandboxes
+// now runs on reconnect — recoverPools + recoverSandboxes — must adopt the sandbox
+// and seed a.versions so AcquireLease can hand out a lease instead of hanging.
+func TestReSyncRecoversUntrackedEphemeralSandbox(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	testVer := newEphemeralVersion(t, server, ctx)
+
+	pool := &compute_v1alpha.SandboxPool{
+		Service:              "web",
+		SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		ReferencedByVersions: []entity.Id{testVer.ID},
+		DesiredInstances:     1,
+	}
+	poolID, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+
+	sb := &compute_v1alpha.Sandbox{
+		Status: compute_v1alpha.RUNNING,
+		Spec: compute_v1alpha.SandboxSpec{
+			Version: testVer.ID,
+			Container: []compute_v1alpha.SandboxSpecContainer{
+				{Port: []compute_v1alpha.SandboxSpecContainerPort{{Port: 3000, Name: "http", Type: "http"}}},
+			},
+		},
+		Network: []compute_v1alpha.Network{{Address: "10.0.0.7"}},
+	}
+	var rpcE entityserver_v1alpha.Entity
+	rpcE.SetAttrs(entity.New(
+		(&core_v1alpha.Metadata{
+			Name:   "eph-sandbox",
+			Labels: types.LabelSet("service", "web", "pool", poolID.String()),
+		}).Encode,
+		entity.Ident, entity.MustKeyword("sandbox/eph-sb"),
+		sb.Encode,
+	).Attrs())
+	_, err = server.EAC.Put(ctx, &rpcE)
+	require.NoError(t, err)
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	key := verKey{testVer.ID.String(), "web"}
+	activator.mu.RLock()
+	_, tracked := activator.versions[key]
+	activator.mu.RUnlock()
+	require.False(t, tracked, "precondition: version must start untracked (as after a dropped watch event)")
+
+	// The re-sync watchSandboxes performs on reconnect.
+	require.NoError(t, activator.recoverPools(ctx))
+	require.NoError(t, activator.recoverSandboxes(ctx))
+
+	acqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	lease, err := activator.AcquireLease(acqCtx, testVer, "web")
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	assert.Equal(t, "http://10.0.0.7:3000", lease.URL)
+}
+
+// TestWakeAllWaitersNonBlocking verifies wakeAllWaiters signals an empty
+// notification channel and does not block on one that is already full (the
+// buffered channel a parked waiter registers). This is the mechanism
+// resyncFromStore relies on to nudge parked waiters after a reconnect reconcile.
+func TestWakeAllWaitersNonBlocking(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	activator := &localActivator{
+		log:             log,
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	empty := make(chan struct{}, 1)
+	full := make(chan struct{}, 1)
+	full <- struct{}{} // pre-fill so a second send would block without the default
+
+	activator.newSandboxChans[verKey{"ver-a", "web"}] = []chan struct{}{empty}
+	activator.newSandboxChans[verKey{"ver-b", "web"}] = []chan struct{}{full}
+
+	done := make(chan struct{})
+	go func() {
+		activator.wakeAllWaiters()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wakeAllWaiters blocked on a full channel")
+	}
+
+	select {
+	case <-empty:
+	default:
+		t.Fatal("wakeAllWaiters did not signal the empty channel")
+	}
+}
+
+// TestResyncWakesParkedWaiter is the regression test for the parked-waiter gap:
+// recoverSandboxes adopts sandboxes by appending to poolSandboxes directly,
+// bypassing the per-sandbox notify the watcher does. A request already parked in
+// waitForSandbox when a reconnect happens would therefore not see its adopted
+// sandbox until the 60s fallback ticker. resyncFromStore now calls wakeAllWaiters
+// to nudge it immediately; this test parks a real waiter, then drives the re-sync
+// and asserts the lease is delivered far faster than the ticker would allow.
+func TestResyncWakesParkedWaiter(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	testVer := newEphemeralVersion(t, server, ctx)
+
+	pool := &compute_v1alpha.SandboxPool{
+		Service:              "web",
+		SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+		ReferencedByVersions: []entity.Id{testVer.ID},
+		DesiredInstances:     1,
+	}
+	poolID, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	key := verKey{testVer.ID.String(), "web"}
+
+	// Park a real waiter. The pool exists at cap (desired=1, MaxInstances=1) but no
+	// sandbox does yet, so AcquireLease resolves the pool, tracks the version, finds
+	// no sandbox, and parks in waitForSandbox.
+	type result struct {
+		lease *Lease
+		err   error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		lease, err := activator.AcquireLease(ctx, testVer, "web")
+		resCh <- result{lease, err}
+	}()
+
+	// Wait until the waiter has registered its notification channel (i.e. it has
+	// parked). The channel is buffered, so a wake delivered after this point lands
+	// even if the waiter hasn't reached its select yet.
+	require.Eventually(t, func() bool {
+		activator.mu.RLock()
+		defer activator.mu.RUnlock()
+		return len(activator.newSandboxChans[key]) > 0
+	}, 2*time.Second, 5*time.Millisecond, "waiter never parked")
+
+	// Now a RUNNING sandbox appears in the store, as it would after the pool scaled
+	// up during a watch gap.
+	sb := &compute_v1alpha.Sandbox{
+		Status: compute_v1alpha.RUNNING,
+		Spec: compute_v1alpha.SandboxSpec{
+			Version: testVer.ID,
+			Container: []compute_v1alpha.SandboxSpecContainer{
+				{Port: []compute_v1alpha.SandboxSpecContainerPort{{Port: 3000, Name: "http", Type: "http"}}},
+			},
+		},
+		Network: []compute_v1alpha.Network{{Address: "10.0.0.7"}},
+	}
+	var rpcE entityserver_v1alpha.Entity
+	rpcE.SetAttrs(entity.New(
+		(&core_v1alpha.Metadata{
+			Name:   "eph-sandbox",
+			Labels: types.LabelSet("service", "web", "pool", poolID.String()),
+		}).Encode,
+		entity.Ident, entity.MustKeyword("sandbox/eph-sb"),
+		sb.Encode,
+	).Attrs())
+	_, err = server.EAC.Put(ctx, &rpcE)
+	require.NoError(t, err)
+
+	// The reconnect re-sync adopts the sandbox and wakes the parked waiter.
+	start := time.Now()
+	activator.resyncFromStore(ctx)
+
+	select {
+	case res := <-resCh:
+		require.NoError(t, res.err)
+		require.NotNil(t, res.lease)
+		assert.Equal(t, "http://10.0.0.7:3000", res.lease.URL)
+		// The fallback ticker is 60s; the wake must deliver far sooner.
+		assert.Less(t, time.Since(start), 10*time.Second, "waiter was woken by the wake, not the fallback ticker")
+	case <-time.After(15 * time.Second):
+		t.Fatal("parked waiter was never woken after re-sync")
+	}
+}
+
+func TestRoutePort(t *testing.T) {
+	// No observed bound port: fall back to the configured port.
+	assert.Equal(t, int64(3000), routePort(nil, 3000))
+
+	// Observed bound port wins over the configured port (the app ignored $PORT).
+	observed := []compute_v1alpha.BoundPort{{Port: 8080}}
+	assert.Equal(t, int64(8080), routePort(observed, 3000))
+
+	// A zero observed port is ignored (defensive): keep the configured port.
+	assert.Equal(t, int64(3000), routePort([]compute_v1alpha.BoundPort{{Port: 0}}, 3000))
 }

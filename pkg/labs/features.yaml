@@ -9,22 +9,7 @@ features:
     description: Schedule jobs across multiple runner nodes
     default: false
 
-  - name: adminapi
-    predicate: AdminAPI
-    description: Enable the admin API for application management functions
-    default: false
-
-  - name: routeoidc
-    predicate: RouteOIDC
-    description: Protect HTTP routes with identity-provider login
-    default: false
-
-  - name: addons
-    predicate: Addons
-    description: Enable the addon system for managed backing services
-    default: true
-
   - name: sagas
     predicate: Sagas
-    description: Use saga-based crash-recoverable workflows for sandbox lifecycle
+    description: Use saga-based crash-recoverable workflows
     default: false

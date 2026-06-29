@@ -15,12 +15,22 @@ import (
 type Miren struct {
 	t       *testing.T
 	cluster *Cluster
+	envVars map[string]string
 }
 
 // NewMiren creates a CLI runner bound to the given cluster.
 func NewMiren(t *testing.T, cluster *Cluster) *Miren {
 	t.Helper()
 	return &Miren{t: t, cluster: cluster}
+}
+
+// SetEnv sets an environment variable that will be injected into subsequent
+// miren CLI and RunCmd invocations inside the dev container.
+func (m *Miren) SetEnv(key, value string) {
+	if m.envVars == nil {
+		m.envVars = make(map[string]string)
+	}
+	m.envVars[key] = value
 }
 
 // Run executes a miren CLI command and returns the result.
@@ -34,14 +44,17 @@ func (m *Miren) Run(args ...string) *Result {
 	case ModeDev:
 		// hack/dev-exec m <args>
 		devExec := filepath.Join(m.cluster.RepoRoot, "hack", "dev-exec")
-		execArgs := append([]string{"m"}, args...)
+		execArgs := m.prependEnvArgs("m", args...)
 		cmd = exec.Command(devExec, execArgs...)
 		cmd.Dir = m.cluster.RepoRoot
 	case ModeLocal:
 		cmd = exec.Command(m.cluster.MirenBin, args...)
+		for k, v := range m.envVars {
+			cmd.Env = append(cmd.Environ(), k+"="+v)
+		}
 	case ModePeers:
 		// iso peers exec coordinator -- m <args>
-		execArgs := append([]string{"peers", "exec", "coordinator", "--", "m"}, args...)
+		execArgs := append([]string{"peers", "exec", "coordinator", "--"}, m.prependEnvArgs("m", args...)...)
 		cmd = exec.Command("iso", execArgs...)
 		cmd.Dir = m.cluster.RepoRoot
 	default:
@@ -105,12 +118,16 @@ func (m *Miren) RunCmd(args ...string) *Result {
 	switch m.cluster.Mode {
 	case ModeDev:
 		devExec := filepath.Join(m.cluster.RepoRoot, "hack", "dev-exec")
-		cmd = exec.Command(devExec, args...)
+		execArgs := m.prependEnvArgs(args[0], args[1:]...)
+		cmd = exec.Command(devExec, execArgs...)
 		cmd.Dir = m.cluster.RepoRoot
 	case ModeLocal:
 		cmd = exec.Command(args[0], args[1:]...)
+		for k, v := range m.envVars {
+			cmd.Env = append(cmd.Environ(), k+"="+v)
+		}
 	case ModePeers:
-		execArgs := append([]string{"peers", "exec", "coordinator", "--"}, args...)
+		execArgs := append([]string{"peers", "exec", "coordinator", "--"}, m.prependEnvArgs(args[0], args[1:]...)...)
 		cmd = exec.Command("iso", execArgs...)
 		cmd.Dir = m.cluster.RepoRoot
 	default:
@@ -330,6 +347,29 @@ func (m *Miren) RunCmdAsRoot(args ...string) *Result {
 	}
 
 	return r
+}
+
+// prependEnvArgs builds a command arg slice with "env K=V" prefixed when
+// the Miren instance has env vars set. This makes the env vars available
+// inside the dev container since hack/dev-exec constructs a shell command
+// from the provided args.
+func (m *Miren) prependEnvArgs(binary string, args ...string) []string {
+	if len(m.envVars) == 0 {
+		return append([]string{binary}, args...)
+	}
+
+	result := []string{"env"}
+	keys := make([]string, 0, len(m.envVars))
+	for k := range m.envVars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		result = append(result, k+"="+m.envVars[k])
+	}
+	result = append(result, binary)
+	result = append(result, args...)
+	return result
 }
 
 // shellQuote wraps a string in single quotes for safe shell interpolation.

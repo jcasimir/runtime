@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -14,6 +15,7 @@ import (
 
 	compute "miren.dev/runtime/api/compute/compute_v1alpha"
 	"miren.dev/runtime/api/entityserver/entityserver_v1alpha"
+	"miren.dev/runtime/pkg/cond"
 	"miren.dev/runtime/pkg/entity"
 	"miren.dev/runtime/pkg/netdb"
 )
@@ -127,8 +129,13 @@ func (w *ContainerWatchdog) CleanupOrphanedContainers(ctx context.Context) (*Cle
 		return result, fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	// Build a set of valid container IDs from sandboxes scheduled to this node.
+	// Build a set of valid container IDs from sandboxes scheduled to this node,
+	// plus the set of sandbox IDs the index returned at all (valid or expired) so
+	// we can tell "the index has no record of this sandbox" (which warrants a
+	// direct re-fetch) apart from "the index returned it but it is past grace"
+	// (already authoritative — no re-fetch needed).
 	validContainers := make(map[string]bool)
+	indexedSandboxes := make(map[string]bool)
 
 	resp, err := w.EAC.List(cleanupCtx, compute.Index(compute.KindSandbox, entity.Id("node/"+w.NodeId)))
 	if err != nil {
@@ -146,6 +153,8 @@ func (w *ContainerWatchdog) CleanupOrphanedContainers(ctx context.Context) (*Cle
 		sb.Decode(e.Entity())
 
 		ent := e.Entity()
+
+		indexedSandboxes[sb.ID.String()] = true
 
 		// Consider all non DEAD sandboes as valid.
 		isRunning := sb.Status != compute.DEAD
@@ -180,19 +189,20 @@ func (w *ContainerWatchdog) CleanupOrphanedContainers(ctx context.Context) (*Cle
 		}
 	}
 
-	// Identify orphaned containers and store their labels for IP cleanup
+	// Collect the sandbox containers (those carrying our entity label) up front so
+	// we can reason about the overall picture before killing or releasing anything.
 	type orphanedContainer struct {
 		container containerd.Container
 		labels    map[string]string
 	}
-	var orphanedContainers []orphanedContainer
+	type sandboxContainer struct {
+		container containerd.Container
+		labels    map[string]string
+		sandboxID string
+	}
+	var sandboxContainers []sandboxContainer
 	for _, container := range containerList {
 		containerID := container.ID()
-
-		// Skip if this is a valid container
-		if validContainers[containerID] {
-			continue
-		}
 
 		// Check labels to see if this is a sandbox container
 		labels, err := container.Labels(cleanupCtx)
@@ -202,12 +212,55 @@ func (w *ContainerWatchdog) CleanupOrphanedContainers(ctx context.Context) (*Cle
 		}
 
 		// Skip if not a sandbox container (check for our labels)
-		if _, ok := labels[sandboxEntityLabel]; !ok {
+		sandboxID, ok := labels[sandboxEntityLabel]
+		if !ok {
 			continue
 		}
 
-		w.Log.Info("watchdog found orphaned container", "id", containerID, "labels", labels)
-		orphanedContainers = append(orphanedContainers, orphanedContainer{container: container, labels: labels})
+		sandboxContainers = append(sandboxContainers, sandboxContainer{
+			container: container,
+			labels:    labels,
+			sandboxID: sandboxID,
+		})
+	}
+
+	// An empty node-scoped sandbox list while sandbox containers are clearly
+	// running is a strong signal that the node index is lagging. We do not act on
+	// the empty list directly — the per-container re-fetch below is authoritative
+	// and both protects index-missed live sandboxes and still reclaims genuinely
+	// drained ones — but surface it so the staleness is visible (MIR-1238).
+	if len(resp.Values()) == 0 && len(sandboxContainers) > 0 {
+		w.Log.Warn("watchdog: node sandbox list empty but sandbox containers exist; relying on per-container entity re-fetch",
+			"sandbox_containers", len(sandboxContainers))
+	}
+
+	// Identify orphaned containers and store their labels for IP cleanup.
+	var orphanedContainers []orphanedContainer
+	for _, sc := range sandboxContainers {
+		containerID := sc.container.ID()
+
+		// Skip if this is a valid container
+		if validContainers[containerID] {
+			continue
+		}
+
+		// If the index returned this sandbox at all, it was already evaluated
+		// above and found not valid (DEAD past the grace window) — that verdict
+		// is authoritative, so reclaim it without a redundant re-fetch.
+		//
+		// If the index has no record of it, the node index may simply be lagging.
+		// Re-fetch the sandbox entity directly by ID — a linearizable key lookup,
+		// not an index read — before treating the container as orphaned. If the
+		// sandbox still exists and is not DEAD past the grace window, the index
+		// merely missed it: never kill it or release its IP (MIR-1238).
+		if !indexedSandboxes[sc.sandboxID] && w.sandboxStillValid(cleanupCtx, sc.sandboxID, now, graceWindow) {
+			w.Log.Warn("watchdog: container missing from node index but sandbox entity is still valid; skipping (stale index)",
+				"id", containerID, "sandbox_id", sc.sandboxID)
+			continue
+		}
+
+		w.Log.Info("watchdog found orphaned container", "id", containerID, "labels", sc.labels)
+		orphanedContainers = append(orphanedContainers, orphanedContainer{container: sc.container, labels: sc.labels})
 	}
 
 	if len(orphanedContainers) == 0 {
@@ -247,35 +300,81 @@ func (w *ContainerWatchdog) CleanupOrphanedContainers(ctx context.Context) (*Cle
 			}
 		}
 
-		// Release IPs from container labels before removing the container
-		if w.Subnet != nil {
-			for label, value := range oc.labels {
-				if strings.HasPrefix(label, "runtime.computer/ip") {
-					addr, err := netip.ParseAddr(value)
-					if err != nil {
-						w.Log.Warn("watchdog failed to parse IP from label", "id", containerID, "label", label, "value", value, "error", err)
-						continue
-					}
-					if err := w.Subnet.ReleaseAddr(addr); err != nil {
-						w.Log.Error("watchdog failed to release IP", "id", containerID, "addr", addr, "error", err)
-					} else {
-						w.Log.Debug("watchdog released IP", "id", containerID, "addr", addr)
-					}
-				}
-			}
+		// Aggressively remove the container. Only once removal succeeds — and the
+		// container's network namespace and veth are actually torn down — do we
+		// return its IP to the pool. Releasing before confirmed removal can hand
+		// a still-live sandbox's IP to a new sandbox, producing a duplicate
+		// assignment on the bridge (MIR-1238).
+		if err := w.removeContainer(cleanupCtx, oc.container); err != nil {
+			w.Log.Error("watchdog failed to remove orphaned container; leaving its IP reserved", "id", containerID, "error", err)
+			result.FailedContainers[containerID] = err
+			continue
 		}
 
-		// Aggressively remove the container
-		if err := w.removeContainer(cleanupCtx, oc.container); err != nil {
-			w.Log.Error("watchdog failed to remove orphaned container", "id", containerID, "error", err)
-			result.FailedContainers[containerID] = err
-		} else {
-			w.Log.Info("watchdog successfully removed orphaned container", "id", containerID)
-			result.DeletedContainers = append(result.DeletedContainers, containerID)
-		}
+		w.Log.Info("watchdog successfully removed orphaned container", "id", containerID)
+		result.DeletedContainers = append(result.DeletedContainers, containerID)
+
+		w.releaseContainerIPs(containerID, oc.labels)
 	}
 
 	return result, nil
+}
+
+// releaseContainerIPs returns the IP addresses recorded in a container's labels
+// to the subnet pool. It must only be called after the container has been
+// confirmed removed, so the addresses are no longer live on the bridge.
+func (w *ContainerWatchdog) releaseContainerIPs(containerID string, labels map[string]string) {
+	if w.Subnet == nil {
+		return
+	}
+	for label, value := range labels {
+		if !strings.HasPrefix(label, "runtime.computer/ip") {
+			continue
+		}
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			w.Log.Warn("watchdog failed to parse IP from label", "id", containerID, "label", label, "value", value, "error", err)
+			continue
+		}
+		if err := w.Subnet.ReleaseAddr(addr); err != nil {
+			w.Log.Error("watchdog failed to release IP", "id", containerID, "addr", addr, "error", err)
+		} else {
+			w.Log.Debug("watchdog released IP", "id", containerID, "addr", addr)
+		}
+	}
+}
+
+// sandboxStillValid reports whether the sandbox with the given ID should still be
+// treated as live. It re-fetches the entity directly by ID — a linearizable key
+// lookup that, unlike the node-scoped index used to build the valid set, does not
+// lag — so it reliably distinguishes a sandbox the index transiently omitted from
+// one that is genuinely gone. A sandbox is valid if it exists and is not DEAD, or
+// is DEAD but was updated within the grace window. On any non not-found error it
+// returns true (fail-safe: keep the sandbox rather than risk reclaiming a live
+// one).
+func (w *ContainerWatchdog) sandboxStillValid(ctx context.Context, sandboxID string, now time.Time, graceWindow time.Duration) bool {
+	resp, err := w.EAC.Get(ctx, sandboxID)
+	if err != nil {
+		if errors.Is(err, cond.ErrNotFound{}) {
+			return false
+		}
+		w.Log.Warn("watchdog: failed to re-fetch sandbox entity; treating as valid (fail-safe)",
+			"sandbox_id", sandboxID, "error", err)
+		return true
+	}
+	if !resp.HasEntity() {
+		return false
+	}
+
+	ent := resp.Entity().Entity()
+
+	var sb compute.Sandbox
+	sb.Decode(ent)
+
+	if sb.Status != compute.DEAD {
+		return true
+	}
+	return now.Sub(ent.GetUpdatedAt()) < graceWindow
 }
 
 // removeContainer removes a container and its task.
@@ -284,7 +383,7 @@ func (w *ContainerWatchdog) removeContainer(ctx context.Context, container conta
 	containerID := container.ID()
 
 	// Try to delete any task first
-	task, err := container.Task(ctx, nil)
+	task, err := container.Task(ctx, cleanupAttach())
 	if err == nil && task != nil {
 		// Try to delete the task (it should already be dead from SIGQUIT/SIGKILL)
 		_, delErr := task.Delete(ctx, containerd.WithProcessKill)

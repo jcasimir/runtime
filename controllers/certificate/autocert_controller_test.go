@@ -86,6 +86,7 @@ func TestAutocertController_GetCertificate_FallbackForUnknownHost(t *testing.T) 
 	}
 	if cert == nil {
 		t.Fatal("expected a fallback certificate, got nil")
+		return
 	}
 	if len(cert.Certificate) == 0 {
 		t.Error("expected fallback cert to have certificate data")
@@ -185,6 +186,46 @@ func TestAutocertController_HostPolicy_WildcardMatching(t *testing.T) {
 	// Unrelated domain should be rejected
 	if err := c.mgr.HostPolicy(context.Background(), "other.com"); err == nil {
 		t.Error("expected host policy to reject other.com")
+	}
+}
+
+// TestAutocertController_IsAllowedHost_EphemeralSubdomain verifies that an
+// ephemeral subdomain of a normal (non-wildcard) route is allowed, matching
+// the request-routing behavior in httpingress.lookupEphemeralRoute. Without
+// this, ephemeral deploy URLs like pr-33.app.example.com would serve the
+// fallback self-signed cert instead of provisioning via autocert.
+func TestAutocertController_IsAllowedHost_EphemeralSubdomain(t *testing.T) {
+	c := newTestAutocertController(t)
+	c.allowedHosts.Store("app.example.com", struct{}{})
+
+	tests := []struct {
+		host    string
+		allowed bool
+	}{
+		{"app.example.com", true},        // exact match (the registered route)
+		{"pr-33.app.example.com", true},  // ephemeral subdomain of the route
+		{"feat-x.app.example.com", true}, // another ephemeral label
+		{"app.example.org", false},       // unrelated TLD
+		{"example.com", false},           // parent of the route, not a subdomain
+		{"other.com", false},             // unrelated domain
+	}
+
+	for _, tt := range tests {
+		got := c.isAllowedHost(tt.host)
+		if got != tt.allowed {
+			t.Errorf("isAllowedHost(%q) = %v, want %v", tt.host, got, tt.allowed)
+		}
+	}
+}
+
+func TestAutocertController_HostPolicy_EphemeralSubdomain(t *testing.T) {
+	c := newTestAutocertController(t)
+	c.allowedHosts.Store("app.example.com", struct{}{})
+
+	// Ephemeral subdomain of a normal route should be accepted by HostPolicy
+	// so autocert will attempt ACME provisioning instead of falling back.
+	if err := c.mgr.HostPolicy(context.Background(), "pr-33.app.example.com"); err != nil {
+		t.Errorf("expected host policy to accept ephemeral subdomain, got: %v", err)
 	}
 }
 
@@ -334,5 +375,145 @@ func TestAutocertController_Reconcile_BlocksUntilReady(t *testing.T) {
 	err := c.Reconcile(ctx, route, meta)
 	if err != context.Canceled {
 		t.Errorf("expected context.Canceled, got: %v", err)
+	}
+}
+
+func TestAutocertController_ClusterHostnames_AddedDuringInit(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	c := NewAutocertController(AutocertControllerOpts{
+		Log:              log,
+		DataPath:         t.TempDir(),
+		Email:            "test@example.com",
+		ClusterHostnames: []string{"cluster-abc.miren.systems", "  Cluster-DEF.miren.systems  "},
+	})
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatalf("failed to init: %v", err)
+	}
+
+	if _, ok := c.allowedHosts.Load("cluster-abc.miren.systems"); !ok {
+		t.Error("expected cluster-abc.miren.systems in allowed hosts")
+	}
+	if _, ok := c.allowedHosts.Load("cluster-def.miren.systems"); !ok {
+		t.Error("expected cluster-def.miren.systems in allowed hosts (lowercased/trimmed)")
+	}
+}
+
+func TestAutocertController_ClusterHostnames_SurviveDelete(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	c := NewAutocertController(AutocertControllerOpts{
+		Log:              log,
+		EAC:              server.EAC,
+		DataPath:         t.TempDir(),
+		Email:            "test@example.com",
+		ClusterHostnames: []string{"cluster.miren.systems"},
+	})
+	if err := c.Init(ctx); err != nil {
+		t.Fatalf("failed to init: %v", err)
+	}
+
+	// Also add a regular route-derived domain
+	c.allowedHosts.Store("app.example.com", struct{}{})
+
+	// Simulate deleting all routes — Delete scans allowedHosts and removes
+	// any domain with zero remaining routes.
+	if err := c.Delete(ctx, "some-route-id"); err != nil {
+		t.Fatalf("unexpected error from Delete: %v", err)
+	}
+
+	// Cluster hostname must survive
+	if _, ok := c.allowedHosts.Load("cluster.miren.systems"); !ok {
+		t.Error("expected cluster hostname to remain in allowed hosts after Delete")
+	}
+
+	// Route-derived domain with no remaining routes should be removed
+	if _, ok := c.allowedHosts.Load("app.example.com"); ok {
+		t.Error("expected route-derived domain to be removed after Delete")
+	}
+}
+
+func TestAutocertController_ClusterHostnames_IsAllowedHost(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	c := NewAutocertController(AutocertControllerOpts{
+		Log:              log,
+		DataPath:         t.TempDir(),
+		Email:            "test@example.com",
+		ClusterHostnames: []string{"cluster.miren.systems"},
+	})
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatalf("failed to init: %v", err)
+	}
+
+	tests := []struct {
+		host    string
+		allowed bool
+	}{
+		{"cluster.miren.systems", true},
+		{"sub.cluster.miren.systems", true}, // ephemeral subdomain
+		{"other.miren.systems", false},
+		{"example.com", false},
+	}
+
+	for _, tt := range tests {
+		got := c.isAllowedHost(tt.host)
+		if got != tt.allowed {
+			t.Errorf("isAllowedHost(%q) = %v, want %v", tt.host, got, tt.allowed)
+		}
+	}
+}
+
+func TestAutocertController_ClusterHostnames_GetCertificateAttempts(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	c := NewAutocertController(AutocertControllerOpts{
+		Log:              log,
+		DataPath:         t.TempDir(),
+		Email:            "test@example.com",
+		ClusterHostnames: []string{"cluster.miren.systems"},
+	})
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatalf("failed to init: %v", err)
+	}
+
+	// GetCertificate should attempt autocert (and fall back) rather than
+	// immediately returning the fallback as it would for an unknown host.
+	hello := &tls.ClientHelloInfo{ServerName: "cluster.miren.systems"}
+	cert, err := c.GetCertificate(hello)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cert == nil {
+		t.Fatal("expected a certificate, got nil")
+	}
+
+	// After the attempt fails (no real ACME), a failure should be recorded
+	// proving the host was treated as allowed (not immediately rejected).
+	if _, ok := c.failures.Load("cluster.miren.systems"); !ok {
+		t.Error("expected failure recorded, proving autocert was attempted for cluster hostname")
+	}
+}
+
+func TestAutocertController_ClusterHostnames_EmptyIgnored(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	c := NewAutocertController(AutocertControllerOpts{
+		Log:              log,
+		DataPath:         t.TempDir(),
+		Email:            "test@example.com",
+		ClusterHostnames: []string{"", "  "},
+	})
+	if err := c.Init(context.Background()); err != nil {
+		t.Fatalf("failed to init: %v", err)
+	}
+
+	count := 0
+	c.allowedHosts.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Errorf("expected no allowed hosts from empty cluster hostnames, got %d", count)
 	}
 }

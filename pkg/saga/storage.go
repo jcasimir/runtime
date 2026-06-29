@@ -60,15 +60,24 @@ func (s *EntityStorage) Save(ctx context.Context, exec *Execution) error {
 		Error:             exec.Error,
 	}
 
-	// Create or update the entity
+	// Create or update the entity. EnsureEntity is create-if-absent and
+	// does NOT apply our attributes when the entity already exists, so on
+	// every save after the first we must explicitly replace. Without this,
+	// the saga record stays frozen at its initial pending state and later
+	// status/action-progress writes are silently dropped.
 	ent := entity.New(
 		entity.DBId, entity.Id(exec.ID),
 		sagaEntity.Encode(),
 	)
 
-	_, _, err = s.store.EnsureEntity(ctx, ent)
+	_, created, err := s.store.EnsureEntity(ctx, ent)
 	if err != nil {
 		return fmt.Errorf("saving saga entity: %w", err)
+	}
+	if !created {
+		if _, err := s.store.ReplaceEntity(ctx, ent); err != nil {
+			return fmt.Errorf("updating saga entity: %w", err)
+		}
 	}
 
 	return nil

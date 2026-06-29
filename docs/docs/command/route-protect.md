@@ -8,10 +8,6 @@ description: "Protect an HTTP route with an identity provider"
 
 Protect an HTTP route with an identity provider
 
-:::note
-This command requires the `routeoidc` [labs feature](/labs) to be enabled.
-:::
-
 ## Usage
 
 ```bash
