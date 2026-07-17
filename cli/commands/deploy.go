@@ -24,7 +24,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/term"
 
-	"miren.dev/runtime/api/app/app_v1alpha"
 	"miren.dev/runtime/api/build/build_v1alpha"
 	"miren.dev/runtime/api/deployment/deployment_v1alpha"
 	"miren.dev/runtime/appconfig"
@@ -38,6 +37,7 @@ import (
 	"miren.dev/runtime/pkg/rpc/standard"
 	"miren.dev/runtime/pkg/rpc/stream"
 	"miren.dev/runtime/pkg/tarx"
+	"miren.dev/runtime/pkg/theme"
 	"miren.dev/runtime/pkg/ui"
 )
 
@@ -55,6 +55,7 @@ func Deploy(ctx *Context, opts struct {
 	Sensitive     []string `short:"s" long:"sensitive" description:"Set sensitive environment variable (masked in output)"`
 	Ephemeral     string   `long:"ephemeral" description:"Deploy as ephemeral preview with this label (e.g. feat-login)"`
 	TTL           string   `long:"ttl" description:"TTL for ephemeral version (e.g. 48h)" default:"24h"`
+	SummaryJSON   string   `long:"summary-json" description:"Write a JSON summary of the deploy result (deploy id, version, and route URLs) to this path"`
 }) error {
 	name := opts.App
 	dir := opts.ResolvedDir()
@@ -215,18 +216,23 @@ func Deploy(ctx *Context, opts struct {
 					}
 				}
 			} else {
-				ctx.Printf("✓ Deployed version %s to %s\n", versionDisplay, ctx.ClusterName)
+				ctx.Printf("Deploying version %s to %s\n", versionDisplay, ctx.ClusterName)
 
-				appCl, appErr := ctx.RPCClient(rpcAppStatus)
-				if appErr == nil {
-					appStatusClient := app_v1alpha.NewAppStatusClient(appCl)
-					waitForActivation(ctx, appStatusClient, name, deployedVersion, versionDisplay)
+				if err := awaitHealthy(ctx, name, deployedVersion, versionDisplay); err != nil {
+					return err
 				}
 
 				if result.HasAccessInfo() && result.AccessInfo() != nil {
 					displayDeployVersionAccessInfo(ctx, name, result.AccessInfo())
 				}
 			}
+
+			// dep.Id() is empty for ephemeral deploys (no deployment record).
+			var summaryURLs []string
+			if result.HasAccessInfo() && result.AccessInfo() != nil {
+				summaryURLs = deployURLs(ctx, result.AccessInfo(), ephemeralLabel)
+			}
+			writeDeploySummary(ctx, opts.SummaryJSON, dep.Id(), deployedVersion, summaryURLs)
 		}
 		return nil
 	}
@@ -285,8 +291,8 @@ func Deploy(ctx *Context, opts struct {
 		}
 	}
 
-	greenStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	faintStyle := lipgloss.NewStyle().Faint(true)
+	greenStyle := lipgloss.NewStyle().Foreground(theme.Success)
+	faintStyle := lipgloss.NewStyle().Foreground(theme.Muted)
 	ctx.Printf("  ✓ %s: %s %s %s\n", greenStyle.Render("Deploying"), name, faintStyle.Render("→"), ctx.ClusterName)
 
 	cl, err := ctx.RPCClient("dev.miren.runtime/build")
@@ -644,9 +650,28 @@ func Deploy(ctx *Context, opts struct {
 	isTTY := term.IsTerminal(int(os.Stdout.Fd()))
 	useExplainMode := opts.Explain || !isTTY
 
+	// When we render the interactive build TUI, the program stays alive past the
+	// build so the activate + health steps render as part of the same process.
+	// These hold the running program across that span; they stay nil/zero in
+	// explain mode. quitBuildUI tears it down (idempotent) before any path that
+	// needs to print directly to stdout.
+	var (
+		buildProg       *tea.Program
+		buildModel      *deployInfo
+		buildWG         sync.WaitGroup
+		buildFinalModel tea.Model
+	)
+	quitBuildUI := func() {
+		if buildProg != nil {
+			buildProg.Quit()
+			buildWG.Wait()
+			buildProg = nil
+		}
+	}
+	defer quitBuildUI()
+
 	if useExplainMode {
 		if useOptimized && cachedFiles > 0 {
-			faintStyle := lipgloss.NewStyle().Faint(true)
 			ctx.Printf("  %s\n", faintStyle.Render(fmt.Sprintf("Reused %d/%d files from previous deploy, uploading %d", cachedFiles, totalFiles, len(neededPaths))))
 		}
 
@@ -757,10 +782,7 @@ func Deploy(ctx *Context, opts struct {
 			updateCh         = make(chan string, 1)
 			buildCh          = make(chan buildProgress, 1)
 			uploadProgressCh = make(chan upload.Progress, 1)
-			wg               sync.WaitGroup
 		)
-
-		defer wg.Wait()
 
 		progressReader := upload.NewProgressReader(r, func(progress upload.Progress) {
 			enrichUploadProgress(&progress, &uncompressedWritten, totalUncompressed)
@@ -775,18 +797,16 @@ func Deploy(ctx *Context, opts struct {
 		deployCtx, cancelDeploy := context.WithCancel(buildCtx)
 		defer cancelDeploy()
 
-		model := initialModel(updateCh, buildCh, uploadProgressCh, cachedFiles, totalFiles, cachedBytes)
-		p := tea.NewProgram(model)
+		buildModel = initialModel(updateCh, buildCh, uploadProgressCh, cachedFiles, totalFiles, cachedBytes)
+		buildProg = tea.NewProgram(buildModel)
 
-		var finalModel tea.Model
-		var runErr error
-
-		wg.Add(1)
+		buildWG.Add(1)
 		go func() {
-			defer wg.Done()
-			finalModel, runErr = p.Run()
+			defer buildWG.Done()
+			fm, runErr := buildProg.Run()
+			buildFinalModel = fm
 			if runErr == nil {
-				if dm, ok := finalModel.(*deployInfo); ok && dm.interrupted {
+				if dm, ok := fm.(*deployInfo); ok && dm.interrupted {
 					cancelDeploy()
 				}
 			} else {
@@ -795,11 +815,9 @@ func Deploy(ctx *Context, opts struct {
 			}
 		}()
 
-		defer p.Quit()
-
 		// Progress handler for interactive mode
 		progressHandler := func(status *client.SolveStatus) error {
-			p.Send(status)
+			buildProg.Send(status)
 			return nil
 		}
 
@@ -807,34 +825,16 @@ func Deploy(ctx *Context, opts struct {
 
 		results, err = buildCall(deployCtx, r, cb)
 
-		// Ensure the progress UI is shut down before printing
-		p.Quit()
-		wg.Wait()
-
-		// Get the final model to extract phase summaries
-		if m, ok := finalModel.(*deployInfo); ok && m.currentPhase == "buildkit" && err == nil {
-			// Complete the buildkit phase if it's still running and we succeeded
-			duration := time.Since(m.phaseStart)
-			buildPhase := phaseSummary{
-				name:     "Build & push image",
-				duration: duration,
-				details:  buildStepsSummary(m.buildSteps),
-			}
-
-			// Only print the final build phase summary (TEA UI already showed the others)
-			ctx.Printf("%s\n", renderPhaseSummary(buildPhase))
-
-			// Update phase to pushing (build includes push in buildkit)
-			updateDeploymentPhase("pushing")
-		}
-
 		if err != nil {
+			// Build failed: shut down the UI before printing anything.
+			quitBuildUI()
+
 			uploadSpan.RecordError(err)
 			uploadSpan.SetStatus(codes.Error, err.Error())
 			uploadSpan.End()
 
 			// Check if this was a user interruption (via UI flag or context cancellation)
-			dm, isDeploy := finalModel.(*deployInfo)
+			dm, isDeploy := buildFinalModel.(*deployInfo)
 			if (isDeploy && dm.interrupted) || deployCtx.Err() != nil {
 				ctx.Printf("\n\n❌ Deploy cancelled.\n")
 				// Don't update deployment status if externally cancelled - it's already cancelled
@@ -867,9 +867,15 @@ func Deploy(ctx *Context, opts struct {
 			return err
 		}
 
+		// Build succeeded: fold the build phase into the model and keep the
+		// program alive, so the activate + health steps render as continuations
+		// of the same TUI rather than flat text printed below it.
+		buildProg.Send(buildDoneMsg{})
+		updateDeploymentPhase("pushing")
 	}
 
 	if results.Version() == "" {
+		quitBuildUI()
 		noVersionErr := fmt.Errorf("build failed: no version returned")
 		uploadSpan.RecordError(noVersionErr)
 		uploadSpan.SetStatus(codes.Error, noVersionErr.Error())
@@ -895,7 +901,10 @@ func Deploy(ctx *Context, opts struct {
 	ctx.Log.Debug("Build completed with version", "version", appVersionId)
 
 	if ephemeralLabel != "" {
-		// Ephemeral deploy: no deployment record to update, just show info
+		// Ephemeral deploy: no deployment record to update, just show info.
+		// Tear down the build TUI first so its final frame doesn't fight our
+		// direct output (ephemeral skips the health phase that would own it).
+		quitBuildUI()
 		versionDisplay := ui.DisplayShortID(results.VersionShortId(), results.Version())
 		ctx.Printf("\n\nEphemeral version %s created.\n", versionDisplay)
 		ctx.Printf("  Label: %s\n", ephemeralLabel)
@@ -940,21 +949,65 @@ func Deploy(ctx *Context, opts struct {
 		finalizeSpan.End()
 		deploymentFinalized = true
 
-		versionDisplay := ui.DisplayShortID(results.VersionShortId(), results.Version())
-		ctx.Printf("\n\nUpdated version %s deployed. All traffic moved to new version.\n", versionDisplay)
+		// No standalone "deployed" line here: the health step below is the next
+		// beat of the same process and reports the version's real state, so an
+		// extra announcement would just split the flow.
 	}
 
-	_, _, warnsSnap := snapshotBuildState()
-	if len(warnsSnap) > 0 {
-		warnHeaderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
+	printDeployWarnings := func() {
+		_, _, warns := snapshotBuildState()
+		if len(warns) == 0 {
+			return
+		}
+		warnHeaderStyle := lipgloss.NewStyle().Foreground(theme.Warning).Bold(true)
 		ctx.Printf("\n%s\n", warnHeaderStyle.Render("Warnings:"))
-		for _, entry := range warnsSnap {
+		for _, entry := range warns {
 			renderDeployWarning(ctx, entry)
 		}
 	}
 
-	// Show route/access information using server-provided data
+	// Wait for the new version to actually become healthy before declaring
+	// success, so a broken deploy reports the failure instead of handing out
+	// next-steps for an app that isn't serving. On the interactive build path
+	// the program is still running, so health renders as the next phase of the
+	// same TUI; otherwise we run the plain spinner/line wait. Either way the
+	// build warnings and route info come afterward, once stdout is ours and the
+	// version's real state is known. Ephemeral deploys don't take over routing,
+	// so there's nothing to wait on.
+	if ephemeralLabel == "" {
+		versionDisplay := ui.DisplayShortID(results.VersionShortId(), results.Version())
+
+		var healthErr error
+		if buildProg != nil {
+			healthErr = awaitHealthyInProgram(ctx, buildProg, func() *deployInfo {
+				buildWG.Wait()
+				dm, _ := buildFinalModel.(*deployInfo)
+				return dm
+			}, name, results.Version(), versionDisplay)
+			buildProg = nil // program has quit
+		} else {
+			healthErr = awaitHealthy(ctx, name, results.Version(), versionDisplay)
+		}
+
+		printDeployWarnings()
+
+		if healthErr != nil {
+			return healthErr
+		}
+	} else {
+		printDeployWarnings()
+	}
+
+	// Show route/access information (the "what's next" guidance) last, once we
+	// know the app is actually up.
 	displayAccessInfo(ctx, name, results)
+
+	// deploymentId is empty for ephemeral deploys (no deployment record).
+	var summaryURLs []string
+	if results.HasAccessInfo() && results.AccessInfo() != nil {
+		summaryURLs = deployURLs(ctx, results.AccessInfo(), ephemeralLabel)
+	}
+	writeDeploySummary(ctx, opts.SummaryJSON, deploymentId, appVersionId, summaryURLs)
 
 	return nil
 }
@@ -1181,9 +1234,8 @@ func createBuildStatusCallback(
 }
 
 func renderDeployWarning(ctx *Context, entry *build_v1alpha.LogEntry) {
-	orange := lipgloss.Color("208")
-	headerStyle := lipgloss.NewStyle().Foreground(orange).Bold(true)
-	linkStyle := lipgloss.NewStyle().Foreground(orange).Faint(true)
+	headerStyle := lipgloss.NewStyle().Foreground(theme.Warning).Bold(true)
+	linkStyle := lipgloss.NewStyle().Foreground(theme.Warning)
 
 	// Compute wrap width: terminal width minus indent (4 chars), capped at 76
 	const indent = 4
@@ -1194,7 +1246,7 @@ func renderDeployWarning(ctx *Context, entry *build_v1alpha.LogEntry) {
 			detailWidth = min(available, maxWidth)
 		}
 	}
-	detailStyle := lipgloss.NewStyle().Foreground(orange).Width(detailWidth).PaddingLeft(indent)
+	detailStyle := lipgloss.NewStyle().Foreground(theme.Warning).Width(detailWidth).PaddingLeft(indent)
 
 	ctx.Printf("  %s\n", headerStyle.Render("⚠ "+entry.Text()))
 
@@ -1208,7 +1260,7 @@ func renderDeployWarning(ctx *Context, entry *build_v1alpha.LogEntry) {
 		ctx.Printf("%s\n", detailStyle.Render(detail))
 	}
 	if link, ok := fields["link"]; ok {
-		ctx.Printf("    %s%s\n", linkStyle.Render("See: "), ui.RenderMarkdownLink(link, 208))
+		ctx.Printf("    %s%s\n", linkStyle.Render("See: "), ui.RenderMarkdownLink(link, theme.Warning))
 	}
 }
 
@@ -1220,6 +1272,100 @@ func buildStepsSummary(count int) string {
 		return "1 step completed"
 	}
 	return fmt.Sprintf("%d steps completed", count)
+}
+
+// deploySummary is the machine-readable result written by --summary-json. It's
+// a side artifact for CI and tooling (e.g. the mirendev/actions deploy action),
+// giving consumers the values that are otherwise awkward to recover after a
+// deploy without re-parsing human output. deploy_id is empty for ephemeral
+// deploys, which have no deployment record.
+type deploySummary struct {
+	DeployID   string   `json:"deploy_id"`
+	AppVersion string   `json:"app_version"`
+	URLs       []string `json:"urls"`
+}
+
+// accessInfoLike is the subset of the generated AccessInfo types shared by the
+// build and deployment flavors, letting deployURLs serve both deploy paths.
+type accessInfoLike interface {
+	HasHostnames() bool
+	Hostnames() *[]string
+	DefaultRoute() bool
+	ClusterHostname() string
+}
+
+// deployURLs derives the app's reachable https URLs from the server-provided
+// access info, mirroring what the human-readable deploy output prints. It is the
+// authoritative source for route URLs, so tooling doesn't have to scrape the
+// deploy log or reconcile a separate `route list` call.
+func deployURLs(ctx *Context, accessInfo accessInfoLike, ephemeralLabel string) []string {
+	if accessInfo == nil {
+		return nil
+	}
+
+	var urls []string
+	seen := map[string]bool{}
+	add := func(u string) {
+		if u != "" && !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
+		}
+	}
+
+	if accessInfo.HasHostnames() && accessInfo.Hostnames() != nil {
+		for _, h := range *accessInfo.Hostnames() {
+			if h != "" {
+				add("https://" + h)
+			}
+		}
+	}
+
+	if ephemeralLabel != "" {
+		// Ephemeral previews are additionally reachable at <label>.<cluster-host>.
+		if accessInfo.ClusterHostname() != "" {
+			add("https://" + ephemeralLabel + "." + accessInfo.ClusterHostname())
+		}
+	} else if len(urls) == 0 && accessInfo.DefaultRoute() {
+		// A stable deploy with no explicit route is the default route, reachable
+		// at the cluster hostname.
+		addr := accessInfo.ClusterHostname()
+		if addr == "" && ctx.ClusterConfig != nil {
+			addr = stripPort(ctx.ClusterConfig.Hostname)
+		}
+		if addr != "" {
+			add("https://" + addr)
+		}
+	}
+
+	return urls
+}
+
+// writeDeploySummary writes the deploy summary to path (a no-op if path is
+// empty). It runs after the deploy has already succeeded, so a failure here must
+// never fail the command: it is logged and swallowed.
+func writeDeploySummary(ctx *Context, path, deployID, appVersion string, urls []string) {
+	if path == "" {
+		return
+	}
+	// Keep urls a stable array (never JSON null) so consumers see a fixed schema.
+	if urls == nil {
+		urls = []string{}
+	}
+	summary := deploySummary{
+		DeployID:   deployID,
+		AppVersion: appVersion,
+		URLs:       urls,
+	}
+	data, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		ctx.Log.Error("Failed to marshal deploy summary", "error", err)
+		return
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		ctx.Log.Error("Failed to write deploy summary", "path", path, "error", err)
+		return
+	}
+	ctx.Log.Debug("Wrote deploy summary", "path", path, "deploy_id", deployID, "app_version", appVersion, "urls", urls)
 }
 
 // deployAccessInfo provides access to build result access info for display purposes.
@@ -1334,10 +1480,10 @@ func stripPort(host string) string {
 var (
 	analyzeTitleStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("3")) // yellow
+				Foreground(theme.Header) // yellow
 
 	analyzeLabelStyle = lipgloss.NewStyle().
-				Faint(true).
+				Foreground(theme.Muted).
 				Width(12).
 				Align(lipgloss.Right)
 
@@ -1346,23 +1492,27 @@ var (
 
 	// Badge styles for different event kinds
 	badgeFile = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("12")). // blue
+			Foreground(theme.Info).
 			Bold(true)
 	badgePackage = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("10")). // green
+			Foreground(theme.Success).
 			Bold(true)
 	badgeFramework = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("13")). // magenta
+			Foreground(theme.Highlight).
 			Bold(true)
 	badgeConfig = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("11")). // yellow
+			Foreground(theme.Warning).
 			Bold(true)
+	// dir shares Info with file, and script shares Warning with config; italic
+	// keeps each pair visually distinct now that the palette is role-based.
 	badgeDir = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("14")). // cyan
-			Bold(true)
+			Foreground(theme.Info).
+			Bold(true).
+			Italic(true)
 	badgeScript = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("208")). // orange
-			Bold(true)
+			Foreground(theme.Warning).
+			Bold(true).
+			Italic(true)
 )
 
 func eventKindBadge(kind string) string {
@@ -1381,7 +1531,7 @@ func eventKindBadge(kind string) string {
 	case "script":
 		return badgeScript.Render(badge)
 	default:
-		return lipgloss.NewStyle().Faint(true).Render(badge)
+		return lipgloss.NewStyle().Foreground(theme.Muted).Render(badge)
 	}
 }
 
@@ -1468,13 +1618,13 @@ func analyzeApp(ctx *Context, bc *build_v1alpha.BuilderClient, dir string) error
 			for _, svc := range services {
 				sourceInfo := ""
 				if svc.Source() != "" {
-					sourceInfo = lipgloss.NewStyle().Faint(true).Render(fmt.Sprintf(" (%s)", svc.Source()))
+					sourceInfo = lipgloss.NewStyle().Foreground(theme.Muted).Render(fmt.Sprintf(" (%s)", svc.Source()))
 				}
 
 				command := svc.Command()
 				if command == "" {
 					// Service uses Dockerfile CMD (image default)
-					command = lipgloss.NewStyle().Faint(true).Italic(true).Render("image default")
+					command = lipgloss.NewStyle().Foreground(theme.Muted).Italic(true).Render("image default")
 				}
 
 				ctx.Printf("  %s: %s%s\n",
@@ -1496,17 +1646,17 @@ func analyzeApp(ctx *Context, bc *build_v1alpha.BuilderClient, dir string) error
 
 			// Show available (detected + found locally)
 			if len(localDetection.Available) > 0 {
-				ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("Available locally:"))
+				ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(theme.Success).Render("Available locally:"))
 				for _, ev := range localDetection.Available {
-					valueDisplay := MaskValue(ev.Value, ev.Sensitive)
+					valueDisplay := maskEnvValue(ev.Value, ev.Sensitive, false)
 					if ev.Sensitive {
 						ctx.Printf("    %s %s=%s\n",
-							lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("✓"),
+							lipgloss.NewStyle().Foreground(theme.Success).Render("✓"),
 							ev.Key,
-							lipgloss.NewStyle().Faint(true).Render(valueDisplay))
+							lipgloss.NewStyle().Foreground(theme.Muted).Render(valueDisplay))
 					} else {
 						ctx.Printf("    %s %s=%s\n",
-							lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("✓"),
+							lipgloss.NewStyle().Foreground(theme.Success).Render("✓"),
 							ev.Key,
 							valueDisplay)
 					}
@@ -1515,27 +1665,27 @@ func analyzeApp(ctx *Context, bc *build_v1alpha.BuilderClient, dir string) error
 
 			// Show missing (detected but not found locally)
 			if len(localDetection.Missing) > 0 {
-				ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render("Not set locally:"))
+				ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(theme.Warning).Render("Not set locally:"))
 				for _, ev := range localDetection.Missing {
 					ctx.Printf("    %s %s\n",
-						lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render("○"),
+						lipgloss.NewStyle().Foreground(theme.Warning).Render("○"),
 						ev.Key)
 				}
 			}
 
 			// Show additional app-related env vars found locally
 			if len(localDetection.Additional) > 0 {
-				ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("Also found locally (may be relevant):"))
+				ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(theme.Info).Render("Also found locally (may be relevant):"))
 				for _, ev := range localDetection.Additional {
-					valueDisplay := MaskValue(ev.Value, ev.Sensitive)
+					valueDisplay := maskEnvValue(ev.Value, ev.Sensitive, false)
 					if ev.Sensitive {
 						ctx.Printf("    %s %s=%s\n",
-							lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("?"),
+							lipgloss.NewStyle().Foreground(theme.Info).Render("?"),
 							ev.Key,
-							lipgloss.NewStyle().Faint(true).Render(valueDisplay))
+							lipgloss.NewStyle().Foreground(theme.Muted).Render(valueDisplay))
 					} else {
 						ctx.Printf("    %s %s=%s\n",
-							lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("?"),
+							lipgloss.NewStyle().Foreground(theme.Info).Render("?"),
 							ev.Key,
 							valueDisplay)
 					}
@@ -1547,17 +1697,17 @@ func analyzeApp(ctx *Context, bc *build_v1alpha.BuilderClient, dir string) error
 		localDetection := DetectLocalEnvVars(nil)
 		if len(localDetection.Additional) > 0 {
 			ctx.Printf("\n%s\n", analyzeTitleStyle.Render("Environment Variables"))
-			ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("Found locally (may be relevant):"))
+			ctx.Printf("  %s\n", lipgloss.NewStyle().Foreground(theme.Info).Render("Found locally (may be relevant):"))
 			for _, ev := range localDetection.Additional {
-				valueDisplay := MaskValue(ev.Value, ev.Sensitive)
+				valueDisplay := maskEnvValue(ev.Value, ev.Sensitive, false)
 				if ev.Sensitive {
 					ctx.Printf("    %s %s=%s\n",
-						lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("?"),
+						lipgloss.NewStyle().Foreground(theme.Info).Render("?"),
 						ev.Key,
-						lipgloss.NewStyle().Faint(true).Render(valueDisplay))
+						lipgloss.NewStyle().Foreground(theme.Muted).Render(valueDisplay))
 				} else {
 					ctx.Printf("    %s %s=%s\n",
-						lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("?"),
+						lipgloss.NewStyle().Foreground(theme.Info).Render("?"),
 						ev.Key,
 						valueDisplay)
 				}

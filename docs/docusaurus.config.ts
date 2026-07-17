@@ -69,8 +69,25 @@ const config: Config = {
   // Prevent GitHub Pages from adding trailing slashes via redirects
   trailingSlash: false,
 
+  // Render ```mermaid fenced blocks as diagrams (e.g. the Miren Anywhere
+  // request-flow diagram). Requires @docusaurus/theme-mermaid, registered below.
+  markdown: {
+    mermaid: true,
+  },
+  themes: ['@docusaurus/theme-mermaid'],
+
   plugins: [
     filterAncestorWatchesPlugin,
+    [
+      '@docusaurus/plugin-client-redirects',
+      {
+        redirects: [
+          // /languages was merged into the Language Guides index. Keep the old
+          // URL alive for external links and search results.
+          {from: '/languages', to: '/guides'},
+        ],
+      },
+    ],
     [
       'docusaurus-plugin-llms',
       {
@@ -120,6 +137,14 @@ const config: Config = {
   ],
 
   themeConfig: {
+    // The theme always emits twitter:card=summary_large_image, so without an
+    // image every shared link renders as a broken large-image card. Shared with
+    // the marketing site (mirendev/public/miren-og-card.png); keep them in sync.
+    image: 'img/miren-og-card.png',
+    metadata: [
+      {property: 'og:type', content: 'website'},
+      {property: 'og:site_name', content: 'Miren Docs'},
+    ],
     colorMode: {
       respectPrefersColorScheme: true,
     },

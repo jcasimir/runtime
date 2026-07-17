@@ -2,6 +2,7 @@ package activator
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -2444,6 +2445,180 @@ func TestRemovePoolFromTrackingCleansAllCaches(t *testing.T) {
 	assert.True(t, poolSandboxes2Exists, "pool-2 should still be in poolSandboxes")
 }
 
+// TestEvictStaleVersionBindingsOnDereference verifies that when a pool stops
+// referencing a version but still exists (the launcher drained a superseded
+// pool without deleting the entity), the binding for the dropped version is
+// evicted while bindings for versions the pool still references are retained
+// (MIR-1293).
+func TestEvictStaleVersionBindingsOnDereference(t *testing.T) {
+	log := testutils.TestLogger(t)
+
+	poolID := entity.Id("pool-1")
+	staleKey := verKey{"ver-stale", "web"}
+	keptKey := verKey{"ver-kept", "web"}
+
+	pool := &compute_v1alpha.SandboxPool{ID: poolID, Service: "web"}
+
+	activator := &localActivator{
+		log: log,
+		versions: map[verKey]*versionPoolRef{
+			staleKey: {poolID: poolID, service: "web"},
+			keptKey:  {poolID: poolID, service: "web"},
+		},
+		pools: map[verKey]*poolState{
+			staleKey: {pool: pool, revision: 1},
+			keptKey:  {pool: pool, revision: 1},
+		},
+		poolSandboxes: map[entity.Id]*poolSandboxes{
+			poolID: {pool: pool, sandboxes: []*sandbox{}, service: "web"},
+		},
+	}
+
+	// The launcher drained the pool for ver-stale, but it still serves ver-kept.
+	freshPool := &compute_v1alpha.SandboxPool{
+		ID:                   poolID,
+		Service:              "web",
+		ReferencedByVersions: []entity.Id{entity.Id("ver-kept")},
+	}
+
+	activator.mu.Lock()
+	activator.evictStaleVersionBindingsLocked(freshPool)
+	activator.mu.Unlock()
+
+	activator.mu.RLock()
+	_, staleVerExists := activator.versions[staleKey]
+	_, stalePoolExists := activator.pools[staleKey]
+	_, keptVerExists := activator.versions[keptKey]
+	_, keptPoolExists := activator.pools[keptKey]
+	activator.mu.RUnlock()
+
+	assert.False(t, staleVerExists, "dereferenced version binding should be evicted")
+	assert.False(t, stalePoolExists, "dereferenced version pool state should be evicted")
+	assert.True(t, keptVerExists, "still-referenced version binding should be retained")
+	assert.True(t, keptPoolExists, "still-referenced version pool state should be retained")
+}
+
+// TestWatchPoolsEvictsStaleBindingOnDereference verifies the eviction is wired
+// into the pool watch: when the launcher dereferences a still-existing pool (the
+// EAC.Replace path updatePool uses to drain a superseded pool), the watch drops
+// the now-stale version->pool binding so the next lease request re-resolves to
+// the canonical pool (MIR-1293).
+//
+// This uses the etcd-backed server rather than NewInMemEntityServer because the
+// in-mem index watch classifies every mutation as a Create op and never delivers
+// the Update op this exercises (the same reason TestConcurrentPoolIncrement uses
+// the etcd server for real OCC semantics).
+func TestWatchPoolsEvictsStaleBindingOnDereference(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server, cleanup := testutils.NewEtcdEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	testVer := &core_v1alpha.AppVersion{
+		App:      app.ID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Port: 3000,
+			Services: []core_v1alpha.Services{
+				{
+					Name:               "web",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{Mode: "auto", RequestsPerInstance: 10},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", testVer)
+	require.NoError(t, err)
+	testVer.ID = verID
+
+	pool := &compute_v1alpha.SandboxPool{
+		Service:              "web",
+		DesiredInstances:     1,
+		ReferencedByVersions: []entity.Id{testVer.ID},
+		SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+	}
+	poolID, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+	pool.ID = poolID
+
+	poolResp, err := server.EAC.Get(ctx, poolID.String())
+	require.NoError(t, err)
+
+	log := testutils.TestLogger(t)
+	key := verKey{testVer.ID.String(), "web"}
+
+	activator := &localActivator{
+		log: log,
+		eac: server.EAC,
+		versions: map[verKey]*versionPoolRef{
+			key: {
+				ver:      testVer,
+				poolID:   poolID,
+				service:  "web",
+				strategy: concurrency.NewStrategy(&testVer.Config.Services[0].ServiceConcurrency),
+			},
+		},
+		poolSandboxes: map[entity.Id]*poolSandboxes{
+			poolID: {pool: pool, service: "web"},
+		},
+		pools: map[verKey]*poolState{
+			key: {pool: pool, revision: poolResp.Entity().Revision()},
+		},
+		newSandboxChans: make(map[verKey][]chan struct{}),
+	}
+
+	go activator.watchPools(ctx)
+
+	// Wait until the pool watch is live before issuing the single dereference
+	// below: a late subscription would deliver the pool as part of its initial
+	// snapshot (a Create) rather than as the live Update the eviction keys on. Bump
+	// a harmless field until the watch reflects it in the cache. Each iteration is
+	// a real change so it always produces an op, and the >-threshold check avoids
+	// chasing a moving target across polls.
+	origDesired := pool.DesiredInstances
+	nextDesired := origDesired
+	require.Eventually(t, func() bool {
+		nextDesired++
+		pool.DesiredInstances = nextDesired
+		if err := server.Client.Update(ctx, pool); err != nil {
+			return false
+		}
+		activator.mu.RLock()
+		defer activator.mu.RUnlock()
+		st, ok := activator.pools[key]
+		return ok && st.pool != nil && st.pool.DesiredInstances > origDesired
+	}, 5*time.Second, 50*time.Millisecond, "pool watch should become live")
+
+	// Dereference the pool the way updatePool does: rebuild its attributes
+	// without ReferencedByVersions and Replace, so the pool still exists but no
+	// longer references the version.
+	var finalAttrs []entity.Attr
+	for _, attr := range poolResp.Entity().Attrs() {
+		if attr.ID == compute_v1alpha.SandboxPoolReferencedByVersionsId {
+			continue
+		}
+		finalAttrs = append(finalAttrs, attr)
+	}
+	_, err = server.EAC.Replace(ctx, finalAttrs, 0)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		activator.mu.RLock()
+		defer activator.mu.RUnlock()
+		_, vOk := activator.versions[key]
+		_, pOk := activator.pools[key]
+		return !vOk && !pOk
+	}, 5*time.Second, 50*time.Millisecond,
+		"watch should evict the stale version->pool binding after the pool is dereferenced")
+}
+
 // TestActivatorRefreshesStaleMaxPoolSizeCache verifies that when the in-memory cache
 // shows DesiredInstances >= MaxPoolSize but the entity store has been reset to a lower
 // value, the activator re-reads from the store and continues rather than permanently
@@ -3499,6 +3674,117 @@ func TestResyncWakesParkedWaiter(t *testing.T) {
 		assert.Less(t, time.Since(start), 10*time.Second, "waiter was woken by the wake, not the fallback ticker")
 	case <-time.After(15 * time.Second):
 		t.Fatal("parked waiter was never woken after re-sync")
+	}
+}
+
+// TestRequestPoolCapacityRetryRaceNoDoubleUnlock reproduces MIR-1306.
+//
+// Under activation contention, a goroutine sitting in requestPoolCapacity's
+// pool-lookup backoff would notice another goroutine had populated the cache
+// and take a bare `continue`, re-entering the attempt loop with a.mu released.
+// The next backoff iteration then called a.mu.Unlock() on an already-unlocked
+// RWMutex — a fatal, unrecoverable runtime throw that took down the whole
+// process (embedded etcd and every app on the node). The trigger is a pool that
+// becomes visible in the store *while* concurrent callers are mid-retry, so some
+// find it and populate a.pools[key] while others are still backing off and about
+// to re-check the cache.
+//
+// There are no ordinary assertions here: the failure mode is a fatal
+// double-unlock that crashes the test binary outright, so simply reaching the
+// end of the rounds without the process dying is the pass condition. Requires an
+// etcd-backed entity store, so run it inside the dev container:
+//
+//	./hack/dev-exec go test -run TestRequestPoolCapacityRetryRaceNoDoubleUnlock ./components/activator
+//
+// Deliberately without -race: the increment path has a separate, pre-existing
+// data race (MIR-1308) that the detector trips on and that would drown out this
+// test's signal. The double-unlock is a fatal throw, so it surfaces without the
+// detector anyway.
+func TestRequestPoolCapacityRetryRaceNoDoubleUnlock(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := testutils.NewEtcdEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{}
+	appID, err := server.Client.Create(ctx, "test-app-race", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	// The bug is timing-dependent, so we run several rounds. Pre-fix, the very
+	// first round reliably crashes; post-fix, every round drains cleanly.
+	const rounds = 10
+	const numGoroutines = 40
+
+	for round := 0; round < rounds; round++ {
+		// A fresh version each round means a fresh cache key and a store with no
+		// pool for it yet, forcing every caller through the store-lookup retry
+		// loop from an empty cache.
+		testVer := &core_v1alpha.AppVersion{
+			App:      app.ID,
+			Version:  fmt.Sprintf("v%d", round),
+			ImageUrl: "test:latest",
+			Config: core_v1alpha.Config{
+				Services: []core_v1alpha.Services{
+					{
+						Name: "web",
+						ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+							Mode:                "auto",
+							RequestsPerInstance: 10,
+						},
+					},
+				},
+			},
+		}
+		verID, err := server.Client.Create(ctx, fmt.Sprintf("test-ver-race-%d", round), testVer)
+		require.NoError(t, err)
+		testVer.ID = verID
+
+		activator := &localActivator{
+			log:             testutils.TestLogger(t),
+			eac:             server.EAC,
+			versions:        make(map[verKey]*versionPoolRef),
+			poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+			pools:           make(map[verKey]*poolState),
+			newSandboxChans: make(map[verKey][]chan struct{}),
+		}
+
+		// Launch callers that all miss the cache and enter the store-lookup retry
+		// loop. The pool does not exist yet, so their first lookups return nil and
+		// they begin backing off.
+		done := make(chan error, numGoroutines)
+		barrier := make(chan struct{})
+		for i := 0; i < numGoroutines; i++ {
+			go func() {
+				<-barrier
+				_, err := activator.requestPoolCapacity(ctx, testVer, "web")
+				done <- err
+			}()
+		}
+		close(barrier)
+
+		// Let the callers reach their first backoff (100ms), then make the pool
+		// visible in the store, mimicking DeploymentLauncher creating it
+		// mid-activation. Now retry lookups start finding it: whoever finds it
+		// first populates a.pools[key] while others are still mid-backoff and
+		// about to re-check the cache — the exact MIR-1306 race window.
+		time.Sleep(120 * time.Millisecond)
+		racePool := &compute_v1alpha.SandboxPool{
+			Service:              "web",
+			SandboxSpec:          compute_v1alpha.SandboxSpec{Version: testVer.ID},
+			ReferencedByVersions: []entity.Id{testVer.ID},
+			DesiredInstances:     0,
+			CurrentInstances:     0,
+		}
+		_, err = server.Client.Create(ctx, fmt.Sprintf("test-pool-race-%d", round), racePool)
+		require.NoError(t, err)
+
+		// Drain every caller. We don't require success — depending on scheduling a
+		// caller may hit a benign OCC conflict or the not-found terminal path. We
+		// only require the process to survive: no fatal double-unlock.
+		for i := 0; i < numGoroutines; i++ {
+			<-done
+		}
 	}
 }
 

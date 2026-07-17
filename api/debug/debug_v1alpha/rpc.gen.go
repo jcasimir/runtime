@@ -825,6 +825,7 @@ func AdaptNetDB(t NetDB) *rpc.Interface {
 			InterfaceName: "NetDB",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"subnet", "reserved_only", "released_only"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ListLeases(ctx, &NetDBListLeases{Call: call})
 			},
@@ -834,6 +835,7 @@ func AdaptNetDB(t NetDB) *rpc.Interface {
 			InterfaceName: "NetDB",
 			Index:         0,
 			Public:        false,
+			Params:        []string{},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Status(ctx, &NetDBStatus{Call: call})
 			},
@@ -843,6 +845,7 @@ func AdaptNetDB(t NetDB) *rpc.Interface {
 			InterfaceName: "NetDB",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"ip"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ReleaseIP(ctx, &NetDBReleaseIP{Call: call})
 			},
@@ -852,6 +855,7 @@ func AdaptNetDB(t NetDB) *rpc.Interface {
 			InterfaceName: "NetDB",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"subnet"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ReleaseSubnet(ctx, &NetDBReleaseSubnet{Call: call})
 			},
@@ -861,6 +865,7 @@ func AdaptNetDB(t NetDB) *rpc.Interface {
 			InterfaceName: "NetDB",
 			Index:         0,
 			Public:        false,
+			Params:        []string{},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ReleaseAll(ctx, &NetDBReleaseAll{Call: call})
 			},
@@ -870,6 +875,7 @@ func AdaptNetDB(t NetDB) *rpc.Interface {
 			InterfaceName: "NetDB",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"subnet", "dry_run"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Gc(ctx, &NetDBGc{Call: call})
 			},

@@ -154,6 +154,14 @@ func loadConfigFile(path string, cfg *Config) error {
 
 func applyCLIFlags(cfg *Config, flags *CLIFlags) {
 
+	if flags.AppVersionConfigRetentionCount != nil {
+		cfg.AppVersion.RetentionCount = flags.AppVersionConfigRetentionCount
+	}
+
+	if flags.AppVersionConfigRetentionPeriod != nil && *flags.AppVersionConfigRetentionPeriod != "" {
+		cfg.AppVersion.RetentionPeriod = flags.AppVersionConfigRetentionPeriod
+	}
+
 	if flags.BuildkitConfigGcKeepDuration != nil && *flags.BuildkitConfigGcKeepDuration != "" {
 		cfg.Buildkit.GcKeepDuration = flags.BuildkitConfigGcKeepDuration
 	}
@@ -212,6 +220,10 @@ func applyCLIFlags(cfg *Config, flags *CLIFlags) {
 
 	if flags.EtcdConfigPrefix != nil && *flags.EtcdConfigPrefix != "" {
 		cfg.Etcd.Prefix = flags.EtcdConfigPrefix
+	}
+
+	if flags.EtcdConfigQuotaBackendBytes != nil {
+		cfg.Etcd.QuotaBackendBytes = flags.EtcdConfigQuotaBackendBytes
 	}
 
 	if flags.EtcdConfigStartEmbedded != nil {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appclient "miren.dev/runtime/api/app"
 	"miren.dev/runtime/api/compute/compute_v1alpha"
 	"miren.dev/runtime/api/core/core_v1alpha"
 	apiserver "miren.dev/runtime/api/entityserver"
@@ -2732,6 +2733,249 @@ func TestNoAutoMountWhenExplicitDiskConfig(t *testing.T) {
 	assert.Equal(t, "local", volumes[0].Provider)
 }
 
+// TestNoAutoMountWhenExplicitLocalDiskElsewhere reproduces MIR-1423: an explicit
+// local-provider disk mounted somewhere other than the legacy /miren/data/local
+// path (and not named "local-data") must suppress the transitional auto-mount.
+// All local volumes share the same per-app host directory, so the explicit disk
+// already exposes the data; the path-only check used to miss this and inject a
+// duplicate local-data mount at /miren/data/local pointing at the same bytes.
+func TestNoAutoMountWhenExplicitLocalDiskElsewhere(t *testing.T) {
+	ctx := context.Background()
+	log := testutils.TestLogger(t)
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{
+		Project: entity.Id("project-1"),
+	}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	version := &core_v1alpha.AppVersion{
+		App:      app.ID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Port: 3000,
+			Services: []core_v1alpha.Services{
+				{
+					Name: "web",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+						Mode:         "fixed",
+						NumInstances: 1,
+					},
+					Disks: []core_v1alpha.Disks{
+						{
+							Name:      "chisigns-data",
+							Provider:  core_v1alpha.LOCAL,
+							MountPath: "/data",
+						},
+					},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", version)
+	require.NoError(t, err)
+	version.ID = verID
+
+	app.ActiveVersion = version.ID
+	require.NoError(t, server.Client.Update(ctx, app))
+
+	// The per-app local directory is already populated, which would otherwise
+	// self-trigger the legacy auto-mount for this explicit local disk.
+	dataPath := t.TempDir()
+	localDir := filepath.Join(dataPath, "data", "local", app.ID.String())
+	require.NoError(t, os.MkdirAll(localDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(localDir, "data.db"), []byte("test"), 0644))
+
+	launcher := newTestLauncher(log, server.EAC)
+	launcher.DataPath = dataPath
+	require.NoError(t, launcher.Reconcile(ctx, app, nil))
+
+	pools := listAllPools(t, ctx, server)
+	require.Len(t, pools, 1)
+
+	// Only the declared disk should be present — no injected local-data duplicate.
+	volumes := pools[0].SandboxSpec.Volume
+	require.Len(t, volumes, 1, "explicit local disk should suppress the auto-mount")
+	assert.Equal(t, "chisigns-data", volumes[0].Name)
+	assert.Equal(t, "local", volumes[0].Provider)
+	assert.Equal(t, "/data", volumes[0].MountPath)
+}
+
+// TestNoAutoMountWhenDiskNameTaken verifies the auto-mount is skipped when the
+// service already declares a disk under the "local-data" name, even at a
+// different mount path. Injecting a second disk with that name would produce a
+// duplicate volume name in the sandbox spec.
+func TestNoAutoMountWhenDiskNameTaken(t *testing.T) {
+	ctx := context.Background()
+	log := testutils.TestLogger(t)
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{
+		Project: entity.Id("project-1"),
+	}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	version := &core_v1alpha.AppVersion{
+		App:      app.ID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Port: 3000,
+			Services: []core_v1alpha.Services{
+				{
+					Name: "web",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+						Mode:         "fixed",
+						NumInstances: 1,
+					},
+					Disks: []core_v1alpha.Disks{
+						{
+							Name:      "local-data",
+							Provider:  core_v1alpha.LOCAL,
+							MountPath: "/somewhere/else",
+						},
+					},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", version)
+	require.NoError(t, err)
+	version.ID = verID
+
+	app.ActiveVersion = version.ID
+	require.NoError(t, server.Client.Update(ctx, app))
+
+	// Existing data would otherwise trigger the auto-mount.
+	dataPath := t.TempDir()
+	localDir := filepath.Join(dataPath, "data", "local", app.ID.String())
+	require.NoError(t, os.MkdirAll(localDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(localDir, "data.db"), []byte("test"), 0644))
+
+	launcher := newTestLauncher(log, server.EAC)
+	launcher.DataPath = dataPath
+	require.NoError(t, launcher.Reconcile(ctx, app, nil))
+
+	pools := listAllPools(t, ctx, server)
+	require.Len(t, pools, 1)
+
+	// Only the explicitly-named disk should be present; no injected duplicate.
+	volumes := pools[0].SandboxSpec.Volume
+	require.Len(t, volumes, 1, "should not inject a duplicate local-data disk")
+	assert.Equal(t, "local-data", volumes[0].Name)
+	assert.Equal(t, "/somewhere/else", volumes[0].MountPath)
+}
+
+// TestAutoMountDrainsSupersededPool reproduces MIR-1293: an app using
+// auto-mounted local storage (existing data, no explicit disk config) must not
+// accumulate a second pool for the same version when the auto-mount first drifts
+// the pool spec. Before the fix the auto-mount was patched into the sandbox spec
+// at build time only, so serviceHasDisks stayed false, the stale-pool drain never
+// ran, and the superseded diskless pool lingered as a duplicate that still
+// referenced the current version. Registering the auto-mount as a real disk in
+// the resolved config puts the app on the disk-aware path, so the superseded pool
+// is drained and dereferenced.
+func TestAutoMountDrainsSupersededPool(t *testing.T) {
+	ctx := context.Background()
+	log := testutils.TestLogger(t)
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{
+		Project: entity.Id("project-1"),
+	}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	version := &core_v1alpha.AppVersion{
+		App:      app.ID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Port: 3000,
+			Services: []core_v1alpha.Services{
+				{
+					Name: "web",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+						Mode:         "fixed",
+						NumInstances: 1,
+					},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", version)
+	require.NoError(t, err)
+	version.ID = verID
+
+	app.ActiveVersion = version.ID
+	require.NoError(t, server.Client.Update(ctx, app))
+
+	dataPath := t.TempDir()
+	launcher := newTestLauncher(log, server.EAC)
+	launcher.DataPath = dataPath
+
+	// First reconcile: no local data yet, so a single diskless pool is created.
+	require.NoError(t, launcher.Reconcile(ctx, app, nil))
+	pools := listAllPools(t, ctx, server)
+	require.Len(t, pools, 1)
+	require.Empty(t, pools[0].SandboxSpec.Volume, "first pool should be diskless")
+	disklessPoolID := pools[0].ID
+
+	// The app writes to its local storage between reconciles, so the auto-mount
+	// probe now finds existing data.
+	localDir := filepath.Join(dataPath, "data", "local", app.ID.String())
+	require.NoError(t, os.MkdirAll(localDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(localDir, "data.db"), []byte("test"), 0644))
+
+	// Second reconcile: the auto-mount now drifts the spec. The superseded
+	// diskless pool must be drained and dereferenced, not left as a duplicate
+	// orphan that still references the current version (MIR-1293).
+	require.NoError(t, launcher.Reconcile(ctx, app, nil))
+
+	getRes, err := server.EAC.Get(ctx, disklessPoolID.String())
+	require.NoError(t, err)
+	var oldPool compute_v1alpha.SandboxPool
+	oldPool.Decode(getRes.Entity().Entity())
+	assert.Equal(t, int64(0), oldPool.DesiredInstances,
+		"superseded diskless pool should be scaled to 0")
+	assert.Empty(t, oldPool.ReferencedByVersions,
+		"superseded diskless pool should be dereferenced")
+
+	// Exactly one pool should still reference the current version, and it should
+	// carry the auto-mounted local disk.
+	pools = listAllPools(t, ctx, server)
+	var referencing []compute_v1alpha.SandboxPool
+	for i := range pools {
+		if containsRef(pools[i].ReferencedByVersions, version.ID) {
+			referencing = append(referencing, pools[i])
+		}
+	}
+	require.Len(t, referencing, 1, "exactly one pool should reference the current version")
+	require.Len(t, referencing[0].SandboxSpec.Volume, 1)
+	assert.Equal(t, "local-data", referencing[0].SandboxSpec.Volume[0].Name)
+	assert.Equal(t, "local", referencing[0].SandboxSpec.Volume[0].Provider)
+	assert.Equal(t, "/miren/data/local", referencing[0].SandboxSpec.Volume[0].MountPath)
+
+	// The container mount is the user-visible half of the auto-mount, so verify
+	// it too, not just the volume declaration.
+	require.Len(t, referencing[0].SandboxSpec.Container, 1)
+	require.Len(t, referencing[0].SandboxSpec.Container[0].Mount, 1)
+	assert.Equal(t, "local-data", referencing[0].SandboxSpec.Container[0].Mount[0].Source)
+	assert.Equal(t, "/miren/data/local", referencing[0].SandboxSpec.Container[0].Mount[0].Destination)
+}
+
 // TestDiskPoolDrainedBeforeNewPoolCreated verifies that when deploying a new
 // version of an app with disks, the old pool is scaled to 0 before the new
 // pool is created. This prevents conflicts when both old and new sandboxes try
@@ -3196,6 +3440,67 @@ func TestPortTimeoutPropagatesToSandboxSpec(t *testing.T) {
 	workerSpec, err := l.buildSandboxSpec(ctx, app, ver, cfgSpec, "worker", "test:latest")
 	require.NoError(t, err)
 	assert.Empty(t, workerSpec.PortWaitTimeout, "worker without timeout stays empty so default applies in resolvePortWaitTimeout")
+}
+
+// TestRuntimeEnvVarsInjectedIntoSandboxSpec pins the names Miren injects into
+// every app container. The old names (MIREN_APP, MIREN_VERSION) collided with the
+// vars the CLI reads from its own environment, so `miren` run inside a sandbox
+// targeted the sandbox's app instead of the one in .miren/app.toml (MIR-1406).
+func TestRuntimeEnvVarsInjectedIntoSandboxSpec(t *testing.T) {
+	ctx := context.Background()
+	log := testutils.TestLogger(t)
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{Project: entity.Id("project-1")}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	ver := &core_v1alpha.AppVersion{
+		App:      app.ID,
+		Version:  "v1",
+		ImageUrl: "test:latest",
+	}
+	verID, err := server.Client.Create(ctx, "test-ver", ver)
+	require.NoError(t, err)
+	ver.ID = verID
+
+	cfgSpec := &core_v1alpha.ConfigSpec{
+		Services: []core_v1alpha.ConfigSpecServices{{Name: "web", Port: 4000}},
+	}
+
+	l := newTestLauncher(log, server.EAC)
+
+	spec, err := l.buildSandboxSpec(ctx, app, ver, cfgSpec, "web", "test:latest")
+	require.NoError(t, err)
+	require.NotEmpty(t, spec.Container)
+
+	env := spec.Container[0].Env
+	assert.Contains(t, env, appclient.EnvRuntimeApp+"=test-app")
+	assert.Contains(t, env, appclient.EnvRuntimeVersion+"=v1")
+
+	for _, e := range env {
+		assert.False(t, strings.HasPrefix(e, "MIREN_APP="),
+			"MIREN_APP must not be injected — the CLI reads it as its target app (MIR-1406)")
+		assert.False(t, strings.HasPrefix(e, "MIREN_VERSION="),
+			"MIREN_VERSION was renamed to %s", appclient.EnvRuntimeVersion)
+	}
+}
+
+// TestRuntimeEnvNamesDoNotCollideWithClientEnv is the deployment half of the
+// MIR-1406 regression guard: every var Miren injects into a sandbox must live
+// under the reserved MIREN_RUNTIME_ sub-namespace. That is what makes collisions
+// impossible for any CLI var, present or future — the CLI reads no var under that
+// prefix. The CLI half, which derives the CLI's env-tag names by reflection and
+// asserts none reads an injected var, lives in cli/commands
+// (TestCLIEnvTagsDoNotReadInjectedVars) so it stays next to the flags it checks.
+func TestRuntimeEnvNamesDoNotCollideWithClientEnv(t *testing.T) {
+	for _, injected := range appclient.RuntimeEnvNames {
+		assert.True(t, strings.HasPrefix(injected, "MIREN_RUNTIME_"),
+			"%s is injected but not under MIREN_RUNTIME_ — it could collide with a CLI var", injected)
+	}
 }
 
 // TestCreatePoolForVersionEphemeral verifies that the web pool of an ephemeral

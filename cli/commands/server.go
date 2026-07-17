@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -45,7 +46,6 @@ import (
 	"miren.dev/runtime/pkg/grunge"
 	"miren.dev/runtime/pkg/ipdiscovery"
 	"miren.dev/runtime/pkg/labs"
-	"miren.dev/runtime/pkg/nbd"
 	"miren.dev/runtime/pkg/netdb"
 	"miren.dev/runtime/pkg/registration"
 	"miren.dev/runtime/pkg/rpc"
@@ -54,6 +54,59 @@ import (
 	"miren.dev/runtime/pkg/workloadidentity"
 	"miren.dev/runtime/version"
 )
+
+// pprofAddr is the localhost-only address for the diagnostic pprof endpoint.
+//
+// NOTE: hard-coded, and this assumes a single miren instance per host. If a
+// second instance runs on the same host (e.g. a blue/green deploy) its bind
+// will fail and it will run without pprof, logging an error at startup.
+const pprofAddr = "127.0.0.1:6060"
+
+// startPprofServer starts the diagnostic net/http/pprof endpoint on pprofAddr so
+// a heap profile can be pulled live during a memory balloon without restarting
+// the process.
+//
+// The pprof handlers are registered on a private ServeMux, not the global
+// http.DefaultServeMux, so nothing else in the process can inadvertently expose
+// handlers on this listener. The server shuts down cleanly when ctx is
+// cancelled, matching the rest of the server's lifecycle.
+//
+// pprof is diagnostic-only, so a bind failure is logged as an error (operators
+// need to know it is unavailable) but does not abort server startup.
+func startPprofServer(ctx context.Context, log *slog.Logger) {
+	mux := http.NewServeMux()
+	// Mirror exactly what net/http/pprof's init would register on the default
+	// mux: Index serves the index and the named profiles (heap, goroutine, ...),
+	// the other four are the endpoints Index does not handle.
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	ln, err := net.Listen("tcp", pprofAddr)
+	if err != nil {
+		log.Error("pprof debug server not started", "addr", pprofAddr, "err", err)
+		return
+	}
+
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("pprof debug server exited", "err", err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("pprof debug server shutdown", "err", err)
+		}
+	}()
+}
 
 func Server(ctx *Context, opts serverconfig.CLIFlags) error {
 	eg, sub := errgroup.WithContext(ctx)
@@ -203,12 +256,6 @@ func Server(ctx *Context, opts serverconfig.CLIFlags) error {
 		return fmt.Errorf("unknown mode: %s (valid modes: standalone, distributed)", cfg.GetMode())
 	}
 
-	// Initialize NBD kernel module for disk provisioning
-	if err := nbd.InitializeNBDModule(ctx.Log); err != nil {
-		ctx.Log.Warn("Failed to initialize NBD module (disk provisioning may not work)", "error", err)
-		// Don't fail server startup if NBD isn't available
-	}
-
 	// Determine containerd socket path
 	if cfg.Containerd.GetSocketPath() == "" {
 		cfg.Containerd.SetSocketPath(filepath.Join(cfg.Server.GetDataPath(), "containerd", "containerd.sock"))
@@ -294,18 +341,23 @@ func Server(ctx *Context, opts serverconfig.CLIFlags) error {
 	// etcdTLSSetup holds etcd TLS configuration when distributed runners is enabled
 	var etcdTLSSetup *coordinate.EtcdTLSSetupResult
 
+	// etcdComponent is hoisted so the metrics writer can be attached later, once the
+	// metrics subsystem is initialized (which happens after etcd has started).
+	var etcdComponent *etcd.EtcdComponent
+
 	// Start embedded etcd server if requested
 	if cfg.Etcd.GetStartEmbedded() {
 		ctx.Log.Info("starting embedded etcd server", "client-port", cfg.Etcd.GetClientPort(), "peer-port", cfg.Etcd.GetPeerPort())
 
-		etcdComponent := etcd.NewEtcdComponent(ctx.Log, ctx.ServerState.CC, ctx.ServerState.Namespace, cfg.Server.GetDataPath())
+		etcdComponent = etcd.NewEtcdComponent(ctx.Log, ctx.ServerState.CC, ctx.ServerState.Namespace, cfg.Server.GetDataPath())
 
 		etcdConfig := etcd.EtcdConfig{
-			Name:           "miren-etcd",
-			ClientPort:     cfg.Etcd.GetClientPort(),
-			HTTPClientPort: cfg.Etcd.GetHTTPClientPort(),
-			PeerPort:       cfg.Etcd.GetPeerPort(),
-			ClusterState:   "new",
+			Name:              "miren-etcd",
+			ClientPort:        cfg.Etcd.GetClientPort(),
+			HTTPClientPort:    cfg.Etcd.GetHTTPClientPort(),
+			PeerPort:          cfg.Etcd.GetPeerPort(),
+			ClusterState:      "new",
+			QuotaBackendBytes: int64(cfg.Etcd.GetQuotaBackendBytes()),
 		}
 
 		// Set up etcd TLS when distributed runners feature is enabled
@@ -508,11 +560,30 @@ func Server(ctx *Context, opts serverconfig.CLIFlags) error {
 	ctx.ServerState.InitMetricsWriter(ctx.Log)
 	ctx.ServerState.InitMetricsReader(ctx.Log)
 
+	// The metrics writer only exists now (it needs the VictoriaMetrics address), after
+	// etcd and its maintenance loop have already started; attach it so the loop can emit
+	// etcd health gauges. The loop reads the writer atomically each tick.
+	if etcdComponent != nil {
+		etcdComponent.SetMetricsWriter(ctx.ServerState.Writer)
+	}
+
 	// Create CPU and memory usage monitors
 	cpu := metrics.NewCPUUsage(ctx.Log, ctx.ServerState.Writer, ctx.ServerState.Reader)
 	ctx.ServerState.CPU = cpu
 	mem := metrics.NewMemoryUsage(ctx.Log, ctx.ServerState.Writer, ctx.ServerState.Reader)
 	ctx.ServerState.Mem = mem
+
+	// Control-process runtime memory metrics. The coordinator process is not
+	// covered by any per-sandbox cgroup, so this is the only visibility into
+	// its own heap/RSS growth. Pushes go_mem_* + process_resident_memory_bytes
+	// (entity="miren/control") through the same writer as the sandbox metrics.
+	runtimeMem := metrics.NewRuntimeMemory(ctx.Log, ctx.ServerState.Writer)
+	go runtimeMem.Monitor(sub)
+
+	// Diagnostic pprof endpoint, bound to localhost only so it is reachable
+	// on-box / via SSH tunnel but never publicly. Lets us pull a heap profile
+	// during a memory balloon to attribute Go-heap growth to an allocation site.
+	startPprofServer(sub, ctx.Log)
 
 	// Create log writer and reader
 	logWriter := observability.NewPersistentLogWriter(ctx.ServerState.VictorialogsAddress, ctx.ServerState.VictorialogsTimeout)
@@ -635,30 +706,41 @@ func Server(ctx *Context, opts serverconfig.CLIFlags) error {
 		}
 	}
 
+	// A malformed retention period parses to 0, which the coordinator treats as
+	// "use the default" rather than "retain nothing". Warn so the operator knows
+	// their configured value was ignored.
+	appVersionRetentionPeriod, err := units.ParseDuration(cfg.AppVersion.GetRetentionPeriod())
+	if err != nil {
+		ctx.Log.Warn("invalid app_version.retention_period, falling back to default",
+			"value", cfg.AppVersion.GetRetentionPeriod(), "error", err)
+	}
+
 	// Build coordinator config
 	coordConfig := coordinate.CoordinatorConfig{
-		Address:                srvaddr,
-		EtcdEndpoints:          cfg.Etcd.Endpoints,
-		Prefix:                 cfg.Etcd.GetPrefix(),
-		NetworkBackend:         cfg.Server.GetNetworkBackend(),
-		DataPath:               cfg.Server.GetDataPath(),
-		AdditionalNames:        cfg.TLS.AdditionalNames,
-		IPs:                    ipSet,
-		AcmeEmail:              cfg.TLS.GetAcmeEmail(),
-		AcmeDNSProvider:        cfg.TLS.GetAcmeDNSProvider(),
-		Resolver:               res,
-		TempDir:                os.TempDir(),
-		CloudAuth:              cloudAuthConfig,
-		Mem:                    mem,
-		Cpu:                    cpu,
-		HTTP:                   httpMetrics,
-		Logs:                   logs,
-		LogWriter:              logWriter,
-		BuildKit:               buildkitComponent,
-		HTTPRequestTimeout:     cfg.Server.HTTPRequestTimeoutDuration(),
-		VictoriametricsAddress: ctx.ServerState.VictoriametricsAddress,
-		VictorialogsAddress:    ctx.ServerState.VictorialogsAddress,
-		WorkloadIssuer:         workloadIssuer,
+		Address:                   srvaddr,
+		EtcdEndpoints:             cfg.Etcd.Endpoints,
+		Prefix:                    cfg.Etcd.GetPrefix(),
+		NetworkBackend:            cfg.Server.GetNetworkBackend(),
+		DataPath:                  cfg.Server.GetDataPath(),
+		AdditionalNames:           cfg.TLS.AdditionalNames,
+		IPs:                       ipSet,
+		AcmeEmail:                 cfg.TLS.GetAcmeEmail(),
+		AcmeDNSProvider:           cfg.TLS.GetAcmeDNSProvider(),
+		Resolver:                  res,
+		TempDir:                   os.TempDir(),
+		CloudAuth:                 cloudAuthConfig,
+		Mem:                       mem,
+		Cpu:                       cpu,
+		HTTP:                      httpMetrics,
+		Logs:                      logs,
+		LogWriter:                 logWriter,
+		BuildKit:                  buildkitComponent,
+		HTTPRequestTimeout:        cfg.Server.HTTPRequestTimeoutDuration(),
+		VictoriametricsAddress:    ctx.ServerState.VictoriametricsAddress,
+		VictorialogsAddress:       ctx.ServerState.VictorialogsAddress,
+		WorkloadIssuer:            workloadIssuer,
+		AppVersionRetentionCount:  cfg.AppVersion.GetRetentionCount(),
+		AppVersionRetentionPeriod: appVersionRetentionPeriod,
 	}
 
 	// Pass etcd TLS config when distributed runners is enabled
@@ -942,6 +1024,15 @@ func Server(ctx *Context, opts serverconfig.CLIFlags) error {
 			ctx.Log.Warn("failed to update buildkit hosts file", "error", err)
 		}
 	}
+
+	// The registry is now listening and cluster.local resolves to it, so
+	// it's safe to resume any build sagas interrupted by a previous crash.
+	// Recovery runs here, not inside co.Start, because a resumed image push
+	// needs these dependencies that Start does not yet have (MIR-1285). It
+	// runs in the background on sub (the errgroup/shutdown context) so a
+	// recovered build, which re-runs to completion and can take minutes,
+	// doesn't block boot but is still cancelled on server shutdown.
+	go co.RecoverBuildSagas(sub)
 
 	cert, err := co.IssueCertificate("miren-server")
 	if err != nil {

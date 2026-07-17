@@ -1,6 +1,7 @@
 package stackbuild
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"io"
@@ -586,11 +587,142 @@ func TestGo(t *testing.T) {
 	require.NoError(t, err)
 
 	buildLLB(t, dir, state, func(r io.Reader) {
+		// Scan the tar directly rather than via tarx.TarToMap: that helper keeps
+		// only regular files, and the busybox shell/coreutils land as symlinks.
+		names := map[string]bool{}
+		var appData []byte
+		tr := tar.NewReader(r)
+		for {
+			th, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+			names[th.Name] = true
+			if th.Name == "bin/app" && th.Typeflag == tar.TypeReg {
+				appData, err = io.ReadAll(tr)
+				require.NoError(t, err)
+			}
+		}
+
+		require.NotEmpty(t, appData, "built binary should be present at bin/app")
+
+		// Pure-Go lands on the distroless static runtime, but it must still carry
+		// a busybox shell and coreutils. /bin/sh because the runner launches the
+		// app via `/bin/sh -c` (a shell-less image crash-loops at boot), and the
+		// likes of /bin/echo so `miren sandbox exec` can run commands in it. The
+		// heavyweight Go toolchain is left behind on the builder.
+		require.True(t, names["bin/sh"], "runtime needs /bin/sh; the runner execs the app via /bin/sh -c")
+		require.True(t, names["bin/echo"], "runtime needs busybox coreutils for `miren sandbox exec`")
+		require.False(t, names["usr/local/go/bin/go"], "runtime image must not carry the Go toolchain")
+		require.True(t, names["etc/passwd"], "distroless runtime should have an app-user passwd entry")
+	})
+}
+
+// TestGoRuntimeIncludesNonGoFiles verifies that a pure-Go app lands on the
+// distroless static runtime carrying its non-Go files (README, nested data
+// dirs) so it can read them at runtime, while the Go source and module/vendor
+// build inputs are left behind on the builder.
+func TestGoRuntimeIncludesNonGoFiles(t *testing.T) {
+	if !checkDocker() {
+		t.Skip("Docker not available")
+	}
+
+	root := t.TempDir()
+	dir := setupTestDir(root, t)
+
+	files := map[string]string{
+		"go.mod":        readFile(t, "go/go.mod"),
+		"go.sum":        readFile(t, "go/go.sum"),
+		"main.go":       readFile(t, "go/main.go"),
+		"README.md":     "# hello\n",
+		"data/seed.txt": "seed\n",
+	}
+
+	for name, content := range files {
+		full := filepath.Join(dir, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0755))
+		require.NoError(t, os.WriteFile(full, []byte(content), 0644))
+	}
+
+	stack := &GoStack{
+		MetaStack: MetaStack{
+			dir: dir,
+		},
+	}
+	state, err := stack.GenerateLLB(dir, BuildOptions{Version: "1.23"})
+	require.NoError(t, err)
+
+	buildLLB(t, dir, state, func(r io.Reader) {
+		names := map[string]bool{}
+		tr := tar.NewReader(r)
+		for {
+			th, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+			names[th.Name] = true
+		}
+
+		// Non-Go files travel with the binary onto the distroless runtime.
+		require.True(t, names["bin/app"], "built binary should be present at bin/app")
+		require.True(t, names["app/README.md"], "non-Go README.md should be carried into the runtime")
+		require.True(t, names["app/data/seed.txt"], "nested non-Go data files should be carried into the runtime")
+
+		// Go source and module/vendor build inputs are stripped.
+		require.False(t, names["app/main.go"], "Go source must not be shipped in the runtime")
+		require.False(t, names["app/go.mod"], "go.mod must not be shipped in the runtime")
+		require.False(t, names["app/go.sum"], "go.sum must not be shipped in the runtime")
+	})
+}
+
+func TestGoCgo(t *testing.T) {
+	if !checkDocker() {
+		t.Skip("Docker not available")
+	}
+
+	root := t.TempDir()
+	dir := setupTestDir(root, t)
+
+	files := map[string]string{
+		"go.mod":  readFile(t, "go-cgo/go.mod"),
+		"main.go": readFile(t, "go-cgo/main.go"),
+	}
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0644))
+	}
+
+	// cgo is opt-in via the standard CGO_ENABLED build env var.
+	opts := BuildOptions{Version: "1.23", EnvVars: map[string]string{"CGO_ENABLED": "1"}}
+
+	stack := &GoStack{MetaStack: MetaStack{dir: dir}}
+	stack.Init(opts)
+	require.True(t, stack.cgoEnabled)
+
+	state, err := stack.GenerateLLB(dir, opts)
+	require.NoError(t, err)
+
+	buildLLB(t, dir, state, func(r io.Reader) {
 		m, err := tarx.TarToMap(r)
 		require.NoError(t, err)
-		data, ok := m["bin/app"]
-		require.True(t, ok)
+		// debian-slim has a merged /usr (/bin -> /usr/bin), so the binary
+		// copied to /bin/app lands at usr/bin/app; /bin/app still resolves to
+		// it via the symlink at runtime.
+		data, ok := m["usr/bin/app"]
+		if !ok {
+			data, ok = m["bin/app"]
+		}
+		require.True(t, ok, "cgo binary should be present (bin/app or usr/bin/app)")
 		require.NotEmpty(t, data)
+
+		// cgo lands on debian-slim (etc/debian_version is present there but not
+		// on the distroless static image), with the Go toolchain left behind on
+		// the builder.
+		_, hasDebian := m["etc/debian_version"]
+		require.True(t, hasDebian, "cgo image should ship on debian-slim")
+		_, hasToolchain := m["usr/local/go/bin/go"]
+		require.False(t, hasToolchain, "runtime image must not carry the Go toolchain")
 	})
 }
 
@@ -688,6 +820,34 @@ func TestGoVersionDetection(t *testing.T) {
 
 			version := stack.parseGoModVersion()
 			require.Equal(t, tc.expectedVersion, version)
+		})
+	}
+}
+
+func TestGoCgoEnvVar(t *testing.T) {
+	cgoEnv := func(v string) BuildOptions {
+		return BuildOptions{EnvVars: map[string]string{"CGO_ENABLED": v}}
+	}
+
+	cases := []struct {
+		name string
+		opts BuildOptions
+		want bool
+	}{
+		{"defaults to off (static, distroless)", BuildOptions{}, false},
+		{"CGO_ENABLED=1 enables cgo", cgoEnv("1"), true},
+		{"CGO_ENABLED=0 stays off", cgoEnv("0"), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
+				[]byte("module test-app\n\ngo 1.23\n"), 0644))
+
+			stack := &GoStack{MetaStack: MetaStack{dir: dir}}
+			stack.Init(tc.opts)
+			require.Equal(t, tc.want, stack.cgoEnabled)
 		})
 	}
 }

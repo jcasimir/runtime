@@ -219,7 +219,7 @@ func (s *EtcdStore) CreateEntity(
 	var coltxopt []clientv3.Op
 	for _, attrs := range indexedAttrs {
 		for _, attr := range attrs {
-			coltxopt = append(coltxopt, s.addToCollectionOp(entity, attr.CAS()))
+			coltxopt = append(coltxopt, s.addToCollectionOp(entity, attr.CAS(), plainIndexLease(o.bind, sid)))
 
 			if sessPart != "" {
 				coltxopt = append(coltxopt, s.addToCollectionSessionOp(entity, attr.CAS(), sessPart, sid))
@@ -356,7 +356,7 @@ func (s *EtcdStore) CreateEntity(
 		coltxopt = coltxopt[:0]
 		for _, attrs := range indexedAttrs {
 			for _, attr := range attrs {
-				coltxopt = append(coltxopt, s.addToCollectionOp(entity, attr.CAS()))
+				coltxopt = append(coltxopt, s.addToCollectionOp(entity, attr.CAS(), plainIndexLease(o.bind, sid)))
 				if sessPart != "" {
 					coltxopt = append(coltxopt, s.addToCollectionSessionOp(entity, attr.CAS(), sessPart, sid))
 				}
@@ -708,7 +708,11 @@ func (s *EtcdStore) UpdateEntity(
 	// Revision is a store-maintained attr, so we remove it from the changes.
 	entity.Remove(Revision)
 
-	err = s.validator.ValidateAttributes(ctx, entity.attrs)
+	// An update only owns the attributes it sets. Exempt unchanged references
+	// from the existence check so a pre-existing reference whose target was
+	// deleted out from under the entity can't block an unrelated change. See
+	// MIR-1320.
+	err = s.validator.ValidateUpdate(ctx, entity.attrs, originalEntity.attrs)
 	if err != nil {
 		return nil, err
 	}
@@ -723,38 +727,15 @@ func (s *EtcdStore) UpdateEntity(
 		sessPart = base58.Encode(o.session)
 	}
 
-	var coltxopt []clientv3.Op
-
 	// Separate attributes into primary and session, and collect indexed attributes (including nested ones)
 	primary, session, newIndexedAttrs, err := s.separateSessionAttributes(ctx, entity.attrs)
 	if err != nil {
 		return nil, err
 	}
 
-	// Compare old and new indexed attributes and only update collections when values change
-	for attrID, oldAttrs := range originalIndexedAttrs {
-		newAttrs := newIndexedAttrs[attrID]
-
-		// Remove old attributes that are no longer present or have changed values
-		for _, oldAttr := range oldAttrs {
-			found := slices.ContainsFunc(newAttrs, oldAttr.Equal)
-			if !found {
-				coltxopt = append(coltxopt, s.deleteFromCollectionOp(entity, oldAttr.CAS()))
-			}
-		}
-	}
-
-	// All new indexed attributes should update their respective indexes so any watchers will get notified
-	for _, newAttrs := range newIndexedAttrs {
-		for _, newAttr := range newAttrs {
-			coltxopt = append(coltxopt, s.addToCollectionOp(entity, newAttr.CAS()))
-			// And if this is a session-bound update, add a subordinate index entry
-			// so that watchers will be updated when the lease expires
-			if sessPart != "" {
-				coltxopt = append(coltxopt, s.addToCollectionSessionOp(entity, newAttr.CAS(), sessPart, sid))
-			}
-		}
-	}
+	// Reindex changed attributes via the shared helper so the lease and watcher
+	// semantics stay in one place (also used by ReplaceEntity/PatchEntity).
+	coltxopt := s.buildCollectionOps(entity, originalIndexedAttrs, newIndexedAttrs, sessPart, sid, o.bind)
 
 	// Build unique-value update operations (release old, claim new)
 	uniqueOps, uniqueConditions, err := s.buildUniqueUpdateOps(ctx, entity.Id(), originalEntity, entity)
@@ -855,6 +836,23 @@ func (s *EtcdStore) collectIndexedAttributes(ctx context.Context, attrs []Attr) 
 }
 
 // separateSessionAttributes separates attributes into primary and session attributes
+// hasSessionAttr reports whether any of the given attributes is session-scoped.
+// It's a lighter-weight check than separateSessionAttributes for callers that
+// only need the yes/no answer and don't want to rebuild the primary/session/
+// indexed split.
+func (s *EtcdStore) hasSessionAttr(ctx context.Context, attrs []Attr) (bool, error) {
+	for _, attr := range attrs {
+		schema, err := s.GetAttributeSchema(ctx, attr.ID)
+		if err != nil {
+			return false, err
+		}
+		if schema.Session {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *EtcdStore) separateSessionAttributes(ctx context.Context, attrs []Attr) (primary, session []Attr, indexedAttrs map[Id][]Attr, err error) {
 	indexedAttrs = make(map[Id][]Attr)
 	// Enumerate all attributes including nested ones in components for indexing
@@ -887,7 +885,7 @@ func (s *EtcdStore) separateSessionAttributes(ctx context.Context, attrs []Attr)
 }
 
 // buildCollectionOps builds etcd operations for updating indexed attribute collections
-func (s *EtcdStore) buildCollectionOps(entity *Entity, originalIndexedAttrs, newIndexedAttrs map[Id][]Attr, sessPart string, sid int64) []clientv3.Op {
+func (s *EtcdStore) buildCollectionOps(entity *Entity, originalIndexedAttrs, newIndexedAttrs map[Id][]Attr, sessPart string, sid int64, bind bool) []clientv3.Op {
 	var ops []clientv3.Op
 
 	// Remove old indexed attributes that are no longer present or have changed
@@ -904,7 +902,7 @@ func (s *EtcdStore) buildCollectionOps(entity *Entity, originalIndexedAttrs, new
 	// Add all new indexed attributes
 	for _, newAttrs := range newIndexedAttrs {
 		for _, newAttr := range newAttrs {
-			ops = append(ops, s.addToCollectionOp(entity, newAttr.CAS()))
+			ops = append(ops, s.addToCollectionOp(entity, newAttr.CAS(), plainIndexLease(bind, sid)))
 			if sessPart != "" {
 				ops = append(ops, s.addToCollectionSessionOp(entity, newAttr.CAS(), sessPart, sid))
 			}
@@ -1051,8 +1049,10 @@ func (s *EtcdStore) ReplaceEntity(
 	// Revision is a store-maintained attr, so we remove it from the replacement.
 	repl.Remove(Revision)
 
-	// Validate replacement attributes
-	if err := s.validator.ValidateAttributes(ctx, repl.attrs); err != nil {
+	// Validate replacement attributes. A replace only owns the references it
+	// sets: a reference carried over unchanged from the existing entity must not
+	// fail the existence check just because its target was deleted. See MIR-1320.
+	if err := s.validator.ValidateUpdate(ctx, repl.attrs, originalEntity.attrs); err != nil {
 		return nil, err
 	}
 
@@ -1069,7 +1069,7 @@ func (s *EtcdStore) ReplaceEntity(
 		sid, _ = binary.Varint(o.session)
 		sessPart = base58.Encode(o.session)
 	}
-	coltxopt := s.buildCollectionOps(repl, originalIndexedAttrs, newIndexedAttrs, sessPart, sid)
+	coltxopt := s.buildCollectionOps(repl, originalIndexedAttrs, newIndexedAttrs, sessPart, sid, o.bind)
 
 	// Build unique-value update operations (release old, claim new)
 	uniqueOps, uniqueConditions, err := s.buildUniqueUpdateOps(ctx, repl.Id(), originalEntity, repl)
@@ -1188,7 +1188,11 @@ func (s *EtcdStore) PatchEntity(
 	// Revision is a store-maintained attr, so we remove it from the changes.
 	entity.Remove(Revision)
 
-	err = s.validator.ValidateAttributes(ctx, entity.attrs)
+	// A patch only owns the attributes it sets. Exempt unchanged references from
+	// the existence check so a pre-existing reference whose target was deleted
+	// out from under the entity can't block an unrelated change (e.g. a
+	// status-only patch). See MIR-1320.
+	err = s.validator.ValidateUpdate(ctx, entity.attrs, originalEntity.attrs)
 	if err != nil {
 		return nil, err
 	}
@@ -1199,6 +1203,22 @@ func (s *EtcdStore) PatchEntity(
 		return nil, err
 	}
 
+	// When the caller has no session, the only session attributes present were
+	// read from the existing entity (this patch didn't set them) — they belong
+	// to another client's session lease and live under their own sub-key. Leave
+	// them untouched rather than trying to re-save them (which would fail for
+	// lack of a session id). A patch that itself carries session attributes
+	// without a session is still a real error, handled by buildEntitySaveOps.
+	if len(o.session) == 0 && len(session) > 0 {
+		inputHasSession, serr := s.hasSessionAttr(ctx, current.attrs)
+		if serr != nil {
+			return nil, serr
+		}
+		if !inputHasSession {
+			session = nil
+		}
+	}
+
 	// Build collection update operations
 	var sid int64
 	var sessPart string
@@ -1206,7 +1226,7 @@ func (s *EtcdStore) PatchEntity(
 		sid, _ = binary.Varint(o.session)
 		sessPart = base58.Encode(o.session)
 	}
-	coltxopt := s.buildCollectionOps(entity, originalIndexedAttrs, newIndexedAttrs, sessPart, sid)
+	coltxopt := s.buildCollectionOps(entity, originalIndexedAttrs, newIndexedAttrs, sessPart, sid, o.bind)
 
 	// Build unique-value update operations (release old, claim new)
 	uniqueOps, uniqueConditions, err := s.buildUniqueUpdateOps(ctx, entity.Id(), originalEntity, entity)
@@ -1302,61 +1322,97 @@ func (s *EtcdStore) EnsureEntity(
 	return entity, true, nil
 }
 
-// DeleteEntity implements Store interface
+// deleteEntityRaceHook is a test seam. When non-nil, DeleteEntity invokes it
+// after reading the entity but before committing the guarded delete transaction,
+// letting a white-box test deterministically interleave a concurrent write into
+// the revision-guard window. It is always nil in production.
+var deleteEntityRaceHook func()
+
+// DeleteEntity implements Store interface.
+//
+// The delete is atomic: the entity key, its index (collection) entries, and its
+// unique-value keys are all removed in a single revision-guarded transaction. If
+// they were removed separately (as they once were, with the index deletes issued
+// as immediate unconditional Deletes before the entity-key txn), a concurrent
+// no-OCC patch could slip into the gap and re-add index entries after the entity
+// was gone, leaking a stale index entry (MIR-1334).
+//
+// Because the txn is guarded on the entity's ModRevision, a concurrent write that
+// bumps the revision between our read and the txn makes it fail. Pools are patched
+// on every reconcile tick via the no-OCC path, so a single-shot delete could lose
+// that race repeatedly; we re-read and retry a bounded number of times so the
+// delete wins against a busy reconcile loop instead of spuriously reporting the
+// entity as already gone.
 func (s *EtcdStore) DeleteEntity(ctx context.Context, id Id) error {
-	entity, err := s.GetEntity(ctx, id)
-	if err != nil {
-		if errors.Is(err, cond.ErrNotFound{}) {
-			return nil
+	const maxDeleteRetries = 3
+	for attempt := 0; ; attempt++ {
+		entity, err := s.GetEntity(ctx, id)
+		if err != nil {
+			if errors.Is(err, cond.ErrNotFound{}) {
+				return nil
+			}
+			return err
 		}
-		return err
-	}
 
-	// Collect all indexed attributes including nested ones within components
-	indexedAttrs, err := s.collectIndexedAttributes(ctx, entity.attrs)
-	if err != nil {
-		return err
-	}
+		// Collect all indexed attributes including nested ones within components
+		indexedAttrs, err := s.collectIndexedAttributes(ctx, entity.attrs)
+		if err != nil {
+			return err
+		}
 
-	// Delete all index entries for this entity
-	for _, attrs := range indexedAttrs {
-		for _, attr := range attrs {
-			// TODO: Batch this as an op into the below txn
-			err := s.deleteFromCollection(entity, attr.CAS())
-			if err != nil {
-				return fmt.Errorf("failed to delete entity from collection: %w", err)
+		// Test seam: exercise the read-before-txn window deterministically. This
+		// is the exact gap a concurrent no-OCC patch could slip into (MIR-1334),
+		// so a test can inject one here to prove the delete stays atomic. Always
+		// nil in production.
+		if deleteEntityRaceHook != nil {
+			deleteEntityRaceHook()
+		}
+
+		key := s.buildKey(id)
+
+		// Build all delete operations: entity key + index entries + unique-value
+		// keys, so the whole delete commits (or fails) as one guarded txn.
+		ops := []clientv3.Op{clientv3.OpDelete(key)}
+
+		for _, attrs := range indexedAttrs {
+			for _, attr := range attrs {
+				ops = append(ops, s.deleteFromCollectionOp(entity, attr.CAS()))
 			}
 		}
+
+		uniqueAttrs, err := s.collectUniqueAttrs(ctx, entity)
+		if err != nil {
+			return err
+		}
+		for _, attr := range uniqueAttrs {
+			ops = append(ops, s.deleteUniqueOp(attr))
+		}
+
+		// Guard on the entity's ModRevision so the delete is all-or-nothing and
+		// can't interleave with a concurrent patch.
+		txnResp, err := s.client.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(key), "=", entity.GetRevision())).
+			Then(ops...).
+			Commit()
+
+		if err != nil {
+			return fmt.Errorf("failed to delete entity from etcd: %w", err)
+		}
+
+		if txnResp.Succeeded {
+			return nil
+		}
+
+		// The guard failed: either the entity was concurrently deleted, or a
+		// concurrent write bumped its revision. Re-read and retry; GetEntity
+		// returning NotFound on the next pass resolves the former.
+		if attempt >= maxDeleteRetries {
+			s.log.Error("delete lost revision race after retries", "id", id)
+			return cond.Conflict("entity", id)
+		}
+		s.log.Info("delete revision race, re-reading and retrying",
+			"id", id, "attempt", attempt+1)
 	}
-
-	key := s.buildKey(id)
-
-	// Build delete operations: entity key + unique-value keys
-	ops := []clientv3.Op{clientv3.OpDelete(key)}
-
-	uniqueAttrs, err := s.collectUniqueAttrs(ctx, entity)
-	if err != nil {
-		return err
-	}
-	for _, attr := range uniqueAttrs {
-		ops = append(ops, s.deleteUniqueOp(attr))
-	}
-
-	// Use Txn to check that the key exists before deleting
-	txnResp, err := s.client.Txn(ctx).
-		If(clientv3.Compare(clientv3.ModRevision(key), "=", entity.GetRevision())).
-		Then(ops...).
-		Commit()
-
-	if err != nil {
-		return fmt.Errorf("failed to delete entity from etcd: %w", err)
-	}
-
-	if !txnResp.Succeeded {
-		return cond.NotFound("entity", id)
-	}
-
-	return nil
 }
 
 // ClearSchemaCache clears the in-memory schema cache, forcing subsequent
@@ -1409,12 +1465,30 @@ func (s *EtcdStore) addToCollectionSessionOp(entity *Entity, collection, suffix 
 	return clientv3.OpPut(key, entity.Id().String(), clientv3.WithLease(clientv3.LeaseID(sid)))
 }
 
-func (s *EtcdStore) addToCollectionOp(entity *Entity, collection string) clientv3.Op {
+// plainIndexLease returns the lease that an entity's plain (durable) index
+// entries should carry. When the entity key itself is leased to a session
+// (BondToSession sets bind), its index entries must share that lease so etcd
+// garbage-collects them atomically with the entity. Otherwise the unleased
+// index entry outlives the entity when the session lease expires, leaving a
+// stale "phantom" index entry pointing at a deleted entity. For unbound
+// (durable) entities this returns NoLease so the index entry stays durable and
+// is cleaned up by DeleteEntity. See MIR-1320.
+func plainIndexLease(bind bool, sid int64) clientv3.LeaseID {
+	if bind {
+		return clientv3.LeaseID(sid)
+	}
+	return clientv3.NoLease
+}
+
+func (s *EtcdStore) addToCollectionOp(entity *Entity, collection string, lease clientv3.LeaseID) clientv3.Op {
 	key := base58.Encode([]byte(entity.Id()))
 	colKey := tr.Replace(collection)
 
 	key = fmt.Sprintf("%s/collections/%s/%s", s.prefix, colKey, key)
 
+	if lease != clientv3.NoLease {
+		return clientv3.OpPut(key, entity.Id().String(), clientv3.WithLease(lease))
+	}
 	return clientv3.OpPut(key, entity.Id().String())
 }
 
@@ -1425,17 +1499,6 @@ func (s *EtcdStore) deleteFromCollectionOp(entity *Entity, collection string) cl
 	key = fmt.Sprintf("%s/collections/%s/%s", s.prefix, colKey, key)
 
 	return clientv3.OpDelete(key)
-}
-
-func (s *EtcdStore) deleteFromCollection(entity *Entity, collection string) error {
-	key := base58.Encode([]byte(entity.Id()))
-	colKey := tr.Replace(collection)
-
-	ctx := context.Background()
-	key = fmt.Sprintf("%s/collections/%s/%s", s.prefix, colKey, key)
-
-	_, err := s.client.Delete(ctx, key)
-	return err
 }
 
 func (s *EtcdStore) ListIndex(ctx context.Context, attr Attr) ([]Id, error) {
@@ -1787,15 +1850,13 @@ func enumerateAllAttrs(attrs []Attr) []Attr {
 // ListAllEntityIDs returns all entity IDs in the store
 func (s *EtcdStore) ListAllEntityIDs(ctx context.Context) ([]Id, error) {
 	prefix := fmt.Sprintf("%s/entity/", s.prefix)
-	resp, err := s.client.Get(ctx, prefix,
-		clientv3.WithPrefix(),
-		clientv3.WithKeysOnly())
+	kvs, err := s.scanPaged(ctx, prefix, withKeysOnly())
 	if err != nil {
 		return nil, fmt.Errorf("failed to list entities: %w", err)
 	}
 
 	var ids []Id
-	for _, kv := range resp.Kvs {
+	for _, kv := range kvs {
 		key := string(kv.Key)
 		// Skip session keys (they have /session/ in the path)
 		if strings.Contains(key, "/session/") {

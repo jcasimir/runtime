@@ -4,17 +4,33 @@ import "testing"
 
 func TestGetRubyImage(t *testing.T) {
 	cases := map[string]string{
-		// Patch-level versions (e.g. from .ruby-version) truncate to the
-		// major.minor tag the registry actually mirrors.
-		"3.3.7": "oci.miren.cloud/ruby:3.3-slim",
-		"3.3.0": "oci.miren.cloud/ruby:3.3-slim",
-		// Already major.minor passes through unchanged.
-		"3.4": "oci.miren.cloud/ruby:3.4-slim",
-		"4.0": "oci.miren.cloud/ruby:4.0-slim",
+		// With our pull-through caching registry, patch-level versions
+		// are fully preserved instead of being truncated to major.minor.
+		"3.3.7": "oci.miren.cloud/ruby:3.3.7-slim",
+		"3.3.0": "oci.miren.cloud/ruby:3.3.0-slim",
+		"3.4":   "oci.miren.cloud/ruby:3.4-slim",
+		"4.0":   "oci.miren.cloud/ruby:4.0-slim",
 	}
 	for in, want := range cases {
 		if got := GetRubyImage(in); got != want {
 			t.Errorf("GetRubyImage(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestGetGolangImage(t *testing.T) {
+	cases := map[string]string{
+		// Go builds on the glibc/bookworm variant (MIR-1248), and the
+		// pull-through registry preserves full patch-level versions instead
+		// of truncating to major.minor.
+		"1.21.5": "oci.miren.cloud/golang:1.21.5-bookworm",
+		"1.21.0": "oci.miren.cloud/golang:1.21.0-bookworm",
+		"1.22":   "oci.miren.cloud/golang:1.22-bookworm",
+		"1.23":   "oci.miren.cloud/golang:1.23-bookworm",
+	}
+	for in, want := range cases {
+		if got := GetGolangImage(in); got != want {
+			t.Errorf("GetGolangImage(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

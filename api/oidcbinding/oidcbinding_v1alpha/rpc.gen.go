@@ -577,6 +577,7 @@ func AdaptOidcBindings(t OidcBindings) *rpc.Interface {
 			InterfaceName: "OidcBindings",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "provider", "issuer", "subject_pattern", "claim_conditions", "description"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Add(ctx, &OidcBindingsAdd{Call: call})
 			},
@@ -586,6 +587,7 @@ func AdaptOidcBindings(t OidcBindings) *rpc.Interface {
 			InterfaceName: "OidcBindings",
 			Index:         1,
 			Public:        false,
+			Params:        []string{"app"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.List(ctx, &OidcBindingsList{Call: call})
 			},
@@ -595,6 +597,7 @@ func AdaptOidcBindings(t OidcBindings) *rpc.Interface {
 			InterfaceName: "OidcBindings",
 			Index:         2,
 			Public:        false,
+			Params:        []string{"id"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Remove(ctx, &OidcBindingsRemove{Call: call})
 			},

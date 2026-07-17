@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"miren.dev/runtime/api/compute/compute_v1alpha"
+	"miren.dev/runtime/api/entityserver"
 	"miren.dev/runtime/api/runner/runner_v1alpha"
 	"miren.dev/runtime/pkg/caauth"
 	"miren.dev/runtime/pkg/enrolltoken"
@@ -18,6 +20,7 @@ import (
 
 type testEnv struct {
 	client *runner_v1alpha.RunnerRegistrationClient
+	ec     *entityserver.Client
 	store  *entity.MockStore
 	server *RegistrationServer
 	ca     *caauth.Authority
@@ -48,7 +51,7 @@ func newTestServer(t *testing.T) (*testEnv, func()) {
 	localClient := rpc.LocalClient(runner_v1alpha.AdaptRunnerRegistration(regServer))
 	client := runner_v1alpha.NewRunnerRegistrationClient(localClient)
 
-	return &testEnv{client: client, store: es.Store, server: regServer, ca: ca}, cleanup
+	return &testEnv{client: client, ec: es.Client, store: es.Store, server: regServer, ca: ca}, cleanup
 }
 
 // issueLeafCert issues a certificate from the given authority and returns the
@@ -322,6 +325,116 @@ func TestReusableInviteMultipleJoins(t *testing.T) {
 	}
 }
 
+// TestJoinRejectsDuplicateRunnerId is the MIR-1225 regression: a caller holding
+// a reusable invite must not be able to join as a runner_id that already backs a
+// live runner. Because runner_id becomes the mTLS cert CommonName that authorizes
+// per-runner actions (minting workload identity tokens for a sandbox), letting a
+// second join reuse a live id would let it impersonate that runner. The second
+// join must be rejected before any certificate is issued.
+func TestJoinRejectsDuplicateRunnerId(t *testing.T) {
+	ctx := context.Background()
+	env, cleanup := newTestServer(t)
+	defer cleanup()
+
+	// A reusable invite is the exposure: it is never consumed on use, so nothing
+	// else gates repeated joins.
+	res, err := env.client.CreateInvite(ctx, nil, 1, "reusable", true, 0, "")
+	if err != nil {
+		t.Fatalf("CreateInvite failed: %v", err)
+	}
+	_, secret, err := enrolltoken.Decode(res.Code())
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	const runnerID = "11111111-1111-1111-1111-111111111111"
+
+	// First join with the chosen id succeeds and mints a cert.
+	first, err := env.client.Join(ctx, secret, runnerID, "10.0.0.1:8443", "v1", nil, "victim")
+	if err != nil {
+		t.Fatalf("first Join RPC failed: %v", err)
+	}
+	if first.HasError() {
+		t.Fatalf("first join returned error: %s", first.Error())
+	}
+	if len(first.CertPem()) == 0 {
+		t.Fatal("first join did not return a certificate")
+	}
+
+	// A second join reusing the same id must be rejected, and must not return a
+	// certificate for the impersonated identity.
+	second, err := env.client.Join(ctx, secret, runnerID, "10.0.0.2:8443", "v1", nil, "impostor")
+	if err != nil {
+		t.Fatalf("second Join RPC failed: %v", err)
+	}
+	if !second.HasError() || second.Error() == "" {
+		t.Fatal("expected second join with a duplicate runner_id to be rejected")
+	}
+	if len(second.CertPem()) != 0 {
+		t.Error("rejected duplicate join must not return a certificate")
+	}
+
+	// The original node entity must be untouched: still exactly one node, with
+	// the victim's identity.
+	list, err := env.client.ListRunners(ctx)
+	if err != nil {
+		t.Fatalf("ListRunners failed: %v", err)
+	}
+	runners := list.Runners()
+	if len(runners) != 1 {
+		t.Fatalf("expected exactly 1 registered runner, got %d", len(runners))
+	}
+	if runners[0].Name() != "victim" {
+		t.Errorf("existing runner should be the original 'victim', got %q", runners[0].Name())
+	}
+}
+
+// TestJoinDuplicateCheckMatchesRunnerIdNotName guards the uniqueness check
+// against false positives: it must key strictly on runner_id, not on a node's
+// human name. A runner may be named with a string that happens to be another
+// runner's UUID; that must not block a legitimate join using that UUID as a
+// runner_id.
+func TestJoinDuplicateCheckMatchesRunnerIdNotName(t *testing.T) {
+	ctx := context.Background()
+	env, cleanup := newTestServer(t)
+	defer cleanup()
+
+	res, err := env.client.CreateInvite(ctx, nil, 1, "reusable", true, 0, "")
+	if err != nil {
+		t.Fatalf("CreateInvite failed: %v", err)
+	}
+	_, secret, err := enrolltoken.Decode(res.Code())
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	// uuidA is used as one runner's *name* and, separately, as another runner's
+	// *id*. Only the id should count for uniqueness.
+	const uuidA = "22222222-2222-2222-2222-222222222222"
+
+	// First runner: a distinct id, but named with uuidA.
+	first, err := env.client.Join(ctx, secret, "33333333-3333-3333-3333-333333333333", "10.0.0.1:8443", "v1", nil, uuidA)
+	if err != nil {
+		t.Fatalf("first Join RPC failed: %v", err)
+	}
+	if first.HasError() {
+		t.Fatalf("first join returned error: %s", first.Error())
+	}
+
+	// Second runner joins using uuidA as its runner_id. No node has that
+	// runner_id (uuidA is only a name), so this must succeed.
+	second, err := env.client.Join(ctx, secret, uuidA, "10.0.0.2:8443", "v1", nil, "second")
+	if err != nil {
+		t.Fatalf("second Join RPC failed: %v", err)
+	}
+	if second.HasError() {
+		t.Fatalf("join using a UUID that is only another runner's name should not be rejected, got: %s", second.Error())
+	}
+	if len(second.CertPem()) == 0 {
+		t.Error("second join should have returned a certificate")
+	}
+}
+
 func TestReusableInviteRevoke(t *testing.T) {
 	ctx := context.Background()
 	env, cleanup := newTestServer(t)
@@ -415,6 +528,162 @@ func TestRemoveRunner(t *testing.T) {
 	}
 	if len(listResult.Runners()) != 0 {
 		t.Errorf("expected 0 runners after remove, got %d", len(listResult.Runners()))
+	}
+}
+
+// TestCordonAndUncordonRunner exercises the full cordon -> uncordon round trip
+// through the real in-memory store, verifying the persistent scheduling enum
+// flips to cordoned and back to schedulable.
+func TestCordonAndUncordonRunner(t *testing.T) {
+	ctx := context.Background()
+	env, cleanup := newTestServer(t)
+	defer cleanup()
+
+	secret := env.createInviteAndDecode(t, ctx)
+	joinResult, err := env.client.Join(ctx, secret, "", "10.0.0.1:8443", "test-version", nil, "cordon-runner")
+	if err != nil {
+		t.Fatalf("Join failed: %v", err)
+	}
+	if joinResult.HasError() {
+		t.Fatalf("Join returned error: %s", joinResult.Error())
+	}
+
+	cordonResult, err := env.client.CordonRunner(ctx, "cordon-runner", "cert rotation")
+	if err != nil {
+		t.Fatalf("CordonRunner failed: %v", err)
+	}
+	if cordonResult.Error() != "" {
+		t.Fatalf("CordonRunner returned error: %s", cordonResult.Error())
+	}
+	if cordonResult.Name() != "cordon-runner" {
+		t.Errorf("CordonRunner returned name %q, want %q", cordonResult.Name(), "cordon-runner")
+	}
+
+	listResult, err := env.client.ListRunners(ctx)
+	if err != nil {
+		t.Fatalf("ListRunners failed: %v", err)
+	}
+	if len(listResult.Runners()) != 1 {
+		t.Fatalf("expected 1 runner, got %d", len(listResult.Runners()))
+	}
+	info := listResult.Runners()[0]
+	if info.Scheduling() != "cordoned" {
+		t.Errorf("scheduling = %q, want %q after cordon", info.Scheduling(), "cordoned")
+	}
+
+	uncordonResult, err := env.client.UncordonRunner(ctx, "cordon-runner")
+	if err != nil {
+		t.Fatalf("UncordonRunner failed: %v", err)
+	}
+	if uncordonResult.Error() != "" {
+		t.Fatalf("UncordonRunner returned error: %s", uncordonResult.Error())
+	}
+
+	listResult, err = env.client.ListRunners(ctx)
+	if err != nil {
+		t.Fatalf("ListRunners after uncordon failed: %v", err)
+	}
+	info = listResult.Runners()[0]
+	if info.Scheduling() != "schedulable" {
+		t.Errorf("scheduling = %q, want %q after uncordon", info.Scheduling(), "schedulable")
+	}
+}
+
+func TestCordonRunnerNotFound(t *testing.T) {
+	ctx := context.Background()
+	env, cleanup := newTestServer(t)
+	defer cleanup()
+
+	res, err := env.client.CordonRunner(ctx, "nonexistent", "")
+	if err != nil {
+		t.Fatalf("CordonRunner failed: %v", err)
+	}
+	if res.Error() == "" {
+		t.Errorf("expected error for nonexistent runner")
+	}
+}
+
+// TestDrainRunnerEvictsSandboxes verifies that draining a runner stops the
+// sandboxes scheduled to it (marking them STOPPED so the pool controllers
+// recreate them elsewhere) and cordons the node, while leaving both the stopped
+// sandbox entities and the node entity intact.
+func TestDrainRunnerEvictsSandboxes(t *testing.T) {
+	ctx := context.Background()
+	env, cleanup := newTestServer(t)
+	defer cleanup()
+
+	secret := env.createInviteAndDecode(t, ctx)
+	joinResult, err := env.client.Join(ctx, secret, "", "10.0.0.1:8443", "v1", nil, "drain-runner")
+	if err != nil {
+		t.Fatalf("Join failed: %v", err)
+	}
+	if joinResult.HasError() {
+		t.Fatalf("Join returned error: %s", joinResult.Error())
+	}
+
+	listResult, err := env.client.ListRunners(ctx)
+	if err != nil {
+		t.Fatalf("ListRunners failed: %v", err)
+	}
+	nodeID := entity.Id(listResult.Runners()[0].Id())
+
+	// Create a sandbox scheduled to the node so drain has something to evict.
+	sbID, err := env.ec.Create(ctx, "drain-sandbox", &compute_v1alpha.Sandbox{
+		Status: compute_v1alpha.RUNNING,
+	})
+	if err != nil {
+		t.Fatalf("failed to create sandbox: %v", err)
+	}
+	err = env.ec.UpdateAttrs(ctx, sbID, (&compute_v1alpha.Schedule{
+		Key: compute_v1alpha.Key{Kind: compute_v1alpha.KindSandbox, Node: nodeID},
+	}).Encode)
+	if err != nil {
+		t.Fatalf("failed to schedule sandbox to node: %v", err)
+	}
+
+	drainResult, err := env.client.DrainRunner(ctx, "drain-runner", "maintenance", 0)
+	if err != nil {
+		t.Fatalf("DrainRunner failed: %v", err)
+	}
+	if drainResult.Error() != "" {
+		t.Fatalf("DrainRunner returned error: %s", drainResult.Error())
+	}
+	if drainResult.EvictedCount() != 1 {
+		t.Errorf("EvictedCount = %d, want 1", drainResult.EvictedCount())
+	}
+	if drainResult.TimedOut() {
+		t.Errorf("drain unexpectedly timed out")
+	}
+
+	// The sandbox should be vacated (no live sandboxes) but NOT deleted: it
+	// stays in the node's schedule index as a terminal (STOPPED) entity, so the
+	// sandbox controller and pool manager drive teardown/reschedule.
+	live, err := env.server.countLiveNodeSandboxes(ctx, nodeID)
+	if err != nil {
+		t.Fatalf("countLiveNodeSandboxes failed: %v", err)
+	}
+	if live != 0 {
+		t.Errorf("expected 0 live sandboxes on node after drain, got %d", live)
+	}
+	total, err := env.server.countNodeSchedules(ctx, nodeID)
+	if err != nil {
+		t.Fatalf("countNodeSchedules failed: %v", err)
+	}
+	if total != 1 {
+		t.Errorf("expected the stopped sandbox entity to remain (not deleted), got %d scheduled", total)
+	}
+
+	// The node itself must still exist (drain does not remove the runner) and
+	// must be cordoned.
+	listResult, err = env.client.ListRunners(ctx)
+	if err != nil {
+		t.Fatalf("ListRunners after drain failed: %v", err)
+	}
+	if len(listResult.Runners()) != 1 {
+		t.Fatalf("expected node to survive drain, got %d runners", len(listResult.Runners()))
+	}
+	if listResult.Runners()[0].Scheduling() != "cordoned" {
+		t.Errorf("expected node to be cordoned after drain, got scheduling %q", listResult.Runners()[0].Scheduling())
 	}
 }
 

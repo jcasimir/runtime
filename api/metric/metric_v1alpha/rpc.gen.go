@@ -314,6 +314,7 @@ func AdaptSandboxMetrics(t SandboxMetrics) *rpc.Interface {
 			InterfaceName: "SandboxMetrics",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"sandbox"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Snapshot(ctx, &SandboxMetricsSnapshot{Call: call})
 			},

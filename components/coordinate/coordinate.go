@@ -45,9 +45,11 @@ import (
 	certctrl "miren.dev/runtime/controllers/certificate"
 	deploymentctrl "miren.dev/runtime/controllers/deployment"
 	ephemeralctrl "miren.dev/runtime/controllers/ephemeral"
+	indexgcctrl "miren.dev/runtime/controllers/indexgc"
 	nodehealthctrl "miren.dev/runtime/controllers/nodehealth"
 	"miren.dev/runtime/controllers/sandboxpool"
 	schedulerctrl "miren.dev/runtime/controllers/scheduler"
+	versionctrl "miren.dev/runtime/controllers/version"
 	"miren.dev/runtime/metrics"
 	"miren.dev/runtime/observability"
 	"miren.dev/runtime/pkg/addon"
@@ -56,12 +58,13 @@ import (
 	"miren.dev/runtime/pkg/addon/postgresql"
 	"miren.dev/runtime/pkg/addon/rabbitmq"
 	"miren.dev/runtime/pkg/addon/valkey"
+	"miren.dev/runtime/pkg/anywhere"
 	"miren.dev/runtime/pkg/caauth"
 	"miren.dev/runtime/pkg/cloudauth"
+	"miren.dev/runtime/pkg/containerenv"
 	"miren.dev/runtime/pkg/controller"
 	"miren.dev/runtime/pkg/entity"
 	"miren.dev/runtime/pkg/entity/schema"
-	"miren.dev/runtime/pkg/globalrouter"
 	"miren.dev/runtime/pkg/labs"
 	"miren.dev/runtime/pkg/oidcauth"
 	"miren.dev/runtime/pkg/rpc"
@@ -130,6 +133,11 @@ type CoordinatorConfig struct {
 
 	// HTTPRequestTimeout is the timeout for HTTP requests to app sandboxes
 	HTTPRequestTimeout time.Duration
+
+	// AppVersionRetentionCount and AppVersionRetentionPeriod tune the version
+	// retention GC. Values <= 0 fall back to the controller defaults.
+	AppVersionRetentionCount  int
+	AppVersionRetentionPeriod time.Duration
 
 	// WorkloadIssuer signs workload identity tokens for sandbox containers
 	WorkloadIssuer *workloadidentity.Issuer
@@ -344,6 +352,8 @@ type Coordinator struct {
 	autocertReady func() // nil when DNS-01 path is used
 	artifactGC    *artifactctrl.GCController
 	ephemeralGC   *ephemeralctrl.GCController
+	versionGC     *versionctrl.GCController
+	indexGC       *indexgcctrl.GCController
 	hs            *httpingress.Server
 
 	authority *caauth.Authority
@@ -361,6 +371,12 @@ type Coordinator struct {
 	logAddressesOnce sync.Once
 
 	debugServer *debugsrv.Server
+
+	// sagaBuilder is retained so build saga recovery can be driven from
+	// the boot sequence (RecoverBuildSagas) after the build's runtime
+	// dependencies — the registry and the cluster.local mapping — are
+	// ready. nil when sagas are disabled. See MIR-1285.
+	sagaBuilder *build.SagaBuilder
 }
 
 func (c *Coordinator) Activator() activator.AppActivator {
@@ -375,6 +391,22 @@ func (c *Coordinator) HttpIngress() *httpingress.Server {
 	return c.hs
 }
 
+// RecoverBuildSagas resumes in-flight build sagas left by a previous
+// process. It must be called from the boot sequence AFTER the runtime
+// dependencies a resumed build needs — the cluster registry and the
+// cluster.local name mapping — are ready. Recovery is deliberately not
+// run during Start, where it would resume an image push before those
+// exist (MIR-1285). No-op when sagas are disabled; recovery errors are
+// logged, not fatal.
+func (c *Coordinator) RecoverBuildSagas(ctx context.Context) {
+	if c.sagaBuilder == nil {
+		return
+	}
+	if err := c.sagaBuilder.Recover(ctx); err != nil {
+		c.Log.Error("build saga recovery completed with errors", "error", err)
+	}
+}
+
 // Stop stops the coordinator and all managed controllers
 func (c *Coordinator) Stop() {
 	if c.cm != nil {
@@ -385,6 +417,12 @@ func (c *Coordinator) Stop() {
 	}
 	if c.ephemeralGC != nil {
 		c.ephemeralGC.Stop()
+	}
+	if c.versionGC != nil {
+		c.versionGC.Stop()
+	}
+	if c.indexGC != nil {
+		c.indexGC.Stop()
 	}
 	if c.debugServer != nil {
 		if err := c.debugServer.Close(); err != nil {
@@ -813,8 +851,18 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Best-effort startup maintenance (format migration, short-id backfill, and
+	// reindex) scans the entity store. Bound it with a timeout so that a large or
+	// not-recently-compacted store fails fast and lets startup continue, rather
+	// than blocking the coordinator — and therefore the edge listener — on an
+	// unbounded read. Each step below already treats failure as non-fatal, so a
+	// timeout simply defers the work to a later startup once compaction catches up.
+	const startupMaintenanceTimeout = 2 * time.Minute
+	maintCtx, cancelMaint := context.WithTimeout(ctx, startupMaintenanceTimeout)
+	defer cancelMaint()
+
 	// Migrate entities from old format to new attribute-based format
-	migrated, skipped, err := entity.MigrateEntityStore(ctx, c.Log, client, entity.MigrateOptions{
+	migrated, skipped, err := entity.MigrateEntityStore(maintCtx, c.Log, client, entity.MigrateOptions{
 		Prefix: c.Prefix,
 		DryRun: false,
 	})
@@ -825,7 +873,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	}
 
 	// Backfill short-ids for entities that don't have one
-	sidMigrated, sidSkipped, sidErr := entity.MigrateShortIds(ctx, c.Log, client, entity.MigrateShortIdOptions{
+	sidMigrated, sidSkipped, sidErr := entity.MigrateShortIds(maintCtx, c.Log, client, entity.MigrateShortIdOptions{
 		Prefix: c.Prefix,
 		DryRun: false,
 	})
@@ -836,7 +884,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	}
 
 	// Check if indexes have changed and reindex if needed
-	if err := c.checkAndReindex(ctx, etcdStore, client); err != nil {
+	if err := c.checkAndReindex(maintCtx, etcdStore, client); err != nil {
 		c.Log.Error("automatic reindex failed (will retry next startup)", "error", err)
 	}
 
@@ -1097,6 +1145,31 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	}
 	c.ephemeralGC.Start(ctx)
 
+	// Start the version retention GC controller
+	versionGCConfig := versionctrl.DefaultGCConfig()
+	if c.AppVersionRetentionCount > 0 {
+		versionGCConfig.RetentionCount = c.AppVersionRetentionCount
+	}
+	if c.AppVersionRetentionPeriod > 0 {
+		versionGCConfig.RetentionPeriod = c.AppVersionRetentionPeriod
+	}
+	c.versionGC = &versionctrl.GCController{
+		Log:    c.Log.With("module", "version-gc"),
+		EAC:    eac,
+		Config: versionGCConfig,
+	}
+	c.versionGC.Start(ctx)
+
+	// Start the stale index GC controller. It deletes stale index entries in the
+	// background so clusters self-heal; the manual `miren debug reindex` stays
+	// available as the immediate big hammer.
+	c.indexGC = &indexgcctrl.GCController{
+		Log:    c.Log.With("module", "index-gc"),
+		Store:  etcdStore,
+		Config: indexgcctrl.DefaultGCConfig(),
+	}
+	c.indexGC.Start(ctx)
+
 	eps := execproxy.NewServer(c.Log, eac, rs)
 	server.ExposeValue("dev.miren.runtime/exec", exec_v1alpha.AdaptSandboxExec(eps))
 
@@ -1123,10 +1196,15 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	if labs.Sagas() {
 		sagaStorage := saga.NewEntityStorage(etcdStore, c.Log)
 		sagaBuilder := build.NewSagaBuilder(bs, sagaStorage, c.Log)
-		if err := sagaBuilder.Init(ctx); err != nil {
+		if err := sagaBuilder.Init(); err != nil {
 			c.Log.Error("failed to initialize saga builder", "error", err)
 			return err
 		}
+		// Retain for RecoverBuildSagas, driven from the boot sequence
+		// after the registry and cluster.local mapping are ready. Running
+		// recovery here would resume an image push before they exist
+		// (MIR-1285).
+		c.sagaBuilder = sagaBuilder
 		buildHandler = sagaBuilder
 	}
 	server.ExposeValue("dev.miren.runtime/build", build_v1alpha.AdaptBuilder(buildHandler))
@@ -1191,24 +1269,24 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		go c.reportStatusPeriodically(ctx)
 	}
 
-	// Start global router for NAT traversal when enabled
-	if labs.GlobalRouter() && c.CloudAuth.Enabled && c.authClient != nil {
+	// Start Miren Anywhere connector for NAT traversal when cloud auth is configured
+	if c.CloudAuth.Enabled && c.authClient != nil {
 		cloudURL := c.CloudAuth.CloudURL
 		if cloudURL == "" {
 			cloudURL = DefaultCloudURL
 		}
 
-		gr := globalrouter.New(globalrouter.Config{
+		conn := anywhere.New(anywhere.Config{
 			CloudURL:   cloudURL,
 			ClusterXID: c.CloudAuth.ClusterID,
 			AuthClient: c.authClient,
 			Ingress:    c.hs,
-			Log:        c.Log.With("component", "globalrouter"),
+			Log:        c.Log.With("component", "anywhere"),
 		})
 
 		go func() {
-			if err := gr.Run(ctx); err != nil && ctx.Err() == nil {
-				c.Log.Error("global router exited with error", "error", err)
+			if err := conn.Run(ctx); err != nil && ctx.Err() == nil {
+				c.Log.Error("Miren Anywhere connector exited with error", "error", err)
 			}
 		}()
 	}
@@ -1364,6 +1442,18 @@ func (c *Coordinator) apiAddresses() []string {
 	return final
 }
 
+// reachabilityVerdict synthesizes the agent's inbound-reachability verdict from
+// the cached netcheck result, for reporting to cloud. Returns nil when netcheck
+// has produced no usable public source address, so the field is simply omitted
+// from the report and cloud falls back to its generic copy.
+func (c *Coordinator) reachabilityVerdict() *cloudauth.ReachabilityVerdict {
+	c.netcheckMu.RLock()
+	netcheck := c.netcheckResult
+	c.netcheckMu.RUnlock()
+
+	return netcheck.ReachabilityVerdict()
+}
+
 // ReportStatus reports the current cluster status to miren.cloud
 func (c *Coordinator) ReportStartupStatus(ctx context.Context) error {
 	if c.authClient == nil {
@@ -1397,6 +1487,8 @@ func (c *Coordinator) ReportStartupStatus(ctx context.Context) error {
 		ClusterID:         c.CloudAuth.ClusterID,
 		APIAddresses:      c.apiAddresses(),
 		CACertFingerprint: caFingerprint,
+		Reachability:      c.reachabilityVerdict(),
+		Containerized:     containerenv.InContainer(),
 	}
 
 	return c.authClient.ReportClusterStatus(ctx, status)
@@ -1444,6 +1536,8 @@ func (c *Coordinator) ReportStatus(ctx context.Context) error {
 		WorkloadCount: workloadCount,
 		ResourceUsage: resourceUsage,
 		APIAddresses:  c.apiAddresses(),
+		Reachability:  c.reachabilityVerdict(),
+		Containerized: containerenv.InContainer(),
 	}
 
 	return c.authClient.ReportClusterStatus(ctx, status)
@@ -1533,10 +1627,13 @@ func (c *Coordinator) checkAndReindex(ctx context.Context, store *entity.EtcdSto
 		"stored_hash", storedHash,
 		"current_hash", currentHash)
 
-	reindexCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-
-	stats, err := store.Reindex(reindexCtx, c.Log, entity.ReindexOptions{
+	// Reindex is the heaviest maintenance step and runs last, inside the shared
+	// startup-maintenance deadline that bounds how long the coordinator blocks
+	// the edge listener. That ceiling is the single bound; don't layer a second
+	// timeout here, which would only ever clamp to whatever's left of it. A
+	// reindex that doesn't finish in time is retried on the next startup (it's
+	// gated on the index hash below).
+	stats, err := store.Reindex(ctx, c.Log, entity.ReindexOptions{
 		DryRun:       false,
 		CleanupStale: false,
 	})

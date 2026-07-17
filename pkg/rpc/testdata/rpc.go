@@ -278,6 +278,7 @@ func AdaptTown(t Town) *rpc.Interface {
 			InterfaceName: "Town",
 			Index:         0,
 			Public:        true,
+			Params:        []string{"name"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.GetHero(ctx, &TownGetHero{Call: call})
 			},
@@ -287,6 +288,7 @@ func AdaptTown(t Town) *rpc.Interface {
 			InterfaceName: "Town",
 			Index:         1,
 			Public:        false,
+			Params:        []string{"name"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.HireHero(ctx, &TownHireHero{Call: call})
 			},
@@ -485,6 +487,7 @@ func AdaptEmpower(t Empower) *rpc.Interface {
 			InterfaceName: "Empower",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"power"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.IncreasePower(ctx, &EmpowerIncreasePower{Call: call})
 			},

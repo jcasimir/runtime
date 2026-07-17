@@ -122,6 +122,7 @@ func AdaptSendStream[T any](t SendStream[T]) *rpc.Interface {
 			InterfaceName: "SendStream",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"value"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Send(ctx, &SendStreamSend[T]{Call: call})
 			},
@@ -287,6 +288,7 @@ func AdaptRecvStream[T any](t RecvStream[T]) *rpc.Interface {
 			InterfaceName: "RecvStream",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"count"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Recv(ctx, &RecvStreamRecv[T]{Call: call})
 			},

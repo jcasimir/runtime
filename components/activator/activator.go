@@ -618,6 +618,11 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 	strategy := concurrency.NewStrategyForVersion(ver, service, &sc)
 	maxInstances := int64(strategy.MaxInstances())
 
+	// poolLoop is labeled so the pool-creation retry path below can break all
+	// the way back out to re-read the cache. The outer loop re-acquires a.mu
+	// from scratch on every iteration (RLock immediately below), so any
+	// `continue poolLoop` MUST leave the lock released.
+poolLoop:
 	for {
 		// Check if pool exists or is being created (read lock)
 		a.mu.RLock()
@@ -838,11 +843,18 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 		if exists {
 			// Another goroutine claimed creation while we waited for lock
 			a.mu.Unlock()
-			continue // Loop back to wait/increment logic
+			continue poolLoop // Loop back to wait/increment logic
 		}
 
 		// Try to find an existing pool in the entity store with retries
-		// DeploymentLauncher may have already created it, but we haven't seen it yet in our cache
+		// DeploymentLauncher may have already created it, but we haven't seen it yet in our cache.
+		//
+		// Lock invariant for this loop: a.mu is held at the top of every
+		// iteration. The attempt>0 backoff below releases it (line ~a.mu.Unlock)
+		// and re-acquires it before the next store query, so any path that exits
+		// an iteration must leave the lock in the state the next iteration (or
+		// the code after the loop) expects: held to stay in this loop, released
+		// to `continue poolLoop`.
 		const maxRetries = 3
 		const baseRetryDelay = 100 * time.Millisecond
 
@@ -870,9 +882,15 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 				a.mu.Lock()
 				_, exists = a.pools[key]
 				if exists {
-					// Another goroutine found or created the pool while we were waiting
+					// Another goroutine found or created the pool while we were
+					// waiting. Break all the way out to the outer loop to pick it
+					// up through the normal wait/increment path. A bare `continue`
+					// here would re-enter *this* attempt loop with the lock
+					// released, and the next iteration's a.mu.Unlock() during
+					// backoff would fatally unlock an already-unlocked mutex
+					// (MIR-1306).
 					a.mu.Unlock()
-					continue // Loop back to main logic
+					continue poolLoop
 				}
 			}
 
@@ -2015,6 +2033,49 @@ func (a *localActivator) removePoolFromTracking(poolID entity.Id) {
 	}
 }
 
+// evictStaleVersionBindingsLocked drops version->pool bindings that point at
+// freshPool but whose version freshPool no longer references. When the launcher
+// supersedes a pool it dereferences it (ReferencedByVersions=nil,
+// DesiredInstances=0) without deleting the entity, so the pool still exists and
+// removePoolFromTracking never fires. Without this, a binding established at
+// recovery stays pinned to the drained pool and never re-resolves to the
+// canonical one that still references the version, which is how ingress gets
+// stranded on a superseded pool across a restart (MIR-1293). Evicting the stale
+// entry lets the next AcquireLease re-resolve the key via findPoolInStore, which
+// selects the pool that still references the version.
+//
+// Callers must hold a.mu.
+func (a *localActivator) evictStaleVersionBindingsLocked(freshPool *compute_v1alpha.SandboxPool) {
+	references := func(versionID string) bool {
+		for _, ref := range freshPool.ReferencedByVersions {
+			if ref.String() == versionID {
+				return true
+			}
+		}
+		return false
+	}
+
+	for key, versionRef := range a.versions {
+		if versionRef.poolID == freshPool.ID && !references(key.ver) {
+			delete(a.versions, key)
+			a.log.Info("evicted stale version->pool mapping after pool dereferenced version",
+				"version", key.ver,
+				"service", key.service,
+				"pool", freshPool.ID)
+		}
+	}
+
+	for key, state := range a.pools {
+		if state.pool != nil && state.pool.ID == freshPool.ID && !references(key.ver) {
+			delete(a.pools, key)
+			a.log.Info("evicted stale pool state after pool dereferenced version",
+				"version", key.ver,
+				"service", key.service,
+				"pool", freshPool.ID)
+		}
+	}
+}
+
 // watchPools watches for pool entity changes and keeps the in-memory cache in sync.
 // Handles deletions (cleanup stale entries) and updates (refresh DesiredInstances, etc.).
 func (a *localActivator) watchPools(ctx context.Context) {
@@ -2075,6 +2136,11 @@ func (a *localActivator) watchPools(ctx context.Context) {
 				if ps, ok := a.poolSandboxes[freshPool.ID]; ok {
 					ps.pool = &freshPool
 				}
+
+				// Drop any binding still pinned to this pool for a version it no
+				// longer references (e.g. the launcher just drained a superseded
+				// pool), so the next lease request re-resolves to the canonical pool.
+				a.evictStaleVersionBindingsLocked(&freshPool)
 
 				a.mu.Unlock()
 			}

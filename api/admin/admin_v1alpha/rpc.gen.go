@@ -593,6 +593,7 @@ func AdaptAdmin(t Admin) *rpc.Interface {
 			InterfaceName: "Admin",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "method", "params"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Invoke(ctx, &AdminInvoke{Call: call})
 			},
@@ -602,6 +603,7 @@ func AdaptAdmin(t Admin) *rpc.Interface {
 			InterfaceName: "Admin",
 			Index:         1,
 			Public:        false,
+			Params:        []string{"app"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ListMethods(ctx, &AdminListMethods{Call: call})
 			},
@@ -611,6 +613,7 @@ func AdaptAdmin(t Admin) *rpc.Interface {
 			InterfaceName: "Admin",
 			Index:         2,
 			Public:        false,
+			Params:        []string{"app", "methods"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.DescribeMethods(ctx, &AdminDescribeMethods{Call: call})
 			},

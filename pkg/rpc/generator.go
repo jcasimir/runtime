@@ -2013,6 +2013,11 @@ func (g *Generator) generateInterfaces(f *j.File) error {
 						g.Line().Id("InterfaceName").Op(":").Lit(i.Name)
 						g.Line().Id("Index").Op(":").Lit(m.Index)
 						g.Line().Id("Public").Op(":").Lit(m.Public)
+						g.Line().Id("Params").Op(":").Index().String().ValuesFunc(func(g *j.Group) {
+							for _, p := range m.Parameters {
+								g.Lit(p.Name)
+							}
+						})
 						g.Line().Id("Handler").Op(":").Func().Params(
 							j.Id("ctx").Qual("context", "Context"),
 							j.Id("call").Qual(rpc, "Call"),

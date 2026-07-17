@@ -295,14 +295,6 @@ func (h *highlevelBuilder) aptInstall(cur llb.State, pkgs ...string) llb.State {
 	).State
 }
 
-func (h *highlevelBuilder) apkAdd(cur llb.State, pkgs ...string) llb.State {
-	return cur.Run(
-		llb.Shlexf("apk add --no-cache %s", strings.Join(pkgs, " ")),
-		h.CacheMount("/var/cache/apk"),
-		llb.WithCustomName("[phase] Installing OS packages"),
-	).State
-}
-
 func (h *highlevelBuilder) bundleInstall(cur, mnt llb.State) llb.State {
 	// Because bundle install likes to modify the lock file, we copy the Gemfile and Gemfile.lock
 	// in rather than using h.Access to mount them in read only.

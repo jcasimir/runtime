@@ -19,6 +19,8 @@ miren server [flags]
 - `--acme-dns-provider` — DNS provider for ACME DNS-01 challenges (e.g., cloudflare, route53, exec). When set, uses DNS challenge instead of HTTP challenge. See https://go-acme.github.io/lego/dns/ for available providers.
 - `--acme-email` — Email address for ACME account registration (recommended for account recovery and notifications)
 - `--address, -a` — Address to listen on (host:port). For IPv6 use brackets, e.g. "[::1]:8443".
+- `--app-version-retention-count` — Number of most-recent versions to retain per app regardless of age
+- `--app-version-retention-period` — Retain versions newer than this duration regardless of count (e.g. 30d, 2w)
 - `--buildkit-gc-duration` — How long to keep BuildKit cache entries (e.g., 7d, 24h)
 - `--buildkit-gc-storage` — Maximum BuildKit layer cache size (e.g., 10GB, 50GB)
 - `--buildkit-socket` — Path to external BuildKit Unix socket (for distributed mode)
@@ -35,6 +37,7 @@ miren server [flags]
 - `--etcd-http-client-port` — Etcd HTTP client port
 - `--etcd-peer-port` — Etcd peer port
 - `--etcd-prefix, -p` — Etcd prefix
+- `--etcd-quota-backend-bytes` — Etcd backend quota in bytes (0 = auto-size from system RAM)
 - `--http-request-timeout` — HTTP request timeout in seconds
 - `--ingress-address` — Optional bind override. Replaces the mode's default bind entirely (interface and port). Rejected by validation in tls-autoprovision (where :443 + :80 is structural). Reserved unix:/path prefix is not yet supported.
 - `--ingress-mode` — Ingress mode: tls-autoprovision (default, :443 + :80 with ACME or self-signed), behind-proxy-http (plain HTTP for use behind a TLS-terminating proxy), behind-proxy-https (TLS terminated by Miren; certs come from self-signed or DNS-01 ACME, since :80 isn't bound for HTTP-01)
@@ -78,7 +81,7 @@ miren server --mode standalone
 ## Subcommands
 
 - [`miren server config`](/command/server-config) — Server configuration management commands
-- [`miren server docker`](/command/server-docker) — Docker-based server management commands
+- [`miren server container`](/command/server-container) — Run the miren server in a container (Docker or Podman)
 - [`miren server install`](/command/server-install) — Install systemd service for miren server
 - [`miren server register`](/command/server-register) — Register this cluster with miren.cloud
 - [`miren server status`](/command/server-status) — Show miren service status

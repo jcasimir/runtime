@@ -965,6 +965,7 @@ func AdaptStream(t Stream) *rpc.Interface {
 			InterfaceName: "Stream",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"count"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Recv(ctx, &StreamRecv{Call: call})
 			},
@@ -1570,6 +1571,7 @@ func AdaptBuilder(t Builder) *rpc.Interface {
 			InterfaceName: "Builder",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"application", "tardata", "status", "envVars", "ephemeral_label", "ephemeral_ttl"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.BuildFromTar(ctx, &BuilderBuildFromTar{Call: call})
 			},
@@ -1579,6 +1581,7 @@ func AdaptBuilder(t Builder) *rpc.Interface {
 			InterfaceName: "Builder",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"tardata"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.AnalyzeApp(ctx, &BuilderAnalyzeApp{Call: call})
 			},
@@ -1588,6 +1591,7 @@ func AdaptBuilder(t Builder) *rpc.Interface {
 			InterfaceName: "Builder",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"application", "manifest"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.PrepareUpload(ctx, &BuilderPrepareUpload{Call: call})
 			},
@@ -1597,6 +1601,7 @@ func AdaptBuilder(t Builder) *rpc.Interface {
 			InterfaceName: "Builder",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"session_id", "tardata", "status", "envVars", "ephemeral_label", "ephemeral_ttl"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.BuildFromPrepared(ctx, &BuilderBuildFromPrepared{Call: call})
 			},

@@ -165,6 +165,7 @@ func AdaptReader[T any](t Reader[T]) *rpc.Interface {
 			InterfaceName: "Reader",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"value"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Read(ctx, &ReaderRead[T]{Call: call})
 			},

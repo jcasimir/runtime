@@ -11,6 +11,10 @@ import (
 // Validate validates the configuration
 func (c *Config) Validate() error {
 
+	if err := c.AppVersion.Validate(); err != nil {
+		return fmt.Errorf("app_version: %w", err)
+	}
+
 	if err := c.Buildkit.Validate(); err != nil {
 		return fmt.Errorf("buildkit: %w", err)
 	}
@@ -55,6 +59,14 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// Validate validates AppVersionConfig
+func (c *AppVersionConfig) Validate() error {
+
+	// Check for port conflicts in AppVersionConfig
+
+	return nil
+}
+
 // Validate validates BuildkitConfig
 func (c *BuildkitConfig) Validate() error {
 
@@ -87,6 +99,11 @@ func (c *EtcdConfig) Validate() error {
 	// Validate peer_port
 	if c.PeerPort != nil && (*c.PeerPort < 1 || *c.PeerPort > 65535) {
 		return fmt.Errorf("peer_port must be between 1 and 65535, got %d", *c.PeerPort)
+	}
+
+	// Validate quota_backend_bytes minimum
+	if c.QuotaBackendBytes != nil && *c.QuotaBackendBytes < 0 {
+		return fmt.Errorf("quota_backend_bytes must be at least 0, got %d", *c.QuotaBackendBytes)
 	}
 
 	// Check for port conflicts in EtcdConfig

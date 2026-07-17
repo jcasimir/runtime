@@ -193,9 +193,12 @@ Complete reference for all `miren` CLI commands.
 | Command | Description |
 |---------|-------------|
 | [`miren runner`](/command/runner) | Runner management commands |
+| [`miren runner cordon`](/command/runner-cordon) | Mark a runner unschedulable without stopping its sandboxes _(`distributedrunners`)_ |
+| [`miren runner drain`](/command/runner-drain) | Cordon a runner and evict its sandboxes onto other nodes _(`distributedrunners`)_ |
 | [`miren runner install`](/command/runner-install) | Install systemd service for miren runner _(`distributedrunners`)_ |
 | [`miren runner join`](/command/runner-join) | Join this machine to a coordinator as a runner _(`distributedrunners`)_ |
 | [`miren runner list`](/command/runner-list) | List all registered runners _(`distributedrunners`)_ |
+| [`miren runner reissue`](/command/runner-reissue) | Rotate this runner's certificate in place (requires a still-valid cert), keeping its identity _(`distributedrunners`)_ |
 | [`miren runner remove`](/command/runner-remove) | Remove a registered runner and clean up resources _(`distributedrunners`)_ |
 | [`miren runner service-status`](/command/runner-service-status) | Show miren-runner systemd service status _(`distributedrunners`)_ |
 | [`miren runner start`](/command/runner-start) | Start this machine as a distributed runner _(`distributedrunners`)_ |
@@ -204,6 +207,7 @@ Complete reference for all `miren` CLI commands.
 | [`miren runner token create`](/command/runner-token-create) | Create a join token for a runner _(`distributedrunners`)_ |
 | [`miren runner token list`](/command/runner-token-list) | List all join tokens _(`distributedrunners`)_ |
 | [`miren runner token revoke`](/command/runner-token-revoke) | Revoke a join token _(`distributedrunners`)_ |
+| [`miren runner uncordon`](/command/runner-uncordon) | Make a cordoned runner eligible for scheduling again _(`distributedrunners`)_ |
 | [`miren runner uninstall`](/command/runner-uninstall) | Remove systemd service for miren runner _(`distributedrunners`)_ |
 | [`miren runner upgrade`](/command/runner-upgrade) | Upgrade miren runner to the latest or specified version _(`distributedrunners`)_ |
 | [`miren runner upgrade rollback`](/command/runner-upgrade-rollback) | Rollback runner to previous version _(`distributedrunners`)_ |
@@ -234,10 +238,10 @@ Complete reference for all `miren` CLI commands.
 | [`miren server config`](/command/server-config) | Server configuration management commands |
 | [`miren server config generate`](/command/server-config-generate) | Generate a server configuration file from current settings |
 | [`miren server config validate`](/command/server-config-validate) | Validate a server configuration file |
-| [`miren server docker`](/command/server-docker) | Docker-based server management commands |
-| [`miren server docker install`](/command/server-docker-install) | Install miren server using Docker |
-| [`miren server docker status`](/command/server-docker-status) | Show status of miren server Docker container |
-| [`miren server docker uninstall`](/command/server-docker-uninstall) | Uninstall miren server Docker container |
+| [`miren server container`](/command/server-container) | Run the miren server in a container (Docker or Podman) |
+| [`miren server container install`](/command/server-container-install) | Install miren server in a container |
+| [`miren server container status`](/command/server-container-status) | Show status of miren server container |
+| [`miren server container uninstall`](/command/server-container-uninstall) | Uninstall miren server container |
 | [`miren server install`](/command/server-install) | Install systemd service for miren server |
 | [`miren server register`](/command/server-register) | Register this cluster with miren.cloud |
 | [`miren server register status`](/command/server-register-status) | Show cluster registration status |
@@ -268,7 +272,7 @@ Complete reference for all `miren` CLI commands.
 
 ## Advanced / Debug Commands
 
-:::caution
+:::warning
 These commands are intended for advanced debugging and troubleshooting. They may change without notice.
 :::
 
@@ -290,7 +294,6 @@ These commands are intended for advanced debugging and troubleshooting. They may
 | [`miren debug disk lease-release`](/command/debug-disk-lease-release) | Release a disk lease |
 | [`miren debug disk lease-status`](/command/debug-disk-lease-status) | Show detailed status of a disk lease |
 | [`miren debug disk list`](/command/debug-disk-list) | List all disk entities |
-| [`miren debug disk migrate`](/command/debug-disk-migrate) | Migrate LSVD volume to raw disk image |
 | [`miren debug disk mounts`](/command/debug-disk-mounts) | List all mounted disks from /proc/mounts |
 | [`miren debug disk status`](/command/debug-disk-status) | Show status of a disk entity |
 | [`miren debug entity`](/command/debug-entity) | Entity store debug commands |

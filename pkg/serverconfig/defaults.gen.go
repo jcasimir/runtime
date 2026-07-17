@@ -10,6 +10,7 @@ func strPtr(s string) *string { return &s }
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
 	return &Config{
+		AppVersion:      DefaultAppVersionConfig(),
 		Buildkit:        DefaultBuildkitConfig(),
 		Containerd:      DefaultContainerdConfig(),
 		Etcd:            DefaultEtcdConfig(),
@@ -20,6 +21,14 @@ func DefaultConfig() *Config {
 		TLS:             DefaultTLSConfig(),
 		Victorialogs:    DefaultVictoriaLogsConfig(),
 		Victoriametrics: DefaultVictoriaMetricsConfig(),
+	}
+}
+
+// DefaultAppVersionConfig returns default AppVersionConfig
+func DefaultAppVersionConfig() AppVersionConfig {
+	return AppVersionConfig{
+		RetentionCount:  intPtr(10),
+		RetentionPeriod: strPtr("30d"),
 	}
 }
 
@@ -46,12 +55,13 @@ func DefaultContainerdConfig() ContainerdConfig {
 // DefaultEtcdConfig returns default EtcdConfig
 func DefaultEtcdConfig() EtcdConfig {
 	return EtcdConfig{
-		ClientPort:     intPtr(12379),
-		Endpoints:      []string{},
-		HTTPClientPort: intPtr(12381),
-		PeerPort:       intPtr(12380),
-		Prefix:         strPtr("/miren"),
-		StartEmbedded:  nil,
+		ClientPort:        intPtr(12379),
+		Endpoints:         []string{},
+		HTTPClientPort:    intPtr(12381),
+		PeerPort:          intPtr(12380),
+		Prefix:            strPtr("/miren"),
+		QuotaBackendBytes: intPtr(0),
+		StartEmbedded:     nil,
 	}
 }
 

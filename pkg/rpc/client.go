@@ -305,36 +305,50 @@ func (c *NetworkClient) reresolveCapability(rs *InterfaceState) error {
 	return nil
 }
 
-// ListMethods returns the list of methods available on this capability.
-// Returns an error if the server doesn't support method introspection (old servers).
-func (c *NetworkClient) ListMethods(ctx context.Context) ([]string, error) {
+// fetchMethods queries the server's method-introspection endpoint. Returns an
+// error if the server doesn't support introspection (old servers).
+func (c *NetworkClient) fetchMethods(ctx context.Context) (methodsResponse, error) {
+	if c.localClient != nil {
+		return c.localClient.listMethods(), nil
+	}
+
 	url := "https://" + c.remote + "/_rpc/methods/" + string(c.oid)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return methodsResponse{}, err
 	}
 
 	c.addBearerToken(req)
 
 	resp, err := c.roundTrip(req)
 	if err != nil {
-		return nil, err
+		return methodsResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return methodsResponse{}, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	var result methodsResponse
 	if err := cbor.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return methodsResponse{}, err
 	}
 
 	if result.Error != "" {
-		return nil, errors.New(result.Error)
+		return methodsResponse{}, errors.New(result.Error)
 	}
 
+	return result, nil
+}
+
+// ListMethods returns the list of methods available on this capability.
+// Returns an error if the server doesn't support method introspection (old servers).
+func (c *NetworkClient) ListMethods(ctx context.Context) ([]string, error) {
+	result, err := c.fetchMethods(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return result.Methods, nil
 }
 
@@ -347,6 +361,24 @@ func (c *NetworkClient) HasMethod(ctx context.Context, method string) bool {
 	}
 	for _, m := range methods {
 		if m == method {
+			return true
+		}
+	}
+	return false
+}
+
+// HasMethodParam reports whether the remote interface's method accepts a given
+// parameter. This distinguishes servers that have a method from servers that
+// have a newer revision of it with an added parameter. Returns false if the
+// method or parameter is absent, or if the server is too old to report
+// parameters at all (introspection predates this, or the method itself).
+func (c *NetworkClient) HasMethodParam(ctx context.Context, method, param string) bool {
+	result, err := c.fetchMethods(ctx)
+	if err != nil {
+		return false
+	}
+	for _, p := range result.Params[method] {
+		if p == param {
 			return true
 		}
 	}

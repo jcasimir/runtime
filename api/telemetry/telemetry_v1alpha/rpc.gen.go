@@ -116,6 +116,7 @@ func AdaptTelemetry(t Telemetry) *rpc.Interface {
 			InterfaceName: "Telemetry",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"span_data"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ReportSpans(ctx, &TelemetryReportSpans{Call: call})
 			},

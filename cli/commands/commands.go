@@ -89,6 +89,7 @@ func RegisterAll(d *mflags.Dispatcher) {
 	))
 	d.Dispatch("deploy", Infer("deploy", "Deploy an application", Deploy,
 		WithGroup(GroupGettingStarted),
+		WithDescription(deployDescription),
 		WithExample(mflags.Example{
 			Name: "Basic",
 			Body: "miren deploy",
@@ -122,6 +123,7 @@ miren deploy --analyze
 	))
 	d.Dispatch("rollback", Infer("rollback", "Roll back to a previous version", Rollback,
 		WithGroup(GroupGettingStarted),
+		WithDescription(rollbackDescription),
 		WithExample(mflags.Example{
 			Name: "Rollback the app in the current directory",
 			Body: "miren rollback",
@@ -212,10 +214,6 @@ miren deploy --analyze
 			Name: "Watch app stats in real time",
 			Body: "miren app --watch",
 		}),
-		WithExample(mflags.Example{
-			Name: "Show only the app configuration",
-			Body: "miren app --config-only",
-		}),
 	))
 	d.Dispatch("app list", Infer("app list", "List all applications", AppList,
 		WithExample(mflags.Example{
@@ -262,6 +260,7 @@ miren deploy --analyze
 		}),
 	))
 	d.Dispatch("app restart", Infer("app restart", "Restart an application", AppRestart,
+		WithDescription(appRestartDescription),
 		WithExample(mflags.Example{
 			Name: "Restart the current app",
 			Body: "miren app restart",
@@ -366,6 +365,7 @@ miren deploy --analyze
 	// Environment variable commands
 	d.Dispatch("env", Section("env", "Environment variable management commands", "", WithSectionGroup(GroupConfiguring)))
 	d.Dispatch("env set", Infer("env set", "Set environment variables for an application", EnvSet,
+		WithDescription(envSetDescription),
 		WithExample(mflags.Example{
 			Name: "Set an environment variable",
 			Body: "miren env set -e DATABASE_URL=postgres://localhost/mydb",
@@ -404,6 +404,7 @@ miren deploy --analyze
 		}),
 	))
 	d.Dispatch("env delete", Infer("env delete", "Delete environment variables", EnvDelete,
+		WithDescription(envDeleteDescription),
 		WithExample(mflags.Example{
 			Name: "Delete a variable",
 			Body: "miren env delete DATABASE_URL",
@@ -433,6 +434,7 @@ miren deploy --analyze
 		}),
 	))
 	d.Dispatch("addon create", Infer("addon create", "Attach an addon to an application", AddonCreate,
+		WithDescription(addonCreateDescription),
 		WithExample(mflags.Example{
 			Name: "Attach a PostgreSQL addon",
 			Body: "miren addon create miren-postgresql:small",
@@ -449,6 +451,7 @@ miren deploy --analyze
 		}),
 	))
 	d.Dispatch("addon destroy", Infer("addon destroy", "Remove an addon from an application", AddonDestroy,
+		WithDescription(addonDestroyDescription),
 		WithExample(mflags.Example{
 			Name: "Remove an addon",
 			Body: "miren addon destroy miren-postgresql",
@@ -545,23 +548,6 @@ miren deploy --analyze
 		WithExample(mflags.Example{
 			Name: "Disable WAF on a route",
 			Body: "miren route waf example.com --disable",
-		}),
-	))
-
-	d.Dispatch("route protect", Infer("route protect", "Protect an HTTP route with an identity provider", RouteProtect,
-		WithExample(mflags.Example{
-			Name: "Protect a route with an identity provider",
-			Body: "miren route protect example.com --provider my-google-oidc --claim-header email:X-User-Email",
-		}),
-		WithExample(mflags.Example{
-			Name: "Protect the default route",
-			Body: "miren route protect --default --provider my-google-oidc",
-		}),
-	))
-	d.Dispatch("route unprotect", Infer("route unprotect", "Remove identity-provider protection from an HTTP route", RouteUnprotect,
-		WithExample(mflags.Example{
-			Name: "Remove protection from a route",
-			Body: "miren route unprotect example.com",
 		}),
 	))
 
@@ -673,6 +659,13 @@ miren deploy --analyze
 				Body: "miren runner join mren_... --coordinator 10.0.0.5:8443",
 			}),
 		))
+		d.Dispatch("runner reissue", Infer("runner reissue", "Rotate this runner's certificate in place (requires a still-valid cert), keeping its identity", RunnerReissue,
+			WithLabsFeature(labs.FeatureDistributedRunners),
+			WithExample(mflags.Example{
+				Name: "Rotate this runner's certificate",
+				Body: "miren runner reissue",
+			}),
+		))
 		d.Dispatch("runner start", Infer("runner start", "Start this machine as a distributed runner", RunnerStart,
 			WithLabsFeature(labs.FeatureDistributedRunners),
 			WithExample(mflags.Example{
@@ -717,6 +710,35 @@ miren deploy --analyze
 			WithExample(mflags.Example{
 				Name: "Force remove a runner with active sandboxes",
 				Body: "miren runner remove my-runner --force",
+			}),
+		))
+		d.Dispatch("runner cordon", Infer("runner cordon", "Mark a runner unschedulable without stopping its sandboxes", RunnerCordon,
+			WithLabsFeature(labs.FeatureDistributedRunners),
+			WithExample(mflags.Example{
+				Name: "Cordon a runner",
+				Body: "miren runner cordon my-runner",
+			}),
+			WithExample(mflags.Example{
+				Name: "Cordon with a reason",
+				Body: "miren runner cordon my-runner --reason \"cert rotation\"",
+			}),
+		))
+		d.Dispatch("runner uncordon", Infer("runner uncordon", "Make a cordoned runner eligible for scheduling again", RunnerUncordon,
+			WithLabsFeature(labs.FeatureDistributedRunners),
+			WithExample(mflags.Example{
+				Name: "Uncordon a runner",
+				Body: "miren runner uncordon my-runner",
+			}),
+		))
+		d.Dispatch("runner drain", Infer("runner drain", "Cordon a runner and evict its sandboxes onto other nodes", RunnerDrain,
+			WithLabsFeature(labs.FeatureDistributedRunners),
+			WithExample(mflags.Example{
+				Name: "Drain a runner before maintenance",
+				Body: "miren runner drain my-runner",
+			}),
+			WithExample(mflags.Example{
+				Name: "Drain with a timeout",
+				Body: "miren runner drain my-runner --timeout 300",
 			}),
 		))
 		d.Dispatch("runner install", Infer("runner install", "Install systemd service for miren runner", RunnerInstall,
@@ -821,41 +843,59 @@ miren deploy --analyze
 			Body: "miren server upgrade rollback",
 		}),
 	))
-	d.Dispatch("server docker", Section("server docker", "Docker-based server management commands", ""))
-	d.Dispatch("server docker install", Infer("server docker install", "Install miren server using Docker", ServerInstallDocker,
+	d.Dispatch("server container", Section("server container", "Run the miren server in a container (Docker or Podman)", ""))
+	d.Dispatch("server container install", Infer("server container install", "Install miren server in a container", ServerInstallContainer,
 		WithExample(mflags.Example{
 			Name: "Install with cloud registration",
-			Body: "miren server docker install",
+			Body: "miren server container install",
 		}),
 		WithExample(mflags.Example{
 			Name: "Install without cloud (local only)",
-			Body: "miren server docker install --without-cloud",
+			Body: "miren server container install --without-cloud",
 		}),
 		WithExample(mflags.Example{
 			Name: "Install with a custom HTTP port",
-			Body: "miren server docker install --http-port 8080",
+			Body: "miren server container install --http-port 8080",
+		}),
+		WithExample(mflags.Example{
+			Name: "Install behind a TLS-terminating proxy (e.g. tailscale serve)",
+			Body: "miren server container install --ingress-mode behind-proxy-http",
+		}),
+		WithExample(mflags.Example{
+			Name: "Force a specific runtime",
+			Body: "miren server container install --runtime podman",
 		}),
 	))
-	d.Dispatch("server docker uninstall", Infer("server docker uninstall", "Uninstall miren server Docker container", ServerUninstallDocker,
+	d.Dispatch("server container uninstall", Infer("server container uninstall", "Uninstall miren server container", ServerUninstallContainer,
 		WithExample(mflags.Example{
 			Name: "Uninstall the container",
-			Body: "miren server docker uninstall",
+			Body: "miren server container uninstall",
 		}),
 		WithExample(mflags.Example{
 			Name: "Uninstall and remove all data",
-			Body: "miren server docker uninstall --remove-volume",
+			Body: "miren server container uninstall --remove-volume",
 		}),
 	))
-	d.Dispatch("server docker status", Infer("server docker status", "Show status of miren server Docker container", ServerStatusDocker,
+	d.Dispatch("server container status", Infer("server container status", "Show status of miren server container", ServerStatusContainer,
 		WithExample(mflags.Example{
 			Name: "Show status",
-			Body: "miren server docker status",
+			Body: "miren server container status",
 		}),
 		WithExample(mflags.Example{
 			Name: "Follow logs",
-			Body: "miren server docker status --follow",
+			Body: "miren server container status --follow",
 		}),
 	))
+
+	// Deprecated `server docker` aliases. The container-install path used to be
+	// docker-only and shipped under this name; keep it working (pointing at the
+	// same handlers) so existing scripts and docs don't break, but steer new
+	// users to `server container`. These are marked deprecated in help rather
+	// than hidden, since mflags doesn't filter hidden groups below the top level.
+	d.Dispatch("server docker", Section("server docker", "Deprecated alias for 'server container'", ""))
+	d.Dispatch("server docker install", Infer("server docker install", "Deprecated: use 'miren server container install'", ServerInstallContainer))
+	d.Dispatch("server docker uninstall", Infer("server docker uninstall", "Deprecated: use 'miren server container uninstall'", ServerUninstallContainer))
+	d.Dispatch("server docker status", Infer("server docker status", "Deprecated: use 'miren server container status'", ServerStatusContainer))
 
 	// CLI management commands
 	d.Dispatch("download", Section("download", "Download management commands", "", WithSectionGroup(GroupServer)))
@@ -1004,7 +1044,6 @@ Warning: These commands are intended for advanced users and developers. They may
 	d.Dispatch("debug disk lease-delete", Infer("debug disk lease-delete", "Delete a disk lease entity", DebugDiskLeaseDelete))
 	d.Dispatch("debug disk lease-status", Infer("debug disk lease-status", "Show detailed status of a disk lease", DebugDiskLeaseStatus))
 	d.Dispatch("debug disk mounts", Infer("debug disk mounts", "List all mounted disks from /proc/mounts", DebugDiskMounts))
-	d.Dispatch("debug disk migrate", Infer("debug disk migrate", "Migrate LSVD volume to raw disk image", DiskMigrate))
 
 	// Debug netdb commands
 	d.Dispatch("debug netdb", Section("debug netdb", "Network database debug commands", ""))
@@ -1025,3 +1064,52 @@ Warning: These commands are intended for advanced users and developers. They may
 
 	addCommands(d)
 }
+
+// Extended markdown descriptions for lifecycle commands. These render in the
+// generated command docs (docs/docs/command/*.md) and clarify which operations
+// roll out automatically versus require a rebuild.
+
+const deployDescription = `Deploy uploads your source, builds a new container image on the server, and activates the resulting version — replacing the previously running one. This is the only command that rebuilds your image.
+
+To activate a previously built version without rebuilding, pass ` + "`" + `--version` + "`" + `:
+` + "```" + `bash
+miren deploy --version myapp-vCVkjR6u7744AsMebwMjGU
+` + "```" + `
+This reuses the existing image and rolls it out immediately — useful for rolling forward to a known-good version without waiting for a build. Find version IDs with ` + "`" + `miren app history` + "`" + `.
+
+:::note[Config changes deploy on their own]
+Changing environment variables (` + "`" + `miren env set` + "`" + ` / ` + "`" + `miren env delete` + "`" + `) or addons (` + "`" + `miren addon create` + "`" + ` / ` + "`" + `miren addon destroy` + "`" + `) already creates and rolls out a new version. You only need ` + "`" + `miren deploy` + "`" + ` when your code or ` + "`" + `app.toml` + "`" + ` has changed.
+:::`
+
+const rollbackDescription = `Rollback re-activates a previous version by reusing its already-built image — no rebuild happens. It presents a picker of recent successful deployments and rolls out the one you choose immediately. The currently active version is excluded since rolling back to it would be a no-op.
+
+Rollback creates a new deployment record; it does not erase history.`
+
+const appRestartDescription = `Restart stops your app's running sandboxes and lets the pool manager re-create them from the *current* active version. It does not create a new version, change any configuration, or rebuild your image — the app comes back on exactly the spec it was already running.
+
+Use restart to:
+- Clear stuck or wedged process state
+- Reset the crash-loop cooldown so a crashing app is retried immediately
+- Pick up data restored out-of-band (for example, after ` + "`" + `miren disk restore` + "`" + `)
+
+:::note[Config and env changes restart on their own]
+You do not need to restart after ` + "`" + `miren env set` + "`" + `, ` + "`" + `miren env delete` + "`" + `, ` + "`" + `miren addon create` + "`" + `, or ` + "`" + `miren addon destroy` + "`" + `. Each of those already creates a new version and rolls out new sandboxes automatically. A manual restart on top only adds a redundant rollout.
+:::`
+
+const envSetDescription = `Setting an environment variable creates a new app version and rolls it out automatically — you do not need to run ` + "`" + `miren deploy` + "`" + ` or ` + "`" + `miren app restart` + "`" + ` afterward. The new version reuses your existing container image (no rebuild); Miren boots new sandboxes with the updated environment and drains the old ones. The command waits for the new version to become healthy before returning.
+
+Use ` + "`" + `-e` + "`" + ` for plain values and ` + "`" + `-s` + "`" + ` for sensitive values (masked in output and logs). A "secret" is simply an env var set with ` + "`" + `-s` + "`" + ` — there is no separate secret command. Pass ` + "`" + `--service` + "`" + ` to scope the change to a single service instead of all services.
+
+:::note[No restart needed]
+Environment variable changes take effect on their own. Running ` + "`" + `miren app restart` + "`" + ` afterward only triggers a redundant second rollout.
+:::`
+
+const envDeleteDescription = `Deleting an environment variable creates a new app version and rolls it out automatically — you do not need to run ` + "`" + `miren deploy` + "`" + ` or ` + "`" + `miren app restart` + "`" + ` afterward. The new version reuses your existing container image (no rebuild), and the command waits for it to become healthy before returning.
+
+:::warning[Deploy app.toml changes first]
+` + "`" + `miren env delete` + "`" + ` builds the new version by copying the *current server-side* spec, not your local ` + "`" + `app.toml` + "`" + `. If you have pending ` + "`" + `app.toml` + "`" + ` changes, deploy them first, then delete the stale variable — otherwise the delete rolls out the server-side spec and your local edits won't be included. Variables declared in ` + "`" + `app.toml` + "`" + ` drop automatically when you remove them from the file and redeploy.
+:::`
+
+const addonCreateDescription = `Attaching an addon provisions the backing resource and injects its connection details as environment variables into your app. Once provisioning completes, Miren creates a new app version with those variables and rolls it out automatically — you do not need to run ` + "`" + `miren deploy` + "`" + ` or ` + "`" + `miren app restart` + "`" + `. The rollout is deferred until the addon finishes provisioning, so it may not be immediate.`
+
+const addonDestroyDescription = `Removing an addon deprovisions the backing resource and strips its injected environment variables from your app. Miren creates a new app version without those variables and rolls it out automatically — you do not need to run ` + "`" + `miren deploy` + "`" + ` or ` + "`" + `miren app restart` + "`" + `.`

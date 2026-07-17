@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -166,8 +167,11 @@ type Runner struct {
 
 	cc *containerd.Client
 
-	ec *entityserver.Client
-	se *entityserver.Session
+	// sessMu guards ec/se, which are swapped when the health session is
+	// re-established after a lost lease (see superviseSession).
+	sessMu sync.Mutex
+	ec     *entityserver.Client
+	se     *entityserver.Session
 
 	closers []io.Closer
 
@@ -205,9 +209,18 @@ func (r *Runner) SetRestartMode(v bool) {
 	}
 }
 
+// entityClient returns the current session-scoped entity client, which may be
+// swapped out when the health session is re-established (see superviseSession).
+func (r *Runner) entityClient() *entityserver.Client {
+	r.sessMu.Lock()
+	defer r.sessMu.Unlock()
+	return r.ec
+}
+
 // Drain sets the runner's node status to disabled and stops all running sandboxes
 func (r *Runner) Drain(ctx context.Context) error {
-	if r.ec == nil || r.Id == "" {
+	ec := r.entityClient()
+	if ec == nil || r.Id == "" {
 		return fmt.Errorf("runner not initialized with entity client")
 	}
 
@@ -215,7 +228,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 
 	// Set node status to disabled
 	r.Log.Info("setting node status to disabled", "id", r.Id)
-	err := r.ec.UpdateAttrs(ctx, entity.Id(r.Id), (&compute_v1alpha.Node{
+	err := ec.UpdateAttrs(ctx, entity.Id(r.Id), (&compute_v1alpha.Node{
 		Status: compute_v1alpha.DISABLED,
 	}).Encode)
 	if err != nil {
@@ -226,7 +239,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 
 	// List all sandboxes scheduled to this node
 	idx := compute_v1alpha.Index(compute_v1alpha.KindSandbox, entity.Id("node/"+r.Id))
-	results, err := r.ec.List(ctx, idx)
+	results, err := ec.List(ctx, idx)
 	if err != nil {
 		return fmt.Errorf("failed to query sandboxes on node: %w", err)
 	}
@@ -264,115 +277,6 @@ func (r *Runner) Drain(ctx context.Context) error {
 
 func (r *Runner) ContainerdNamespace() string {
 	return r.namespace
-}
-
-// stopUserContainers stops all running user workload containers so their file
-// descriptors to disk images are released before migration. Containers with
-// IDs starting with "miren-" are infrastructure (etcd, etc.) and are left
-// running. The sandbox controller will recreate stopped containers during its
-// subsequent reconciliation.
-func (r *Runner) stopUserContainers(ctx context.Context, log *slog.Logger) {
-	cc := r.deps.CC
-	containers, err := cc.Containers(ctx)
-	if err != nil {
-		log.Warn("failed to list containers for stop", "error", err)
-		return
-	}
-
-	// Collect tasks to stop and set up wait channels before sending signals
-	type pendingStop struct {
-		id     string
-		task   containerd.Task
-		exitCh <-chan containerd.ExitStatus
-	}
-
-	var pending []pendingStop
-	for _, c := range containers {
-		if strings.HasPrefix(c.ID(), "miren-") {
-			continue
-		}
-
-		task, err := c.Task(ctx, nil)
-		if err != nil {
-			continue
-		}
-
-		status, err := task.Status(ctx)
-		if err != nil || status.Status == containerd.Stopped {
-			continue
-		}
-
-		exitCh, err := task.Wait(ctx)
-		if err != nil {
-			continue
-		}
-
-		log.Info("sending SIGTERM to container for disk migration", "id", c.ID())
-		if err := task.Kill(ctx, syscall.SIGTERM); err != nil {
-			log.Warn("failed to send SIGTERM, migration will proceed anyway", "id", c.ID(), "error", err)
-			continue
-		}
-
-		pending = append(pending, pendingStop{id: c.ID(), task: task, exitCh: exitCh})
-	}
-
-	if len(pending) == 0 {
-		return
-	}
-
-	// Wait for all containers in parallel with a shared 10s deadline
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-
-	remaining := make(map[int]struct{})
-	for i := range pending {
-		remaining[i] = struct{}{}
-	}
-
-	for len(remaining) > 0 {
-		select {
-		case <-timer.C:
-			// Timeout — SIGKILL everything still running
-			for i := range remaining {
-				p := &pending[i]
-				log.Warn("container did not exit in 10s, sending SIGKILL", "id", p.id)
-				_ = p.task.Kill(ctx, syscall.SIGKILL)
-			}
-			// Wait briefly for SIGKILL to take effect
-			for i := range remaining {
-				p := &pending[i]
-				killCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-				select {
-				case <-p.exitCh:
-				case <-killCtx.Done():
-				}
-				cancel()
-				if _, err := p.task.Delete(ctx); err != nil {
-					log.Warn("failed to delete task after kill", "id", p.id, "error", err)
-				}
-			}
-			remaining = nil
-		case <-ctx.Done():
-			return
-		default:
-			// Poll all remaining exit channels without blocking
-			for i := range remaining {
-				select {
-				case <-pending[i].exitCh:
-					if _, err := pending[i].task.Delete(ctx); err != nil {
-						log.Warn("failed to delete task after stop", "id", pending[i].id, "error", err)
-					}
-					delete(remaining, i)
-				default:
-				}
-			}
-			if len(remaining) > 0 {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-	}
-
-	log.Info("stopped containers for disk migration", "count", len(pending))
 }
 
 func (r *Runner) ContainerdContainerForSandbox(ctx context.Context, id entity.Id) (containerd.Container, error) {
@@ -606,20 +510,51 @@ func (r *Runner) initializeNetwork(ctx context.Context, eg ...*errgroup.Group) e
 	return nil
 }
 
-func (r *Runner) setupEntity(ctx context.Context, ec *entityserver.Client) error {
+// setupEntity establishes the runner's coordinator health session and node
+// registration, then supervises the session so a lost lease (e.g. from a
+// coordinator restart) is transparently re-established. base is the plain,
+// non-session entity client; each session is minted from it.
+func (r *Runner) setupEntity(ctx context.Context, base *entityserver.Client) error {
 	if r.Id == "" {
 		return nil
 	}
 
+	if err := r.establishSession(ctx, base); err != nil {
+		return err
+	}
+
+	go r.superviseSession(ctx, base)
+
+	return nil
+}
+
+// establishSession mints a fresh health session from base, registers the node
+// entity, and marks it READY. The node's READY status is session-scoped: it
+// lives under the etcd lease and vanishes when the lease dies, so this must be
+// re-run to bring the runner back after a lost session. base is the plain
+// (non-session) client; the session-scoped client it returns is stored on r.ec.
+func (r *Runner) establishSession(ctx context.Context, base *entityserver.Client) error {
 	r.Log.Info("Creating health session")
 
-	sess, ec, err := ec.NewSession(ctx, "runner health")
+	sess, ec, err := base.NewSession(ctx, "runner health")
 	if err != nil {
 		return err
 	}
 
-	r.ec = ec
-	r.se = sess
+	// If registration below fails we abandon this session, so revoke its
+	// lease rather than leaking a keepalive goroutine and orphaned lease.
+	// The retry path can otherwise pile these up on a flaky coordinator.
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		revokeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rerr := sess.Revoke(revokeCtx); rerr != nil {
+			r.Log.Warn("failed to revoke unregistered health session", "error", rerr)
+		}
+	}()
 
 	role := "runner"
 	if r.deps.IsCoordinator {
@@ -648,9 +583,70 @@ func (r *Runner) setupEntity(ctx context.Context, ec *entityserver.Client) error
 		return err
 	}
 
+	r.sessMu.Lock()
+	r.ec = ec
+	r.se = sess
+	published = true
+	r.sessMu.Unlock()
+
 	r.Log.Info("Runner registered and ready", "id", res, "status", "ready")
 
 	return nil
+}
+
+// superviseSession watches the current health session and re-establishes it
+// when its lease is lost. Without this, a coordinator restart orphans the
+// runner's lease, the session-scoped READY status is dropped, and the runner
+// stays not-ready until manually restarted (MIR-1305). Re-establishing well
+// within nodehealth's grace period keeps the runner's sandboxes from being
+// evacuated.
+func (r *Runner) superviseSession(ctx context.Context, base *entityserver.Client) {
+	for {
+		r.sessMu.Lock()
+		se := r.se
+		r.sessMu.Unlock()
+		if se == nil {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-se.Dead():
+		}
+
+		// No explicit Close on the old session: by the time Dead() fires its
+		// keepalive goroutine has already stopped and revoked what it could,
+		// so establishSession can simply overwrite r.se with a fresh one.
+		r.Log.Warn("runner health session lease lost, re-establishing", "id", r.Id)
+
+		backoff := time.Second
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+
+			if err := r.establishSession(ctx, base); err == nil {
+				r.Log.Info("runner health session re-established", "id", r.Id)
+				break
+			} else {
+				r.Log.Error("failed to re-establish runner health session, retrying",
+					"error", err, "backoff", backoff)
+			}
+
+			// Jitter the wait so a fleet of runners knocked offline by the
+			// same coordinator restart doesn't reconnect in lockstep. Sleep a
+			// random 50-100% of the current backoff.
+			wait := backoff/2 + time.Duration(rand.Int64N(int64(backoff/2)+1))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+
+			backoff = min(backoff*2, 30*time.Second)
+		}
+	}
 }
 
 func (r *Runner) SetupControllers(
@@ -734,11 +730,6 @@ func (r *Runner) SetupControllers(
 		workers = DefaulWorkers
 	}
 
-	// Stop any orphaned lsvd-server process left over from a previous version.
-	// Before universal mode, the lsvd-server ran as an outboard process; during
-	// upgrade it must be stopped since the new code no longer manages it.
-	stopOrphanedLSVDServer(log, r.DataPath)
-
 	// Initialize disk I/O controllers for universal mode (loop devices)
 	dataPath := filepath.Join(r.DataPath, "disk-data")
 	err = os.MkdirAll(dataPath, 0700)
@@ -771,13 +762,6 @@ func (r *Runner) SetupControllers(
 
 	if err := r.dvc.Init(ctx); err != nil {
 		return nil, fmt.Errorf("disk volume controller init: %w", err)
-	}
-
-	// If LSVD migration is pending, stop user containers so their file
-	// descriptors to disk images are released before migration. The sandbox
-	// controller will recreate them during its subsequent reconciliation.
-	if r.dvc.HasPendingMigration(ctx) {
-		r.stopUserContainers(ctx, log)
 	}
 
 	// Reconcile volumes with entity server on startup to re-mount any
@@ -864,9 +848,22 @@ func (r *Runner) SetupControllers(
 	))
 
 	mntHandler := controller.AdaptReconcileController[storage_v1alpha.DiskMount](r.dmc)
-	cm.AddController(controller.NewReconcileController(
+	mntController := controller.NewReconcileController(
 		"disk-mount", log, r.dmc.Index(), eas, mntHandler, 5*time.Minute, workers,
-	))
+	)
+	// Record the mount controller's direct entity writes so the watch skips its
+	// own events instead of self-retriggering reconcile in a tight loop (MIR-1345).
+	r.dmc.SetWriteTracker(mntController.WriteTracker())
+	// Periodically delete mounts whose backing volume is gone. Such a mount can
+	// never reach its desired state; sweeping bounds how long an orphan lingers
+	// and re-attempts a failing reconcile (MIR-1345).
+	mntController.SetPeriodic(5*time.Minute, func(ctx context.Context) error {
+		if err := r.dmc.ReconcileOrphanMounts(ctx, diskio.OrphanMountSweepGracePeriod); err != nil {
+			log.Warn("periodic orphan mount sweep failed", "error", err)
+		}
+		return nil
+	})
+	cm.AddController(mntController)
 
 	// Use entity mode controllers
 	diskController := disk.NewDiskController(log, eas, r.Id, r.DiskMode, r.deps.IsCoordinator)

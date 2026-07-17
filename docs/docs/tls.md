@@ -14,7 +14,9 @@ Miren automatically provisions TLS certificates for your applications using [Let
 
 When a request arrives for a hostname with a configured route, Miren provisions a TLS certificate from Let's Encrypt using the ACME protocol. Certificates are cached on disk and renewed automatically before they expire.
 
+:::warning[Unrouted hostnames]
 Hostnames without a configured route are served with a self-signed fallback certificate (browsers will show a warning).
+:::
 
 For wildcard routes (e.g., `*.myapp.example.com`), TLS certificates are provisioned for each matching subdomain as requests arrive. See [Wildcard Routes](/traffic-routing#wildcard-routes) for details.
 
@@ -113,7 +115,7 @@ See the [lego DNS provider documentation](https://go-acme.github.io/lego/dns/) f
 
 Whether Miren terminates TLS at all (and on which ports) is set by `ingress.mode`. The default `tls-autoprovision` mode is what this page has been describing: TLS on `:443`, plus `:80` for the HTTPS redirect and HTTP-01 ACME challenges.
 
-Two other modes are available for deployments where Miren sits behind a TLS-terminating proxy (nginx, Caddy, Cloudflare Tunnel, ALB):
+Two other modes are available for deployments where Miren sits behind a TLS-terminating proxy (nginx, Caddy, Cloudflare Tunnel, `tailscale serve`, ALB). This is also the answer when something else already owns `:443` on the host: rather than fighting over the port, let that proxy keep it and run Miren behind it with `behind-proxy-http`.
 
 | Mode | What Miren does | Cert source |
 |------|-----------------|-------------|

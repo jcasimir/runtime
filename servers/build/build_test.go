@@ -3,11 +3,14 @@ package build
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appclient "miren.dev/runtime/api/app"
 	"miren.dev/runtime/api/build/build_v1alpha"
 	"miren.dev/runtime/api/compute/compute_v1alpha"
 	"miren.dev/runtime/api/core/core_v1alpha"
@@ -1700,10 +1703,13 @@ func TestIsSystemEnvVar(t *testing.T) {
 		key      string
 		isSystem bool
 	}{
-		{"MIREN_VERSION", true},
-		{"MIREN_APP", true},
-		{"MIREN_INSTANCE_NUM", true},
+		// The entire MIREN_ namespace is reserved, whoever set it.
+		{appclient.EnvRuntimeApp, true},
+		{appclient.EnvRuntimeVersion, true},
+		{appclient.EnvRuntimeInstanceNum, true},
 		{"MIREN_CUSTOM", true},
+		{"MIREN_", true},
+		// Unprefixed system vars, named explicitly.
 		{"PORT", true},
 		{"ADMIN_TOKEN", true},
 		{"DATABASE_URL", false},
@@ -1712,6 +1718,7 @@ func TestIsSystemEnvVar(t *testing.T) {
 		{"SECRET_KEY_BASE", false},
 		{"MY_PORT", false},
 		{"PORTNAME", false},
+		{"MIRENISH", false},
 	}
 
 	for _, tt := range tests {
@@ -1784,8 +1791,8 @@ func TestComputeBuildEnvVars(t *testing.T) {
 			name: "system vars are filtered out",
 			existingVars: []core_v1alpha.ConfigSpecVariables{
 				{Key: "DATABASE_URL", Value: "postgres://localhost/db", Source: "manual"},
-				{Key: "MIREN_VERSION", Value: "v1", Source: "config"},
-				{Key: "MIREN_APP", Value: "myapp", Source: "config"},
+				{Key: appclient.EnvRuntimeVersion, Value: "v1", Source: "config"},
+				{Key: appclient.EnvRuntimeApp, Value: "myapp", Source: "config"},
 				{Key: "PORT", Value: "8080", Source: "manual"},
 				{Key: "ADMIN_TOKEN", Value: "token123", Source: "manual"},
 				{Key: "MIREN_CUSTOM", Value: "custom", Source: "config"},
@@ -2455,6 +2462,91 @@ func TestValidateDiskConfigsLocalDiskSkipsCheck(t *testing.T) {
 
 	err := validateDiskConfigs(ctx, server.EAC, spec)
 	assert.NoError(t, err)
+}
+
+// TestShouldWarnLocalStorageMigration covers the migration-warning decision,
+// including MIR-1423: an explicit local-provider disk mounted somewhere other
+// than the legacy /miren/data/local path must suppress the warning. All local
+// volumes share the same per-app host directory keyed on app ID, so the explicit
+// disk already exposes the data — the old path-only check missed this and warned
+// (and injected a duplicate mount) once the shared directory held data.
+func TestShouldWarnLocalStorageMigration(t *testing.T) {
+	const appID = entity.Id("app/test")
+
+	localDiskAt := func(mountPath string) core_v1alpha.ConfigSpec {
+		return core_v1alpha.ConfigSpec{
+			Services: []core_v1alpha.ConfigSpecServices{{
+				Name: "web",
+				Disks: []core_v1alpha.ConfigSpecServicesDisks{{
+					Name:      "chisigns-data",
+					MountPath: mountPath,
+					Provider:  core_v1alpha.ConfigSpecServicesDisksLOCAL,
+				}},
+			}},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		spec      core_v1alpha.ConfigSpec
+		writeData bool
+		want      bool
+	}{
+		{
+			name:      "existing data, no disk declared",
+			spec:      core_v1alpha.ConfigSpec{Services: []core_v1alpha.ConfigSpecServices{{Name: "web"}}},
+			writeData: true,
+			want:      true,
+		},
+		{
+			name:      "explicit local disk at /data suppresses warning",
+			spec:      localDiskAt("/data"),
+			writeData: true,
+			want:      false,
+		},
+		{
+			name:      "explicit local disk at legacy path suppresses warning",
+			spec:      localDiskAt("/miren/data/local"),
+			writeData: true,
+			want:      false,
+		},
+		{
+			name: "miren-provider disk at legacy path suppresses warning",
+			spec: core_v1alpha.ConfigSpec{Services: []core_v1alpha.ConfigSpecServices{{
+				Name: "web",
+				Disks: []core_v1alpha.ConfigSpecServicesDisks{{
+					Name:      "legacy",
+					MountPath: "/miren/data/local",
+					Provider:  core_v1alpha.ConfigSpecServicesDisksMIREN,
+				}},
+			}}},
+			writeData: true,
+			want:      false,
+		},
+		{
+			name:      "no existing data, no disk declared",
+			spec:      core_v1alpha.ConfigSpec{Services: []core_v1alpha.ConfigSpecServices{{Name: "web"}}},
+			writeData: false,
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataPath := t.TempDir()
+			if tt.writeData {
+				localDir := filepath.Join(dataPath, "data", "local", appID.String())
+				require.NoError(t, os.MkdirAll(localDir, 0755))
+				require.NoError(t, os.WriteFile(filepath.Join(localDir, "data.db"), []byte("x"), 0644))
+			}
+			got := shouldWarnLocalStorageMigration(dataPath, appID, tt.spec)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("empty data path never warns", func(t *testing.T) {
+		assert.False(t, shouldWarnLocalStorageMigration("", appID, core_v1alpha.ConfigSpec{}))
+	})
 }
 
 func TestValidateDiskConfigsAutoCreate(t *testing.T) {

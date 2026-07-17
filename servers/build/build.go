@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	buildkitclient "github.com/moby/buildkit/client"
 	"github.com/tonistiigi/fsutil"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -78,6 +79,15 @@ type buildSession struct {
 	cancelFunc context.CancelFunc
 }
 
+// BuildKitProvider is the subset of *buildkit.Component the builder depends on.
+// Abstracting it as an interface lets unit tests inject a fake daemon (e.g. one
+// whose Client fails) instead of standing up a real containerd-managed buildkitd.
+type BuildKitProvider interface {
+	Client(ctx context.Context) (*buildkitclient.Client, error)
+	SocketPath() string
+	IsRunning() bool
+}
+
 type Builder struct {
 	Log           *slog.Logger
 	EAS           *entityserver_v1alpha.EntityAccessClient
@@ -95,14 +105,14 @@ type Builder struct {
 
 	// BuildKit is the persistent BuildKit component for container image builds.
 	// When set, uses the shared daemon instead of launching ephemeral sandboxes.
-	BuildKit *buildkit.Component
+	BuildKit BuildKitProvider
 
 	sessions   sync.Map // sessionID → *buildSession
 	cacheLocks *appLocks
 }
 
 func NewBuilder(log *slog.Logger, eas *entityserver_v1alpha.EntityAccessClient, appClient *app.Client, addonsClient *app_v1alpha.AddonsClient, res netresolve.Resolver, tmpdir string, logWriter observability.LogWriter, dnsHostname string, bk *buildkit.Component, dataPath string) *Builder {
-	return &Builder{
+	b := &Builder{
 		Log:           log.With("module", "builder"),
 		EAS:           eas,
 		appClient:     appClient,
@@ -113,10 +123,16 @@ func NewBuilder(log *slog.Logger, eas *entityserver_v1alpha.EntityAccessClient, 
 		ec:            entityserver.NewClient(log, eas),
 		LogWriter:     logWriter,
 		DNSHostname:   dnsHostname,
-		BuildKit:      bk,
 		DataPath:      dataPath,
 		cacheLocks:    newAppLocks(),
 	}
+	// Only assign when non-nil: storing a typed-nil *buildkit.Component into the
+	// BuildKitProvider interface would make the field non-nil and defeat the
+	// `b.BuildKit == nil` guard used to detect an unconfigured daemon.
+	if bk != nil {
+		b.BuildKit = bk
+	}
+	return b
 }
 
 // mergeServiceEnvVars merges per-service environment variables from app.toml into existing service env vars.
@@ -820,26 +836,41 @@ func logField(key, value string) *build_v1alpha.LogField {
 	return f
 }
 
-// checkLocalStorageMigration checks whether the app has existing data in
-// local storage but no explicit disk config, and sends a deploy warning.
-func (b *Builder) checkLocalStorageMigration(ctx context.Context, appID entity.Id, configSpec core_v1alpha.ConfigSpec, status *stream.SendStreamClient[*build_v1alpha.Status]) {
-	if b.DataPath == "" {
-		return
-	}
-
-	// Check if any service already declares a disk at /miren/data/local
-	// (any provider — local or miren). If so, the user has migrated.
+// configDeclaresLocalStorage reports whether the config already declares a disk
+// that satisfies the local-storage migration. That's true when any service
+// declares an explicit local-provider disk (regardless of its container mount
+// path — all local volumes share the same per-app host directory keyed on app
+// ID), or a disk of any provider at the legacy /miren/data/local mount path.
+func configDeclaresLocalStorage(configSpec core_v1alpha.ConfigSpec) bool {
 	for _, svc := range configSpec.Services {
 		for _, disk := range svc.Disks {
-			if disk.MountPath == "/miren/data/local" {
-				return
+			if disk.Provider == core_v1alpha.ConfigSpecServicesDisksLOCAL || disk.MountPath == "/miren/data/local" {
+				return true
 			}
 		}
 	}
+	return false
+}
 
-	localPath := filepath.Join(b.DataPath, "data", "local", appID.String())
+// shouldWarnLocalStorageMigration reports whether a deploy should warn that the
+// app has existing data in local storage but no explicit disk config.
+func shouldWarnLocalStorageMigration(dataPath string, appID entity.Id, configSpec core_v1alpha.ConfigSpec) bool {
+	if dataPath == "" {
+		return false
+	}
+	if configDeclaresLocalStorage(configSpec) {
+		return false
+	}
+
+	localPath := filepath.Join(dataPath, "data", "local", appID.String())
 	entries, err := os.ReadDir(localPath)
-	if err != nil || len(entries) == 0 {
+	return err == nil && len(entries) > 0
+}
+
+// checkLocalStorageMigration checks whether the app has existing data in
+// local storage but no explicit disk config, and sends a deploy warning.
+func (b *Builder) checkLocalStorageMigration(ctx context.Context, appID entity.Id, configSpec core_v1alpha.ConfigSpec, status *stream.SendStreamClient[*build_v1alpha.Status]) {
+	if !shouldWarnLocalStorageMigration(b.DataPath, appID, configSpec) {
 		return
 	}
 
@@ -851,13 +882,15 @@ func (b *Builder) checkLocalStorageMigration(ctx context.Context, appID entity.I
 }
 
 // isSystemEnvVar returns true if the given key is a system-managed env var
-// that should not be injected as a build arg.
+// that should not be injected as a build arg. The whole MIREN_ namespace is
+// reserved (the injected MIREN_RUNTIME_* vars are enumerated in
+// api/app/runtimeenv.go), so only the unprefixed names need explicit cases here.
 func isSystemEnvVar(key string) bool {
 	switch key {
-	case "MIREN_VERSION", "MIREN_APP", "MIREN_INSTANCE_NUM", "PORT", "ADMIN_TOKEN":
+	case "PORT", "ADMIN_TOKEN":
 		return true
 	}
-	return strings.HasPrefix(key, "MIREN_")
+	return app.IsReservedEnvVar(key)
 }
 
 // computeBuildEnvVars computes the merged set of environment variables to inject

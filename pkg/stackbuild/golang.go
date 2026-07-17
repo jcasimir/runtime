@@ -72,12 +72,19 @@ type GoStack struct {
 	// Cached go.mod content for dependency detection
 	goModContent []byte
 
+	// cgoEnabled is the resolved cgo decision: true builds with CGO_ENABLED=1
+	// against glibc and ships on a debian-slim runtime; false builds a static
+	// binary (CGO_ENABLED=0) bound for the distroless runtime. Set in Init().
+	cgoEnabled bool
+
 	// Detected environment variable requirements
 	requiredEnvVars []EnvVarRequirement
 }
 
 func (s *GoStack) BaseDistro() string {
-	return "alpine"
+	// The Go stack builds on golang:<v>-bookworm (glibc/debian), so the
+	// apt-based augmentation machinery applies, same as every other stack.
+	return "debian"
 }
 
 func (s *GoStack) Name() string {
@@ -120,6 +127,17 @@ func (s *GoStack) Init(opts BuildOptions) {
 	s.goModVersion = s.parseGoModVersion()
 	if s.goModVersion != "" {
 		s.Event("config", "go-version", "Go version "+s.goModVersion+" specified in go.mod")
+	}
+
+	// cgo is opt-in via the standard CGO_ENABLED build env var (set under [env]
+	// in app.toml). Off (the default) builds a static binary bound for the
+	// distroless runtime; on links against glibc and ships on debian-slim.
+	// Honoring the canonical Go knob keeps cgo off our app.toml schema, and it
+	// is a clean seam for the planned auto-detection follow-up, which will ask
+	// the toolchain directly and make the env var unnecessary.
+	s.cgoEnabled = opts.EnvVars["CGO_ENABLED"] == "1"
+	if s.cgoEnabled {
+		s.Event("config", "cgo", "Building with cgo enabled (CGO_ENABLED=1)")
 	}
 
 	// Detect required environment variables
@@ -195,16 +213,13 @@ func (s *GoStack) GenerateLLB(dir string, opts BuildOptions) (*llb.State, error)
 
 	h := &highlevelBuilder{opts}
 
-	// Install git for private dependencies
-	state := h.apkAdd(base, "git", "ca-certificates")
+	// golang:bookworm already ships git and ca-certificates, and provides the C
+	// toolchain that makes cgo work, so no extra package install is needed on
+	// the builder before fetching private deps or compiling.
+	builder := h.applyAugmentations(base, localCtx, s.BaseDistro(), s.Augmentations(), s.SkipJSInstall())
 
-	// Add app user before copying code so copyApp can set ownership
-	state = s.addAppUser(state)
-
-	state = h.applyAugmentations(state, localCtx, s.BaseDistro(), s.Augmentations(), s.SkipJSInstall())
-
-	// Copy the application code (now owned by app user)
-	appState := h.copyApp(state, localCtx)
+	// Copy the application code (owned by the app user, uid 2010)
+	builder = h.copyApp(builder, localCtx)
 
 	// Use the pre-computed cmdDir from Init()
 	buildDir := s.cmdDir
@@ -217,9 +232,18 @@ func (s *GoStack) GenerateLLB(dir string, opts BuildOptions) (*llb.State, error)
 		buildCmd = fmt.Sprintf("sh -c 'go mod download -json && go build -o /bin/app ./%s'", buildDir)
 	}
 
+	// Set CGO_ENABLED explicitly: bookworm ships gcc, so Go would otherwise
+	// default cgo on. Off (the default) keeps the binary static and bound for
+	// the distroless runtime; on links against glibc and ships on debian-slim.
+	cgoEnabled := "0"
+	if s.cgoEnabled {
+		cgoEnabled = "1"
+	}
+
 	// Build with cache
-	state = appState.Dir("/app").Run(
+	builder = builder.Dir("/app").Run(
 		llb.Shlex(buildCmd),
+		llb.AddEnv("CGO_ENABLED", cgoEnabled),
 
 		// This basically is just a scratch mount until we add the ability to
 		// properly export and import the cache dirs.
@@ -227,16 +251,110 @@ func (s *GoStack) GenerateLLB(dir string, opts BuildOptions) (*llb.State, error)
 		llb.WithCustomName("[phase] Building Go application"),
 	).Root()
 
-	if opts.AlpineImage == "" {
-		opts.AlpineImage = imagerefs.AlpineDefault
+	// Make the built binary path available to onBuild commands, which run on
+	// the builder where the toolchain and full /app tree still exist.
+	builder = builder.AddEnv("APP", "/bin/app")
+	builder = s.applyOnBuild(builder, opts)
+
+	runtime := s.assembleRuntime(h, mr, builder)
+
+	return &runtime, nil
+}
+
+// assembleRuntime copies the build output onto a minimal runtime base, leaving
+// the heavyweight Go toolchain and module cache behind. The base adapts to the
+// build:
+//
+//   - cgo or JS-augmented apps land on debian-slim: cgo needs glibc at runtime,
+//     and augmented apps carry a built /app tree (compiled frontend assets,
+//     templates) that the binary serves. The full working tree is copied so
+//     that behavior is preserved.
+//   - everything else lands on distroless/static — the canonical tiny Go
+//     container. The compiled binary is joined by the app's non-Go files
+//     (READMEs, templates, data dirs) so it can read them at runtime relative
+//     to /app; Go source and the module/vendor build inputs are left behind
+//     (see goRuntimeExcludePatterns). A JS augmentation or an explicit
+//     build.cgo = true routes to the slim base instead.
+//
+// Both paths run as uid 2010 (the app user) for consistency with every other
+// stack: debian-slim creates it with adduser, distroless gets a written
+// /etc/passwd since it has no shell to run adduser.
+func (s *GoStack) assembleRuntime(h *highlevelBuilder, mr llb.ImageMetaResolver, builder llb.State) llb.State {
+	if s.cgoEnabled || len(s.Augmentations()) > 0 {
+		rt := llb.Image(imagerefs.DebianSlim, llb.WithMetaResolver(mr))
+		rt = h.aptInstall(rt, "ca-certificates")
+		rt = s.addAppUser(rt) // sets result.Config.User = "2010"
+		rt = rt.File(llb.Mkdir("/app", 0o755,
+			llb.WithParents(true), llb.WithUIDGID(2010, 2011)))
+		rt = rt.File(llb.Copy(builder, "/bin/app", "/bin/app", &llb.CopyInfo{}))
+		// Carry the built working tree (assets, templates, data files).
+		rt = rt.File(llb.Copy(builder, "/app", "/app", &llb.CopyInfo{
+			CopyDirContentsOnly: true,
+			CreateDestPath:      true,
+			FollowSymlinks:      true,
+			AllowWildcard:       true,
+			AllowEmptyWildcard:  true,
+			ChownOpt:            &appChown,
+		}))
+		return rt
 	}
 
-	state = state.AddEnv("APP", "/bin/app")
+	rt := llb.Image(imagerefs.GoRuntimeStatic, llb.WithMetaResolver(mr))
 
-	state = s.applyOnBuild(state, opts)
+	// distroless ships no shell or coreutils, which breaks two things: the
+	// runner launches the app as `/bin/sh -c <command>` (controllers/sandbox),
+	// and `miren sandbox exec` runs arbitrary commands like `echo`/`ls` in the
+	// container. Drop in a static (musl) busybox and symlink its whole applet
+	// set into /bin, giving /bin/sh plus the common coreutils. busybox is
+	// static so it runs regardless of the base's libc, and the lot adds about a
+	// megabyte.
+	busybox := llb.Image(imagerefs.BusyboxDefault)
+	rt = rt.File(llb.Copy(busybox, "/bin/busybox", "/bin/busybox", &llb.CopyInfo{}))
+	rt = rt.Run(
+		llb.Args([]string{"/bin/busybox", "sh", "-c",
+			"for a in $(/bin/busybox --list); do /bin/busybox ln -s /bin/busybox /bin/$a; done"}),
+		llb.WithCustomName("[phase] Installing busybox shell and coreutils"),
+	).Root()
 
-	return &state, nil
+	rt = rt.File(llb.Mkfile("/etc/passwd", 0o644, goRuntimePasswd))
+	rt = rt.File(llb.Mkfile("/etc/group", 0o644, goRuntimeGroup))
+	rt = rt.File(llb.Mkdir("/app", 0o755,
+		llb.WithParents(true), llb.WithUIDGID(2010, 2011)))
+	rt = rt.File(llb.Copy(builder, "/bin/app", "/bin/app", &llb.CopyInfo{}))
+
+	// Carry the app's non-Go files (READMEs, templates, data dirs) from the
+	// built working tree so a pure-Go app can still read them at runtime. The
+	// distroless base would otherwise ship only the binary, silently dropping
+	// everything else — a footgun for apps that open files relative to /app.
+	// Go source and the module/vendor build inputs are excluded: the compiled
+	// binary needs none of them, and copying them would only bloat the image.
+	rt = rt.File(llb.Copy(builder, "/app", "/app", &llb.CopyInfo{
+		CopyDirContentsOnly: true,
+		CreateDestPath:      true,
+		FollowSymlinks:      true,
+		AllowWildcard:       true,
+		AllowEmptyWildcard:  true,
+		ChownOpt:            &appChown,
+		ExcludePatterns:     goRuntimeExcludePatterns,
+	}))
+
+	s.result.Config.User = "2010"
+	return rt
 }
+
+// goRuntimePasswd/goRuntimeGroup define the app user (uid 2010) on the
+// distroless static runtime, which has no shell to run adduser. A passwd entry
+// also lets pure-Go os/user lookups resolve the running uid.
+var (
+	goRuntimePasswd = []byte("root:x:0:0:root:/root:/sbin/nologin\napp:x:2010:2011:app:/app:/sbin/nologin\n")
+	goRuntimeGroup  = []byte("root:x:0:\napp:x:2011:\n")
+)
+
+// goRuntimeExcludePatterns lists build-only inputs stripped when the pure-Go
+// distroless runtime carries the app's data files. The compiled binary needs
+// none of these at runtime, so they are left behind on the builder. Patterns
+// use .dockerignore semantics, so **/*.go matches Go source at any depth.
+var goRuntimeExcludePatterns = []string{"**/*.go", "go.mod", "go.sum", "vendor"}
 
 func (s *GoStack) WebCommand() string {
 	return "/bin/app"

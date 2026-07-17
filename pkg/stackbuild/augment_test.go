@@ -246,7 +246,7 @@ func TestDetectStack_AttachesAugmentationsToGo(t *testing.T) {
 	stack, err := DetectStack(dir, BuildOptions{Name: "test"})
 	require.NoError(t, err)
 	require.Equal(t, "go", stack.Name())
-	require.Equal(t, "alpine", stack.BaseDistro())
+	require.Equal(t, "debian", stack.BaseDistro())
 
 	ms := stack.metaStack()
 	require.Equal(t, []Augmentation{AugNpm}, ms.Augmentations())
@@ -262,7 +262,7 @@ func TestBaseDistros(t *testing.T) {
 		{&NodeStack{}, "debian"},
 		{&BunStack{}, "debian"},
 		{&RustStack{}, "debian"},
-		{&GoStack{}, "alpine"},
+		{&GoStack{}, "debian"},
 	}
 	for _, c := range cases {
 		require.Equal(t, c.distro, c.stack.BaseDistro(), "%s base distro", c.stack.Name())

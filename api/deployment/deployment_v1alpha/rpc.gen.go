@@ -2315,6 +2315,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app_name", "cluster_id", "app_version_id", "git_info"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.CreateDeployment(ctx, &DeploymentCreateDeployment{Call: call})
 			},
@@ -2324,6 +2325,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         1,
 			Public:        false,
+			Params:        []string{"deployment_id", "status", "error_message"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.UpdateDeploymentStatus(ctx, &DeploymentUpdateDeploymentStatus{Call: call})
 			},
@@ -2333,6 +2335,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         2,
 			Public:        false,
+			Params:        []string{"deployment_id", "phase"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.UpdateDeploymentPhase(ctx, &DeploymentUpdateDeploymentPhase{Call: call})
 			},
@@ -2342,6 +2345,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         3,
 			Public:        false,
+			Params:        []string{"deployment_id", "error_message", "build_logs"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.UpdateFailedDeployment(ctx, &DeploymentUpdateFailedDeployment{Call: call})
 			},
@@ -2351,6 +2355,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         4,
 			Public:        false,
+			Params:        []string{"deployment_id", "app_version_id"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.UpdateDeploymentAppVersion(ctx, &DeploymentUpdateDeploymentAppVersion{Call: call})
 			},
@@ -2360,6 +2365,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         5,
 			Public:        false,
+			Params:        []string{"app_name", "cluster_id", "status", "limit"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ListDeployments(ctx, &DeploymentListDeployments{Call: call})
 			},
@@ -2369,6 +2375,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         6,
 			Public:        false,
+			Params:        []string{"deployment_id"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.GetDeploymentById(ctx, &DeploymentGetDeploymentById{Call: call})
 			},
@@ -2378,6 +2385,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         7,
 			Public:        false,
+			Params:        []string{"app_name", "cluster_id"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.GetActiveDeployment(ctx, &DeploymentGetActiveDeployment{Call: call})
 			},
@@ -2387,6 +2395,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         8,
 			Public:        false,
+			Params:        []string{"deployment_id", "caller_user_id"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.CancelDeployment(ctx, &DeploymentCancelDeployment{Call: call})
 			},
@@ -2396,6 +2405,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         9,
 			Public:        false,
+			Params:        []string{"app_name", "cluster_id", "app_version_id", "is_rollback", "env_vars", "ephemeral_label", "ephemeral_ttl"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.DeployVersion(ctx, &DeploymentDeployVersion{Call: call})
 			},
@@ -2405,6 +2415,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         10,
 			Public:        false,
+			Params:        []string{"app_name", "cluster_id", "vars", "service"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.SetEnvVars(ctx, &DeploymentSetEnvVars{Call: call})
 			},
@@ -2414,6 +2425,7 @@ func AdaptDeployment(t Deployment) *rpc.Interface {
 			InterfaceName: "Deployment",
 			Index:         11,
 			Public:        false,
+			Params:        []string{"app_name", "cluster_id", "keys", "service"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.DeleteEnvVars(ctx, &DeploymentDeleteEnvVars{Call: call})
 			},

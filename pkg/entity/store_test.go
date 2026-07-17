@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2383,4 +2384,599 @@ func TestCreateEntity_OverwritePreservesAllAttrs(t *testing.T) {
 	docAttr, hasDoc := fetched.Get(Doc)
 	require.True(t, hasDoc, "entity should still have db/doc after overwrite")
 	assert.Equal(t, "updated doc", docAttr.Value.Any(), "doc should reflect the overwrite")
+}
+
+// TestEtcdStore_PatchPreservesReadInSessionAttributes reproduces the scenario
+// that broke coordinator-side cordon writes: an entity carries a session-scoped
+// attribute owned by one client's session, and a different client with no
+// session patches a primary attribute. The patch must succeed and leave the
+// existing session attribute in place, rather than failing with "session ID is
+// required for session attributes". A sessionless patch that itself sets a
+// session attribute must still be rejected.
+func TestEtcdStore_PatchPreservesReadInSessionAttributes(t *testing.T) {
+	r := require.New(t)
+	store, _ := setupTestEtcdStore(t)
+
+	_, err := store.CreateEntity(t.Context(), New(
+		Ident, "test/kind",
+		Doc, "a kind",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Index, true,
+	))
+	r.NoError(err)
+
+	// A session-scoped attribute, like a Node's status.
+	_, err = store.CreateEntity(t.Context(), New(
+		Ident, "test/status",
+		Doc, "session-scoped status",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Session, true,
+	))
+	r.NoError(err)
+
+	// A persistent primary attribute, like a Node's scheduling flag.
+	_, err = store.CreateEntity(t.Context(), New(
+		Ident, "test/scheduling",
+		Doc, "persistent scheduling flag",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+	))
+	r.NoError(err)
+
+	// The "runner" session sets the session-scoped status.
+	sid, err := store.CreateSession(t.Context(), 30)
+	r.NoError(err)
+
+	ent, err := store.CreateEntity(t.Context(), New(
+		String(Id("test/kind"), "foo"),
+	))
+	r.NoError(err)
+
+	_, err = store.UpdateEntity(t.Context(), ent.Id(), New(
+		String(Id("test/status"), "ready"),
+	), WithSession(sid))
+	r.NoError(err)
+
+	// The "coordinator" (no session) patches the persistent attribute.
+	_, err = store.PatchEntity(t.Context(), New(
+		Ref(DBId, ent.Id()),
+		String(Id("test/scheduling"), "cordoned"),
+	))
+	r.NoError(err, "sessionless patch of a primary attr must not require the session")
+
+	// Both the new primary value and the existing session value survive.
+	got, err := store.GetEntity(t.Context(), ent.Id())
+	r.NoError(err)
+
+	sched, ok := got.Get(Id("test/scheduling"))
+	r.True(ok)
+	r.Equal("cordoned", sched.Value.String())
+
+	status, ok := got.Get(Id("test/status"))
+	r.True(ok, "read-in session attribute must be preserved across the sessionless patch")
+	r.Equal("ready", status.Value.String())
+
+	// A sessionless patch that itself sets a session attribute is still an error.
+	_, err = store.PatchEntity(t.Context(), New(
+		Ref(DBId, ent.Id()),
+		String(Id("test/status"), "disabled"),
+	))
+	r.Error(err, "patching a session attribute without a session must still fail")
+}
+
+// TestEtcdStore_PingSessionAfterLeaseGone locks in the error contract that the
+// runner's session keepalive relies on to detect a lost lease and re-establish
+// (MIR-1305): once the lease backing a session is gone, PingSession must return
+// an error whose message contains "lease not found". The client-side classifier
+// (entityserver.isLeaseGone) matches on exactly that substring, so if etcd ever
+// changes this wording, this test fails before the runner silently regresses to
+// pinging a dead lease forever.
+func TestEtcdStore_PingSessionAfterLeaseGone(t *testing.T) {
+	r := require.New(t)
+	store, _ := setupTestEtcdStore(t)
+
+	sid, err := store.CreateSession(t.Context(), 30)
+	r.NoError(err)
+
+	// A healthy session pings clean.
+	r.NoError(store.PingSession(t.Context(), sid))
+
+	// Revoking the lease simulates the coordinator/etcd restart that orphans it.
+	r.NoError(store.RevokeSession(t.Context(), sid))
+
+	err = store.PingSession(t.Context(), sid)
+	r.Error(err, "pinging a session whose lease is gone must error")
+	r.Contains(err.Error(), "lease not found",
+		"error wording is load-bearing: entityserver.isLeaseGone matches this substring")
+}
+
+// collectionKVsForEntity returns every /collections/ entry whose value points at
+// the given entity id, exposing each KV's attached etcd Lease. Used to assert
+// whether an entity's index entries share its session lease (MIR-1320).
+func collectionKVsForEntity(t *testing.T, client *clientv3.Client, prefix string, id Id) []*mvccpb.KeyValue {
+	t.Helper()
+	resp, err := client.Get(context.Background(), prefix+"/collections/", clientv3.WithPrefix())
+	require.NoError(t, err)
+	var out []*mvccpb.KeyValue
+	for _, kv := range resp.Kvs {
+		if string(kv.Value) == id.String() {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// TestEtcdStore_BoundEntityIndexEntriesShareSessionLease is the MIR-1320
+// regression at the store layer. A session-bound entity (BondToSession leases
+// the entity key itself) must have its plain index entries leased to the same
+// session, so etcd garbage-collects them atomically with the entity when the
+// lease is revoked or expires. Before the fix the plain index entry was written
+// unleased and outlived the entity, leaving a stale index entry pointing at a
+// deleted entity — which on one production cluster accumulated to the point
+// where 88% of "pool" and 98% of "session" index entries were phantoms.
+func TestEtcdStore_BoundEntityIndexEntriesShareSessionLease(t *testing.T) {
+	store, client := setupTestEtcdStore(t)
+	ctx := t.Context()
+	r := require.New(t)
+
+	// An indexed attribute so entities produce collection (index) entries.
+	_, err := store.CreateEntity(ctx, New(
+		Ident, "test/kind",
+		Doc, "a kind",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Index, true,
+	))
+	r.NoError(err)
+
+	// A durable (unbound) entity: its index entry must stay UNLEASED so it
+	// remains durable and is removed only by an explicit delete.
+	durable, err := store.CreateEntity(ctx, New(
+		Ident, "durable-1",
+		String(Id("test/kind"), "widget"),
+	))
+	r.NoError(err)
+	durableKVs := collectionKVsForEntity(t, client, store.Prefix(), durable.Id())
+	r.NotEmpty(durableKVs, "durable entity must have an index entry")
+	for _, kv := range durableKVs {
+		r.Zero(kv.Lease, "durable entity's index entry %q must not be leased", kv.Key)
+	}
+
+	// A session-bound entity: BondToSession leases the entity key, so its
+	// index entries must carry a lease too.
+	sid, err := store.CreateSession(ctx, 30)
+	r.NoError(err)
+
+	bound, err := store.CreateEntity(ctx, New(
+		Ident, "bound-1",
+		String(Id("test/kind"), "widget"),
+	), BondToSession(sid))
+	r.NoError(err)
+
+	boundKVs := collectionKVsForEntity(t, client, store.Prefix(), bound.Id())
+	r.NotEmpty(boundKVs, "bound entity must have index entries")
+	for _, kv := range boundKVs {
+		r.NotZero(kv.Lease,
+			"bound entity's index entry %q must share the session lease (MIR-1320)", kv.Key)
+	}
+
+	// Both entities are indexed while the session is alive.
+	ids, err := store.ListIndex(ctx, String(Id("test/kind"), "widget"))
+	r.NoError(err)
+	r.Contains(ids, durable.Id())
+	r.Contains(ids, bound.Id())
+
+	// End the session: etcd revokes the lease and drops every attached key,
+	// including the bound entity and — with the fix — its index entries.
+	r.NoError(store.RevokeSession(ctx, sid))
+
+	// The bound entity is gone...
+	_, err = store.GetEntity(ctx, bound.Id())
+	r.Error(err, "bound entity must be removed when its session lease is revoked")
+
+	// ...and no stale index entry outlives it.
+	r.Empty(collectionKVsForEntity(t, client, store.Prefix(), bound.Id()),
+		"no index entry may outlive a bound entity's session lease (MIR-1320)")
+
+	// The durable entity and its index entry are untouched.
+	_, err = store.GetEntity(ctx, durable.Id())
+	r.NoError(err)
+	ids, err = store.ListIndex(ctx, String(Id("test/kind"), "widget"))
+	r.NoError(err)
+	r.Equal([]Id{durable.Id()}, ids)
+}
+
+// TestEtcdStore_PatchStatusToleratesDanglingRef is the MIR-1320 general-invariant
+// test: a patch owns only the attributes it sets. When an entity holds a
+// reference to something later deleted out from under it, an unrelated change
+// (like a status patch) must still succeed. A brand-new dangling reference must
+// still be rejected. Before the fix, PatchEntity re-validated the whole merged
+// entity, so any dangling reference made every patch fail and any controller
+// reconciling the entity looped forever (the disk-lease orphan sweeper).
+func TestEtcdStore_PatchStatusToleratesDanglingRef(t *testing.T) {
+	store, _ := setupTestEtcdStore(t)
+	ctx := t.Context()
+	r := require.New(t)
+
+	// A reference attribute (like disk_lease.disk_id) and a plain status.
+	_, err := store.CreateEntity(ctx, New(
+		Ident, "test/target-ref",
+		Doc, "a reference to another entity",
+		Cardinality, CardinalityOne,
+		Type, TypeRef,
+	))
+	r.NoError(err)
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "test/status",
+		Doc, "a status",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+	))
+	r.NoError(err)
+
+	// The referenced entity, and an entity referencing it with a status.
+	target, err := store.CreateEntity(ctx, New(Any(Ident, KeywordValue("target/thing"))))
+	r.NoError(err)
+	holder, err := store.CreateEntity(ctx, New(
+		Any(Ident, KeywordValue("holder/thing")),
+		Ref(Id("test/target-ref"), target.Id()),
+		String(Id("test/status"), "bound"),
+	))
+	r.NoError(err)
+
+	// The target is deleted out from under the holder.
+	r.NoError(store.DeleteEntity(ctx, target.Id()))
+
+	// A status-only patch must still succeed even though test/target-ref now
+	// dangles. Before the fix this failed with "references a non-existent entity".
+	_, err = store.PatchEntity(ctx, New(
+		DBId, holder.Id(),
+		String(Id("test/status"), "released"),
+	))
+	r.NoError(err, "status patch must tolerate a pre-existing dangling reference (MIR-1320)")
+
+	got, err := store.GetEntity(ctx, holder.Id())
+	r.NoError(err)
+	statusAttr, ok := got.Get(Id("test/status"))
+	r.True(ok)
+	r.Equal("released", statusAttr.Value.Any())
+
+	// But setting a brand-new reference to a non-existent entity is still rejected.
+	_, err = store.PatchEntity(ctx, New(
+		DBId, holder.Id(),
+		Ref(Id("test/target-ref"), Id("target/does-not-exist")),
+	))
+	r.Error(err, "setting a new dangling reference must still be rejected")
+}
+
+// TestEtcdStore_PatchToleratesDanglingRefInComponent covers the component-nested
+// case of the MIR-1320 exemption: a reference living inside an unchanged
+// component attribute must also be exempt from re-validation on a patch, or a
+// status change would fail once the component's nested target is deleted.
+func TestEtcdStore_PatchToleratesDanglingRefInComponent(t *testing.T) {
+	store, _ := setupTestEtcdStore(t)
+	ctx := t.Context()
+	r := require.New(t)
+
+	// A component type with a nested reference field, plus a plain status.
+	_, err := store.CreateEntity(ctx, New(
+		Ident, "test/spec",
+		Doc, "a component type",
+		Cardinality, CardinalityOne,
+		Type, TypeComponent,
+	))
+	r.NoError(err)
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "test/spec.target",
+		Doc, "a nested reference field",
+		Cardinality, CardinalityOne,
+		Type, TypeRef,
+	))
+	r.NoError(err)
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "test/status",
+		Doc, "a status",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+	))
+	r.NoError(err)
+
+	target, err := store.CreateEntity(ctx, New(Any(Ident, KeywordValue("target/comp"))))
+	r.NoError(err)
+	holder, err := store.CreateEntity(ctx, New([]Attr{
+		Keyword(Ident, "holder-comp"),
+		Component(Id("test/spec"), []Attr{
+			Ref(Id("test/spec.target"), target.Id()),
+		}),
+		String(Id("test/status"), "bound"),
+	}))
+	r.NoError(err)
+
+	// Delete the entity referenced from inside the component.
+	r.NoError(store.DeleteEntity(ctx, target.Id()))
+
+	// A status patch must still succeed even though the unchanged component now
+	// holds a dangling nested reference the patch never touches (MIR-1320).
+	_, err = store.PatchEntity(ctx, New(
+		DBId, holder.Id(),
+		String(Id("test/status"), "released"),
+	))
+	r.NoError(err, "status patch must tolerate a dangling ref nested in an unchanged component")
+}
+
+// expectedIndexKey rebuilds the etcd collection key that addToCollectionOp would
+// write for the given entity id + indexed attribute, so a test can check whether
+// that specific index entry survives a delete.
+func expectedIndexKey(prefix string, id Id, attr Attr) string {
+	return fmt.Sprintf("%s/collections/%s/%s", prefix, tr.Replace(attr.CAS()), base58.Encode([]byte(id)))
+}
+
+// TestEtcdStore_DeleteRemovesAllIndexEntries reproduces the MIR-1320 "pool"
+// leak. A durable (unleased) kinded entity must have EVERY index entry removed
+// by DeleteEntity, including the system-managed entity/kind and db/short-id
+// indexes. On garden, deleted pool entities deterministically leaked exactly
+// those two index entries — 63% of the cluster's stale index.
+func TestEtcdStore_DeleteRemovesAllIndexEntries(t *testing.T) {
+	store, client := setupTestEtcdStore(t)
+	ctx := t.Context()
+	r := require.New(t)
+
+	// A kind entity to reference (entity/kind is a validated ref).
+	k, err := store.CreateEntity(ctx, New(Any(Ident, KeywordValue("test/pool-kind"))))
+	r.NoError(err)
+
+	// A domain indexed attribute, for contrast with the system indexes.
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "test/region",
+		Doc, "a region",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Index, true,
+	))
+	r.NoError(err)
+
+	// A durable, kinded entity like a pool: entity/kind (indexed) triggers a
+	// db/short-id allocation (also indexed), plus a domain indexed attr.
+	pool, err := store.CreateEntity(ctx, New(
+		Any(Ident, KeywordValue("pool/thing-1")),
+		Ref(EntityKind, k.Id()),
+		String(Id("test/region"), "us-central1"),
+	))
+	r.NoError(err)
+
+	// Read the stored form to recover the system attrs (short-id is allocated
+	// by the store) and compute their expected index keys.
+	stored, err := store.GetEntity(ctx, pool.Id())
+	r.NoError(err)
+	kindAttrs := stored.GetAll(EntityKind)
+	r.NotEmpty(kindAttrs, "stored entity must carry entity/kind")
+	shortIDAttr, ok := stored.Get(DBShortId)
+	r.True(ok, "kinded entity must have a db/short-id")
+
+	kindKey := expectedIndexKey(store.Prefix(), pool.Id(), kindAttrs[0])
+	shortIDKey := expectedIndexKey(store.Prefix(), pool.Id(), shortIDAttr)
+
+	before := collectionKVsForEntity(t, client, store.Prefix(), pool.Id())
+	r.NotEmpty(before, "kinded entity must have index entries")
+	t.Logf("index entries before delete: %d", len(before))
+
+	r.NoError(store.DeleteEntity(ctx, pool.Id()))
+
+	after := collectionKVsForEntity(t, client, store.Prefix(), pool.Id())
+	var leakedKind, leakedShortID bool
+	for _, kv := range after {
+		key := string(kv.Key)
+		label := "domain"
+		switch key {
+		case kindKey:
+			label = "entity/kind"
+			leakedKind = true
+		case shortIDKey:
+			label = "db/short-id"
+			leakedShortID = true
+		}
+		t.Logf("LEAKED after delete [%s]: %s", label, key)
+	}
+	t.Logf("leaked entity/kind index: %v   leaked db/short-id index: %v", leakedKind, leakedShortID)
+
+	r.Empty(after, "DeleteEntity must remove every index entry (MIR-1320 pool leak)")
+}
+
+// TestEtcdStore_PatchThenDeleteRemovesAllIndexEntries checks the realistic pool
+// lifecycle: a kinded entity is patched (no-OCC, like a reconcile status write,
+// including an indexed-value change) and then deleted. Every index entry — the
+// old and new value of the changed attr, plus the system indexes — must be gone.
+// If a sequential patch-then-delete leaks, the pool bug is an update-path gap;
+// if it's clean, the garden leak must be the concurrent delete-vs-patch race.
+func TestEtcdStore_PatchThenDeleteRemovesAllIndexEntries(t *testing.T) {
+	store, client := setupTestEtcdStore(t)
+	ctx := t.Context()
+	r := require.New(t)
+
+	k, err := store.CreateEntity(ctx, New(Any(Ident, KeywordValue("test/pool-kind"))))
+	r.NoError(err)
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "test/region",
+		Doc, "a region",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Index, true,
+	))
+	r.NoError(err)
+
+	pool, err := store.CreateEntity(ctx, New(
+		Any(Ident, KeywordValue("pool/thing-2")),
+		Ref(EntityKind, k.Id()),
+		String(Id("test/region"), "us-central1"),
+	))
+	r.NoError(err)
+
+	// No-OCC patch that changes the indexed region value (exercises old-value
+	// index cleanup) — mimics a reconcile tick rewriting the entity.
+	_, err = store.PatchEntity(ctx, New(
+		DBId, pool.Id(),
+		String(Id("test/region"), "us-east1"),
+	))
+	r.NoError(err)
+
+	// The old region value must no longer be indexed.
+	oldIdx, err := store.ListIndex(ctx, String(Id("test/region"), "us-central1"))
+	r.NoError(err)
+	r.NotContains(oldIdx, pool.Id(), "old indexed value must be removed by patch")
+
+	r.NoError(store.DeleteEntity(ctx, pool.Id()))
+
+	after := collectionKVsForEntity(t, client, store.Prefix(), pool.Id())
+	for _, kv := range after {
+		t.Logf("LEAKED after patch+delete: %s", kv.Key)
+	}
+	r.Empty(after, "patch-then-delete must leave no index entry (MIR-1320 pool leak)")
+}
+
+// TestEtcdStore_ConcurrentDeleteVsPatchNoStaleIndex is a stress smoke test for
+// the MIR-1334 scenario: it hammers no-OCC patches (the reconcile status-write
+// path) against a concurrent DeleteEntity on a high-churn, pool-like entity and
+// asserts the store never settles into an index/entity desync.
+//
+// The invariant every store mutation preserves is index ⟺ entity: an index
+// (collection) entry exists iff the entity it points at exists. This test drives
+// the real concurrent path (and guards against panics/deadlocks/gross breakage
+// under it), but it is NOT a reliable regression guard for the atomicity bug on
+// its own: the race window is narrow and concurrent patches tend to re-add the
+// index before the quiescence check, so the old non-atomic delete can pass here.
+// TestEtcdStore_DeleteIsAtomicUnderConcurrentPatch pins the atomicity guarantee
+// deterministically via a test seam; this one exercises it at volume.
+func TestEtcdStore_ConcurrentDeleteVsPatchNoStaleIndex(t *testing.T) {
+	store, client := setupTestEtcdStore(t)
+	ctx := t.Context()
+	r := require.New(t)
+
+	k, err := store.CreateEntity(ctx, New(Any(Ident, KeywordValue("test/pool-kind"))))
+	r.NoError(err)
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "test/region",
+		Doc, "a region",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Index, true,
+	))
+	r.NoError(err)
+
+	const iterations = 40
+	const patchesPerIter = 15
+
+	for i := range iterations {
+		pool, err := store.CreateEntity(ctx, New(
+			Any(Ident, KeywordValue(fmt.Sprintf("pool/churn-%d", i))),
+			Ref(EntityKind, k.Id()),
+			String(Id("test/region"), "us-central1"),
+		))
+		r.NoError(err)
+		id := pool.Id()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Patcher: hammer no-OCC status patches (cas=0), rotating an indexed
+		// value so old-value index cleanup runs too. Errors are expected once
+		// the deleter wins (the entity is gone), so they're ignored.
+		go func() {
+			defer wg.Done()
+			for j := range patchesPerIter {
+				_, _ = store.PatchEntity(ctx, New(
+					DBId, id,
+					String(Id("test/region"), fmt.Sprintf("region-%d", j)),
+				))
+			}
+		}()
+
+		// Deleter: race a single delete against the patch storm.
+		go func() {
+			defer wg.Done()
+			_ = store.DeleteEntity(ctx, id)
+		}()
+
+		wg.Wait()
+
+		// At quiescence, index and entity must agree.
+		_, getErr := store.GetEntity(ctx, id)
+		kvs := collectionKVsForEntity(t, client, store.Prefix(), id)
+		if getErr != nil {
+			r.Empty(kvs, "iter %d: entity is gone but index entries survive (stale index, MIR-1334)", i)
+		} else {
+			r.NotEmpty(kvs, "iter %d: entity exists but its index entries are missing (index desync)", i)
+		}
+
+		// Ensure the entity is actually removed before the next iteration so a
+		// lingering (resurrected) entity doesn't mask a later leak.
+		r.NoError(store.DeleteEntity(ctx, id))
+		r.Empty(collectionKVsForEntity(t, client, store.Prefix(), id),
+			"iter %d: cleanup delete must leave no index entry", i)
+	}
+}
+
+// TestEtcdStore_DeleteIsAtomicUnderConcurrentPatch is the deterministic MIR-1334
+// regression test. It uses the deleteEntityRaceHook seam to inject exactly one
+// no-OCC patch into DeleteEntity's read-before-txn window — the precise gap a
+// reconcile status write could land in — and asserts the delete still leaves the
+// index and entity in agreement.
+//
+// With the atomic delete, the injected patch bumps the revision, the guarded txn
+// fails, and the bounded retry re-reads at the new revision and removes the
+// entity and every index entry together. With the old non-atomic delete (index
+// removed by unconditional Deletes before the txn), the injected patch re-adds
+// the index, the unconditional delete wipes it, and the entity txn then fails on
+// the now-stale revision — leaving the entity alive with its index gone. This
+// test forbids that disagreement, so it fails against the old delete and passes
+// against the fix.
+func TestEtcdStore_DeleteIsAtomicUnderConcurrentPatch(t *testing.T) {
+	store, client := setupTestEtcdStore(t)
+	ctx := t.Context()
+	r := require.New(t)
+
+	k, err := store.CreateEntity(ctx, New(Any(Ident, KeywordValue("test/pool-kind"))))
+	r.NoError(err)
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "test/region",
+		Doc, "a region",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Index, true,
+	))
+	r.NoError(err)
+
+	pool, err := store.CreateEntity(ctx, New(
+		Any(Ident, KeywordValue("pool/race-1")),
+		Ref(EntityKind, k.Id()),
+		String(Id("test/region"), "us-central1"),
+	))
+	r.NoError(err)
+
+	// Fire one no-OCC patch inside the delete's read-before-txn window. sync.Once
+	// keeps it to a single injection so the atomic delete's retry can re-read past
+	// the revision bump and win; firing on every attempt would just be an infinite
+	// patch storm that no delete could beat.
+	var once sync.Once
+	deleteEntityRaceHook = func() {
+		once.Do(func() {
+			_, perr := store.PatchEntity(ctx, New(
+				DBId, pool.Id(),
+				String(Id("test/region"), "us-east1"),
+			))
+			r.NoError(perr, "injected concurrent patch must succeed")
+		})
+	}
+	t.Cleanup(func() { deleteEntityRaceHook = nil })
+
+	// The atomic delete loses the guard on the first attempt (revision bumped by
+	// the injected patch) and wins on the retry.
+	r.NoError(store.DeleteEntity(ctx, pool.Id()))
+
+	// Entity and index must agree: both gone.
+	_, getErr := store.GetEntity(ctx, pool.Id())
+	r.Error(getErr, "entity must be deleted after DeleteEntity returns")
+	r.Empty(collectionKVsForEntity(t, client, store.Prefix(), pool.Id()),
+		"no index entry may survive a delete that raced a patch (MIR-1334)")
 }

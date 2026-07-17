@@ -61,7 +61,7 @@ sudo miren server install --without-cloud
 
 ### Using Our Demo Cluster
 
-Ask for access to our demo cluster in #miren-club on [Discord](https://miren.dev/discord). Once you have access, log in and add the cluster:
+Ask for access to our demo cluster, [Miren Club](/miren-club), in #miren-club on [Discord](https://miren.dev/discord). Once you have access, log in and add the cluster:
 
 <CliCommand context="client">
 ```miren
@@ -129,9 +129,11 @@ Then open the URL in your browser to see the demo app.
 
 ![The demo app running in a browser](/img/demo-app-browser.png)
 
-:::note Not publicly accessible?
-If your server is behind a firewall or on a private network, `miren route set` will still configure the route, but you won't be able to reach it from outside. You can verify your app is running with `miren app list` and `miren logs` instead. See [Firewall](/firewall) for details on making your cluster reachable.
+:::note[Not publicly accessible?]
+If your server is behind a firewall or on a private network, `miren route set` still configures the route. To serve your apps to the internet without a public IP, [Miren Anywhere](/miren-cloud/miren-anywhere) routes traffic through Miren Cloud.
 :::
+
+Otherwise, verify the app is running locally with `miren app list` and `miren logs`, and see [Firewall](/firewall) for making the cluster directly reachable.
 
 ## See It Running
 
@@ -164,7 +166,7 @@ That's it! You have an app running on Miren.
 
 Now that you've got something deployed, here's where to go depending on what you need.
 
-**Deploy your own app.** Miren auto-detects Python, Node, Bun, Go, Ruby, and Rust projects. Run `miren init` in your project to create a [`.miren/app.toml`](/app-configuration) config, then `miren deploy`. You can always provide a `Dockerfile` if you need full control over the build.
+**Deploy your own app.** Miren auto-detects Python, Node, Bun, Go, Ruby, and Rust projects. Run `miren init` in your project to create a [`.miren/app.toml`](/app-configuration) config, then `miren deploy`. You can always provide a `Dockerfile` if you need full control over the build. For a step-by-step walkthrough for your language, see the [Language Guides](/guides).
 
 **Manage multiple clusters.** If you have more than one server, use [`miren cluster`](/command/cluster) to list your clusters and `miren cluster switch` to change which one you're targeting before deploying.
 
@@ -174,7 +176,7 @@ Now that you've got something deployed, here's where to go depending on what you
 
 **Scale your app.** Miren autoscales by default (like Cloud Run), spinning instances up and down with traffic. If you need fixed instance counts for things like databases or workers, see [Application Scaling](/scaling).
 
-**Add persistent storage.** [Disks](/disks) let you attach storage volumes to services, with automatic backup to Miren Cloud.
+**Add persistent storage.** [Disks](/disks) let you attach storage volumes to services, with built-in backup and restore.
 
 **Explore the CLI.** The full [CLI Reference](/commands) documents every command and flag.
 

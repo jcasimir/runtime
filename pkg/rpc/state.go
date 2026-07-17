@@ -40,6 +40,14 @@ func init() {
 	}
 
 	DefaultQUICConfig = quic.Config{
+		// Pin the QUIC Initial at the 1200-byte spec minimum so the handshake
+		// fits a 1280-MTU path (Tailscale/WireGuard tunnels, the IPv6 minimum).
+		// quic-go's default of 1280 yields a 1308-byte IPv4 datagram with DF
+		// set, which such tunnels silently drop, hanging the handshake in both
+		// directions. PMTUD raises the packet size again after the handshake
+		// completes, so 1500-MTU paths are unaffected. See quic-go#5573,
+		// quic-go#5634, tailscale#2633.
+		InitialPacketSize:              1200,
 		EnableDatagrams:                true,
 		MaxIncomingStreams:             1000,
 		MaxIncomingUniStreams:          1000,
@@ -72,6 +80,11 @@ type StateCommon struct {
 	top context.Context
 	log *slog.Logger
 
+	// auditLog is the security audit trail, pinned at an Info floor and tagged
+	// module=audit so it stays legible and volume-bounded regardless of the
+	// server's -v verbosity. See newAuditLogger.
+	auditLog *slog.Logger
+
 	opts *stateOptions
 
 	serverTlsCfg *tls.Config
@@ -85,6 +98,15 @@ type StateCommon struct {
 	pubkey  ed25519.PublicKey
 
 	qc quic.Config
+}
+
+// audit returns the security audit logger, falling back to the general logger
+// if one was not wired up (e.g. a hand-constructed StateCommon in a test).
+func (s *StateCommon) audit() *slog.Logger {
+	if s.auditLog != nil {
+		return s.auditLog
+	}
+	return s.log
 }
 
 type State struct {
@@ -314,6 +336,7 @@ func NewState(ctx context.Context, opts ...StateOption) (*State, error) {
 		StateCommon: &StateCommon{
 			top:           ctx,
 			log:           so.log,
+			auditLog:      newAuditLogger(so.log),
 			opts:          &so,
 			clientTlsCfg:  tlsCfg,
 			privkey:       priv,
@@ -390,18 +413,13 @@ func (s *State) setupServerTls(so *stateOptions) error {
 		if so.requireClientCerts {
 			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
 		} else {
-			tlsCfg.ClientAuth = tls.RequestClientCert
-		}
-		tlsCfg.VerifyConnection = func(cs tls.ConnectionState) error {
-			// Standard certificate validation only
-			// The authenticator can use r.TLS to access certificates later in ServeHTTP
-			/* Too noisy, disabled for now.
-			if len(cs.PeerCertificates) != 0 {
-				cert := cs.PeerCertificates[0]
-				s.log.Info("verified client connection", "subject", cert.Subject)
-			}
-			*/
-			return nil
+			// VerifyClientCertIfGiven: a client is not required to present a
+			// cert (JWT/OIDC callers authenticate via the Authorization header),
+			// but if one IS presented it MUST chain to ClientCAs. This ensures
+			// r.TLS.PeerCertificates only ever holds a cert that has been
+			// verified against the cluster CA, so authenticators that derive an
+			// identity from the cert cannot be fooled by a self-signed forgery.
+			tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
 		}
 	}
 
@@ -432,9 +450,9 @@ type connectionKey struct{}
 type CurrentConnectionInfo struct {
 	PeerSubject string
 	// PeerCertificate is the client certificate presented during the mTLS
-	// handshake, if any. The server is configured with tls.RequestClientCert,
-	// which requests but does not verify the cert, so handlers that rely on it
-	// for authorization must verify it (e.g. that it chains to the cluster CA).
+	// handshake, if any. When a CA is configured the server uses
+	// tls.VerifyClientCertIfGiven, so any cert present here has already been
+	// verified to chain to the cluster CA (r.TLS.VerifiedChains is non-empty).
 	PeerCertificate *x509.Certificate
 }
 

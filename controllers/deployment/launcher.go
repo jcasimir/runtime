@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"miren.dev/runtime/api/addon/addon_v1alpha"
+	appclient "miren.dev/runtime/api/app"
 	"miren.dev/runtime/api/compute/compute_v1alpha"
 	coreutil "miren.dev/runtime/api/core"
 	"miren.dev/runtime/api/core/core_v1alpha"
@@ -47,6 +49,11 @@ type Launcher struct {
 	PoolReadyTimeout time.Duration
 
 	appMu sync.Map // per-app mutexes: app ID -> *sync.Mutex
+
+	// warnedNoDisk tracks apps we've already warned about auto-mounting local
+	// storage without a disk config, so the warning fires once per app instead
+	// of on every reconcile tick. Keyed by app ID.
+	warnedNoDisk sync.Map
 }
 
 // PoolWithEntity wraps a SandboxPool with its entity, allowing updates without re-fetching
@@ -81,6 +88,7 @@ func (l *Launcher) CreatePoolForVersion(ctx context.Context, ver *core_v1alpha.A
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve config for version %s: %w", ver.Version, err)
 	}
+	l.injectAutoMountLocalDisks(spec, &app)
 
 	poolID, err := l.ensurePoolForService(ctx, &app, ver, spec, service)
 	if err != nil {
@@ -131,7 +139,6 @@ func (l *Launcher) Reconcile(ctx context.Context, app *core_v1alpha.App, meta *e
 
 	span.SetAttributes(attribute.String("miren.app.active_version", current.ActiveVersion.String()))
 
-	l.Log.Info("reconciling app", "app", current.ID, "version", current.ActiveVersion)
 	ready, err := l.addonsReady(ctx, current.ID)
 	if err != nil {
 		l.Log.Error("failed to check addon readiness", "app", current.ID, "error", err)
@@ -234,11 +241,7 @@ func (l *Launcher) reconcileAppVersion(ctx context.Context, app *core_v1alpha.Ap
 	if err != nil {
 		return fmt.Errorf("failed to resolve config: %w", err)
 	}
-
-	l.Log.Info("reconciling app version",
-		"app", app.ID,
-		"version", ver.Version,
-		"services", len(spec.Services))
+	l.injectAutoMountLocalDisks(spec, app)
 
 	// For each service, ensure a pool exists. Collect IDs of newly created pools.
 	var newPoolIDs []entity.Id
@@ -319,12 +322,26 @@ func (l *Launcher) reconcileAppVersion(ctx context.Context, app *core_v1alpha.Ap
 	}
 
 	// Clean up old version pools (pools not referenced by current version)
-	if err := l.cleanupOldVersionPools(ctx, app, ver.ID); err != nil {
+	cleaned, err := l.cleanupOldVersionPools(ctx, app, ver.ID)
+	if err != nil {
 		l.Log.Error("failed to cleanup old version pools",
 			"app", app.ID,
 			"version", ver.ID,
 			"error", err)
 		// Don't fail the entire reconciliation if cleanup fails
+	}
+
+	// Summarize only when this reconcile actually did something. The loop runs
+	// constantly; a steady-state pass that created and cleaned up nothing stays
+	// silent so the journal isn't buried in no-op narration.
+	// pools_started counts pools we booted this pass: both brand-new pools and
+	// drained pools revived for deploy verification (newPoolIDs holds both).
+	if len(newPoolIDs) > 0 || cleaned > 0 {
+		l.Log.Info("reconciled app version",
+			"app", app.ID,
+			"version", ver.Version,
+			"pools_started", len(newPoolIDs),
+			"pools_cleaned_up", cleaned)
 	}
 
 	return nil
@@ -392,12 +409,9 @@ func (l *Launcher) ensurePoolForService(ctx context.Context, app *core_v1alpha.A
 	}
 
 	if poolWithEntity != nil {
-		// Reuse existing pool — sandboxes already running, no wait needed
-		l.Log.Info("reusing existing pool",
-			"pool", poolWithEntity.Pool.ID,
-			"service", serviceName,
-			"app", app.ID)
-
+		// Reuse existing pool — sandboxes already running, no wait needed.
+		// Steady-state reuse is a no-op; only log (below) when reuse actually
+		// mutates the pool.
 		needsUpdate := false
 
 		// Update the pool's sandbox spec version to track the current AppVersion
@@ -423,9 +437,7 @@ func (l *Launcher) ensurePoolForService(ctx context.Context, app *core_v1alpha.A
 			needsUpdate = true
 		}
 
-		// Only force DesiredInstances when the strategy enforces a minimum
-		// (fixed mode). Auto and ephemeral strategies leave the activator and
-		// sandboxpool manager to drive DesiredInstances dynamically.
+		// Fixed-mode strategies enforce their configured minimum.
 		if min := int64(strategy.MinInstances()); min > 0 && poolWithEntity.Pool.DesiredInstances != min {
 			poolWithEntity.Pool.DesiredInstances = min
 			l.Log.Info("strategy-enforced minimum, updating desired instances",
@@ -434,13 +446,38 @@ func (l *Launcher) ensurePoolForService(ctx context.Context, app *core_v1alpha.A
 			needsUpdate = true
 		}
 
+		// A deploy should boot the new version so we can verify it, even when
+		// reusing a pool that drained to zero (an autoscale app gone idle).
+		// Floor a drained pool back to 1, the same way a fresh pool seeds; the
+		// autoscaler scales it down again afterward. Without this, a redeploy of
+		// a scaled-to-zero app would just point the pool at the new version
+		// without ever booting it, so we'd never know if it actually works.
+		bootForVerification := false
+		if poolWithEntity.Pool.DesiredInstances < 1 {
+			poolWithEntity.Pool.DesiredInstances = 1
+			l.Log.Info("flooring drained pool to one instance for deploy verification",
+				"service", serviceName,
+				"pool", poolWithEntity.Pool.ID)
+			needsUpdate = true
+			bootForVerification = true
+		}
+
 		if needsUpdate {
+			l.Log.Info("reusing existing pool, applying updates",
+				"pool", poolWithEntity.Pool.ID,
+				"service", serviceName,
+				"app", app.ID)
 			if err := l.updatePool(ctx, poolWithEntity); err != nil {
 				return "", fmt.Errorf("failed to update pool: %w", err)
 			}
 		}
 
-		// Return empty ID — existing pool already has running sandboxes
+		// A revived drained pool has to boot before it's ready, so return its ID
+		// to gate readiness like a fresh pool. Otherwise the existing pool is
+		// already running and needs no wait.
+		if bootForVerification {
+			return poolWithEntity.Pool.ID, nil
+		}
 		return "", nil
 	}
 
@@ -535,8 +572,8 @@ func (l *Launcher) buildSandboxSpec(
 		Name:  "app",
 		Image: image,
 		Env: []string{
-			"MIREN_APP=" + appMD.Name,
-			"MIREN_VERSION=" + ver.Version,
+			appclient.EnvRuntimeApp + "=" + appMD.Name,
+			appclient.EnvRuntimeVersion + "=" + ver.Version,
 		},
 		Directory: startDir,
 	}
@@ -748,33 +785,6 @@ func (l *Launcher) buildSandboxSpec(
 		}
 	}
 
-	// Transitional: auto-mount local storage if the host directory has existing
-	// data but no explicit disk config. This prevents data loss for apps that
-	// relied on the old implicit mount behavior. Will be removed in a future release.
-	if l.DataPath != "" {
-		hasLocalMount := false
-		for _, m := range appCont.Mount {
-			if m.Destination == "/miren/data/local" {
-				hasLocalMount = true
-				break
-			}
-		}
-		if !hasLocalMount && dirHasData(filepath.Join(l.DataPath, "data", "local", app.ID.String())) {
-			l.Log.Warn("auto-mounting local storage for app with existing data but no disk config",
-				"service", serviceName,
-				"app", app.ID)
-			sbSpec.Volume = append(sbSpec.Volume, compute_v1alpha.SandboxSpecVolume{
-				Name:      "local-data",
-				Provider:  "local",
-				MountPath: "/miren/data/local",
-			})
-			appCont.Mount = append(appCont.Mount, compute_v1alpha.SandboxSpecContainerMount{
-				Source:      "local-data",
-				Destination: "/miren/data/local",
-			})
-		}
-	}
-
 	if shutdownTimeout != "" {
 		appCont.ShutdownTimeout = shutdownTimeout
 	}
@@ -788,6 +798,69 @@ func (l *Launcher) buildSandboxSpec(
 func dirHasData(path string) bool {
 	entries, err := os.ReadDir(path)
 	return err == nil && len(entries) > 0
+}
+
+// localDataMountPath is where the transitional local-storage auto-mount is
+// exposed inside the container, and localDataDiskName is the disk/volume name
+// it is registered under.
+const (
+	localDataMountPath = "/miren/data/local"
+	localDataDiskName  = "local-data"
+)
+
+// injectAutoMountLocalDisks registers the transitional local-storage auto-mount
+// as a real disk on the resolved config. For any service whose per-app host data
+// directory already holds data but which declares no disk at the auto-mount path,
+// it appends a "local" disk to the config. Doing this at config-resolution time
+// (rather than patching the sandbox spec at build time) puts the app on the
+// disk-aware deploy path: serviceHasDisks reports true, so drainStaleDiskPools
+// reaps superseded pools instead of leaving a duplicate orphaned pool behind that
+// keeps a live version reference and can strand ingress on a restart (MIR-1293).
+//
+// configureLocalVolume keys the on-disk location purely on the app ID, so naming
+// the disk here does not move any existing data.
+func (l *Launcher) injectAutoMountLocalDisks(spec *core_v1alpha.ConfigSpec, app *core_v1alpha.App) {
+	if l.DataPath == "" {
+		return
+	}
+	if !dirHasData(filepath.Join(l.DataPath, "data", "local", app.ID.String())) {
+		return
+	}
+
+	for i := range spec.Services {
+		svc := &spec.Services[i]
+
+		// Skip if the service already declares an explicit local-provider disk
+		// (all local volumes share the same per-app host directory, so any local
+		// disk already exposes this data regardless of its mount path), a disk at
+		// the legacy auto-mount path, or a disk under the name we would inject.
+		// The last two also guard against a duplicate volume name in the spec.
+		conflicts := false
+		for _, d := range svc.Disks {
+			if d.Provider == core_v1alpha.ConfigSpecServicesDisksLOCAL || d.MountPath == localDataMountPath || d.Name == localDataDiskName {
+				conflicts = true
+				break
+			}
+		}
+		if conflicts {
+			continue
+		}
+
+		// Warn once per app; this condition holds on every reconcile tick until
+		// the app gets an explicit disk config, so logging each time would just
+		// flood the journal.
+		if _, warned := l.warnedNoDisk.LoadOrStore(app.ID, struct{}{}); !warned {
+			l.Log.Warn("auto-mounting local storage for app with existing data but no disk config",
+				"service", svc.Name,
+				"app", app.ID)
+		}
+
+		svc.Disks = append(svc.Disks, core_v1alpha.ConfigSpecServicesDisks{
+			Name:      localDataDiskName,
+			Provider:  core_v1alpha.ConfigSpecServicesDisksLOCAL,
+			MountPath: localDataMountPath,
+		})
+	}
 }
 
 // findMatchingPool searches for an existing pool with matching spec.
@@ -948,7 +1021,7 @@ func mountsEqual(mounts1, mounts2 []compute_v1alpha.SandboxSpecContainerMount) b
 }
 
 // envVarsEqual compares two env var slices in an order-independent way,
-// ignoring version-specific system env vars (MIREN_VERSION, MIREN_APP)
+// ignoring the system env vars Miren injects per version — see filterSystemEnvVars.
 func envVarsEqual(env1, env2 []string) bool {
 	// Filter out system env vars
 	filtered1 := filterSystemEnvVars(env1)
@@ -974,33 +1047,29 @@ func envVarsEqual(env1, env2 []string) bool {
 }
 
 // isSystemEnvVar returns true if the given key is a system-managed env var
-// that user config must not override.
+// that user config must not override. The whole MIREN_ namespace is reserved
+// (the injected MIREN_RUNTIME_* vars are enumerated in api/app/runtimeenv.go),
+// so only the unprefixed names need explicit cases here.
 func isSystemEnvVar(key string) bool {
 	switch key {
-	case "MIREN_VERSION", "MIREN_APP", "MIREN_INSTANCE_NUM", "PORT", "ADMIN_TOKEN":
+	case "PORT", "ADMIN_TOKEN":
 		return true
 	}
-	return strings.HasPrefix(key, "MIREN_")
+	return appclient.IsReservedEnvVar(key)
 }
 
-// filterSystemEnvVars filters out system-managed env vars that shouldn't affect pool reuse
+// filterSystemEnvVars filters out system-managed env vars that shouldn't affect pool reuse.
+// Unlike isSystemEnvVar this matches exact names rather than the MIREN_ prefix: a user's
+// own MIREN_-prefixed var could never be set anyway, but a pool must still be reused across
+// versions that differ only in the values Miren injects.
 func filterSystemEnvVars(envVars []string) []string {
+	skip := append([]string{"PORT", "ADMIN_TOKEN"}, appclient.RuntimeEnvNames...)
+
 	filtered := []string{}
 	for _, e := range envVars {
-		// Skip MIREN_VERSION, MIREN_APP, MIREN_INSTANCE_NUM, PORT, and ADMIN_TOKEN - these are set automatically
-		if strings.HasPrefix(e, "MIREN_VERSION=") {
-			continue
-		}
-		if strings.HasPrefix(e, "MIREN_APP=") {
-			continue
-		}
-		if strings.HasPrefix(e, "MIREN_INSTANCE_NUM=") {
-			continue
-		}
-		if strings.HasPrefix(e, "PORT=") {
-			continue
-		}
-		if strings.HasPrefix(e, "ADMIN_TOKEN=") {
+		if slices.ContainsFunc(skip, func(name string) bool {
+			return strings.HasPrefix(e, name+"=")
+		}) {
 			continue
 		}
 		filtered = append(filtered, e)
@@ -1208,21 +1277,16 @@ func (l *Launcher) hasRunningSandboxForPool(ctx context.Context, poolID entity.I
 	return false, nil
 }
 
-// cleanupOldVersionPools removes old version references from pools and scales down unreferenced pools
-func (l *Launcher) cleanupOldVersionPools(ctx context.Context, app *core_v1alpha.App, currentVersionID entity.Id) error {
-	l.Log.Info("cleaning up old version pools",
-		"app", app.ID,
-		"current_version", currentVersionID)
-
+// cleanupOldVersionPools removes old version references from pools and scales
+// down unreferenced pools. It returns the number of pools it actually changed.
+func (l *Launcher) cleanupOldVersionPools(ctx context.Context, app *core_v1alpha.App, currentVersionID entity.Id) (int, error) {
 	// List all pools
 	poolsResp, err := l.EAC.List(ctx, entity.Ref(entity.EntityKind, compute_v1alpha.KindSandboxPool))
 	if err != nil {
-		return fmt.Errorf("failed to list pools: %w", err)
+		return 0, fmt.Errorf("failed to list pools: %w", err)
 	}
 
-	poolCount := len(poolsResp.Values())
-	l.Log.Info("found pools to check", "count", poolCount)
-
+	cleaned := 0
 	for _, ent := range poolsResp.Values() {
 		var pool compute_v1alpha.SandboxPool
 		pool.Decode(ent.Entity())
@@ -1237,20 +1301,12 @@ func (l *Launcher) cleanupOldVersionPools(ctx context.Context, app *core_v1alpha
 			continue
 		}
 
-		l.Log.Info("checking pool for cleanup",
-			"pool", pool.ID,
-			"service", pool.Service,
-			"references", pool.ReferencedByVersions)
-
 		// Check if this pool is being used by the current version
 		isUsedByCurrentVersion := containsRef(pool.ReferencedByVersions, currentVersionID)
 
 		if isUsedByCurrentVersion {
-			// Pool is being reused by current version - keep ALL references
-			// Multiple versions may reference the same pool during rolling deployments
-			l.Log.Info("pool is being reused by current version, keeping all references",
-				"pool", pool.ID,
-				"service", pool.Service)
+			// Pool is being reused by current version - keep ALL references.
+			// Multiple versions may reference the same pool during rolling deployments.
 			continue
 		}
 
@@ -1291,9 +1347,10 @@ func (l *Launcher) cleanupOldVersionPools(ctx context.Context, app *core_v1alpha
 			l.Log.Error("failed to update pool", "error", err, "pool", pool.ID)
 			continue
 		}
+		cleaned++
 	}
 
-	return nil
+	return cleaned, nil
 }
 
 // ensureServiceForPorts creates or updates a network Service entity for a service

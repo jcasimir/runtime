@@ -24,29 +24,29 @@ func MigrateShortIds(ctx context.Context, log *slog.Logger, client *clientv3.Cli
 
 	log.Info("starting short-id migration", "prefix", prefix, "dry_run", opts.DryRun)
 
-	resp, err := client.Get(ctx, prefix, clientv3.WithPrefix())
+	kvs, err := scanPaged(ctx, client, prefix)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to list entities: %w", err)
 	}
 
-	log.Info("found entities to scan for short-id migration", "count", len(resp.Kvs))
+	log.Info("found entities to scan for short-id migration", "count", len(kvs))
 
 	// Build a set of existing unique keys for collision checking.
 	// We use the full unique key (attrCAS-based) to avoid collisions
 	// between different unique attributes.
-	uniqueResp, err := client.Get(ctx, uniquePrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	uniqueKvs, err := scanPaged(ctx, client, uniquePrefix, withKeysOnly())
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to list existing unique keys: %w", err)
 	}
 
 	existingUnique := make(map[string]struct{})
-	for _, kv := range uniqueResp.Kvs {
+	for _, kv := range uniqueKvs {
 		existingUnique[string(kv.Key)] = struct{}{}
 	}
 
 	var errorCount int
 
-	for _, kv := range resp.Kvs {
+	for _, kv := range kvs {
 		key := string(kv.Key)
 
 		// Skip session keys

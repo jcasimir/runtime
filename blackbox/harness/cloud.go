@@ -26,9 +26,10 @@ const (
 	certEncKey           = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	dbURL                = "postgres://cloud:cloud@postgres:5432/cloud?sslmode=disable"
 	valkeyAddr           = "valkey:6379"
+	metricsPassword      = "test-metrics-password"
 )
 
-// CloudEnv manages a cloud+POP test environment for global router blackbox tests.
+// CloudEnv manages a cloud+POP test environment for Miren Anywhere blackbox tests.
 type CloudEnv struct {
 	CloudURL      string // e.g. http://localhost:18080
 	PopListenPort string
@@ -50,10 +51,10 @@ type CloudEnv struct {
 	m *Miren
 }
 
-// NewCloudEnv builds a full cloud+POP environment for testing the global router.
+// NewCloudEnv builds a full cloud+POP environment for testing Miren Anywhere.
 // It builds cloud/POP binaries, starts cloud, registers a POP and cluster,
-// starts POP, and restarts the miren server with --labs globalrouter.
-// The environment is torn down via t.Cleanup.
+// starts POP, and restarts the miren server so it picks up the new
+// registration.json. The environment is torn down via t.Cleanup.
 func NewCloudEnv(t *testing.T, m *Miren) *CloudEnv {
 	t.Helper()
 
@@ -98,10 +99,10 @@ func NewCloudEnv(t *testing.T, m *Miren) *CloudEnv {
 	// Start POP
 	env.startPOP(t)
 
-	// Restart miren server with globalrouter enabled
-	env.restartServerWithGlobalRouter(t)
+	// Restart miren server so it picks up the registration
+	env.restartServerWithRegistration(t)
 
-	// Wait for global router to connect
+	// Wait for Miren Anywhere to connect
 	env.waitForConnection(t)
 
 	return env
@@ -184,11 +185,18 @@ func (env *CloudEnv) buildBinaries(t *testing.T, cloudRepo string) {
 
 	binDir := filepath.Join(env.m.cluster.RepoRoot, "bin")
 
+	// GOTOOLCHAIN=auto lets these builds fetch whatever toolchain the cloud
+	// repo's go.mod requires, decoupling it from runtime's Go version. CI's
+	// setup-go exports GOTOOLCHAIN=local job-wide, which would otherwise pin
+	// the cloud build to runtime's toolchain and fail whenever cloud requires
+	// a newer Go. Appended last so it wins over the inherited value.
+	buildEnv := append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOTOOLCHAIN=auto")
+
 	// Build cloud binary
 	t.Log("building cloud binary...")
 	cmd := exec.Command("go", "build", "-o", filepath.Join(binDir, "bb-cloud"), "./cmd/cloud")
 	cmd.Dir = cloudRepo
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
+	cmd.Env = buildEnv
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build cloud binary: %v\n%s", err, out)
 	}
@@ -197,7 +205,7 @@ func (env *CloudEnv) buildBinaries(t *testing.T, cloudRepo string) {
 	t.Log("building POP binary...")
 	cmd = exec.Command("go", "build", "-o", filepath.Join(binDir, "bb-pop"), "./cmd/pop")
 	cmd.Dir = cloudRepo
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
+	cmd.Env = buildEnv
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build POP binary: %v\n%s", err, out)
 	}
@@ -269,6 +277,7 @@ func (env *CloudEnv) startCloud(t *testing.T) {
 		"POP_CERT_ENCRYPTION_KEY": certEncKey,
 		"CHALLENGE_SIGNING_KEY":   base64.StdEncoding.EncodeToString(sigKey),
 		"DEV_LOGIN":               "true",
+		"METRICS_PASSWORD":        metricsPassword,
 	}, "/src/bin/bb-cloud", "-mode=all")
 
 	// Wait for cloud to be ready, with process liveness checks
@@ -442,9 +451,9 @@ func (env *CloudEnv) startPOP(t *testing.T) {
 	t.Log("POP server ready")
 }
 
-func (env *CloudEnv) restartServerWithGlobalRouter(t *testing.T) {
+func (env *CloudEnv) restartServerWithRegistration(t *testing.T) {
 	t.Helper()
-	t.Log("restarting miren server with --labs globalrouter...")
+	t.Log("restarting miren server to pick up registration...")
 
 	// Stop current server
 	env.m.RunCmdAsRoot("bash", "-c", "hack/dev-server stop")
@@ -453,13 +462,12 @@ func (env *CloudEnv) restartServerWithGlobalRouter(t *testing.T) {
 	// old "Miren server started" line from the previous startup.
 	env.m.RunCmdAsRoot("bash", "-c", ": > /tmp/miren-server.log")
 
-	// Start with globalrouter lab flag
-	env.m.RunCmdAsRoot("bash", "-c", "DEV_SERVER_FLAGS='--labs globalrouter' hack/dev-server start")
+	env.m.RunCmdAsRoot("bash", "-c", "hack/dev-server start")
 
 	// Wait for server to be ready
 	r := env.m.RunCmdAsRoot("hack/dev-server", "wait-ready", "60")
 	if !r.Success() {
-		t.Fatalf("server failed to start with globalrouter: %s", r.Stderr)
+		t.Fatalf("server failed to start: %s", r.Stderr)
 	}
 
 	// Also wait for buildkit's hosts file to be updated with the registry IP,
@@ -474,39 +482,39 @@ func (env *CloudEnv) restartServerWithGlobalRouter(t *testing.T) {
 	})
 
 	t.Cleanup(func() {
-		// Restart server without globalrouter to restore original state
+		// Restart server after registration files are removed to restore original state
 		env.m.RunCmdAsRoot("bash", "-c", "hack/dev-server stop")
 		env.m.RunCmdAsRoot("bash", "-c", ": > /tmp/miren-server.log")
 		env.m.RunCmdAsRoot("bash", "-c", "hack/dev-server start")
 		env.m.RunCmdAsRoot("hack/dev-server", "wait-ready", "30")
 	})
 
-	t.Log("miren server restarted with globalrouter enabled")
+	t.Log("miren server restarted with registration loaded")
 }
 
 func (env *CloudEnv) waitForConnection(t *testing.T) {
 	t.Helper()
-	t.Log("waiting for global router to connect to cloud...")
+	t.Log("waiting for Miren Anywhere to connect to cloud...")
 
 	// Look for the definitive "connected to cloud" log line emitted by
-	// pkg/globalrouter/client.go:163 after the WebSocket dial succeeds.
+	// pkg/anywhere/client.go:163 after the WebSocket dial succeeds.
 	const readyMarker = "connected to cloud"
 
-	Poll(t, "global router connected", 60*time.Second, 2*time.Second, func() (bool, string) {
+	Poll(t, "Miren Anywhere connected", 60*time.Second, 2*time.Second, func() (bool, string) {
 		r := env.m.RunCmdAsRoot("bash", "-c",
 			fmt.Sprintf("grep -F %q /tmp/miren-server.log 2>/dev/null | head -1", readyMarker))
 		if strings.Contains(r.Stdout, readyMarker) {
 			return true, ""
 		}
 
-		// Surface recent log lines mentioning the router for faster diagnosis
-		// when the marker is missing.
+		// Surface recent log lines mentioning Miren Anywhere for faster
+		// diagnosis when the marker is missing.
 		tail := env.m.RunCmdAsRoot("bash", "-c",
-			"grep -i 'global.router\\|cluster.channel\\|cloud' /tmp/miren-server.log 2>/dev/null | tail -5")
-		return false, fmt.Sprintf("no %q marker yet; recent router logs:\n%s", readyMarker, tail.Stdout)
+			"grep -i 'anywhere\\|cluster.channel\\|cloud' /tmp/miren-server.log 2>/dev/null | tail -5")
+		return false, fmt.Sprintf("no %q marker yet; recent Miren Anywhere logs:\n%s", readyMarker, tail.Stdout)
 	})
 
-	t.Log("global router connected")
+	t.Log("Miren Anywhere connected")
 }
 
 // adminCall makes a JSON-RPC call to the cloud admin API.

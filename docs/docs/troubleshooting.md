@@ -108,13 +108,24 @@ sudo journalctl -u miren -f
 ```
 </CliCommand>
 
-For Docker installations:
+For container installations (Docker or Podman), use whichever runtime you
+installed with:
 
 <CliCommand context="server">
 ```bash
-docker logs -f miren
+docker logs -f miren   # or: podman logs -f miren
 ```
 </CliCommand>
+
+:::note[Podman and restart-on-reboot]
+Docker's daemon restarts the miren container automatically after a reboot.
+Podman is daemonless, so `--restart always` only covers crashes while the
+machine is up — it won't bring the container back after a reboot on its own.
+On a systemd host, enable `podman-restart.service`
+(`sudo systemctl enable --now podman-restart.service`, or the `--user` variant
+plus `loginctl enable-linger` for a rootless install), or generate a dedicated
+unit with `podman generate systemd` / a Quadlet.
+:::
 
 **2. Test connectivity**
 
@@ -138,7 +149,7 @@ sudo miren debug bundle
 
 This creates a `miren-debug.tar.gz` archive containing system info, container state, process lists, and server logs.
 
-:::warning Review bundles before sharing
+:::warning[Review bundles before sharing]
 Debug bundles collect diagnostic data that may include sensitive information:
 
 - **Process command lines** — arguments passed to running processes may contain tokens or credentials
@@ -147,11 +158,11 @@ Debug bundles collect diagnostic data that may include sensitive information:
 Environment variable values are automatically redacted from container inspect output, but logs and process arguments are included as-is. Review the bundle contents and remove anything sensitive before sharing, especially in public channels like GitHub Issues.
 :::
 
-:::tip Use sudo for a complete bundle
+:::tip[Use sudo for a complete bundle]
 Without sudo, the command still runs but produces a partial bundle. Root access is needed for:
 - **Containerd socket** — the primary source of container state
 - **System journal** — miren server logs via journalctl
-- **Docker socket** — unless your user is in the `docker` group
+- **Docker/Podman socket** — for Docker, unless your user is in the `docker` group (rootless Podman needs no group)
 :::
 
 ### Bundle options
@@ -160,7 +171,7 @@ Without sudo, the command still runs but produces a partial bundle. Root access 
 |------|-------------|---------|
 | `-o, --output` | Output file path | `miren-debug.tar.gz` |
 | `-s, --since` | Include logs since this time | `1 day ago` |
-| `-d, --docker-container` | Docker container name | `miren` |
+| `-d, --docker-container` | Server container name (Docker or Podman) | `miren` |
 
 <CliCommand context="both">
 ```miren

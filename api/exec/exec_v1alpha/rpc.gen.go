@@ -350,6 +350,7 @@ func AdaptSandboxExec(t SandboxExec) *rpc.Interface {
 			InterfaceName: "SandboxExec",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"category", "value", "command", "options", "input", "output", "window_updates"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Exec(ctx, &SandboxExecExec{Call: call})
 			},

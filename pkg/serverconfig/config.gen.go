@@ -6,6 +6,38 @@ import (
 	"time"
 )
 
+// AppVersionConfig App version retention garbage collection
+type AppVersionConfig struct {
+	RetentionCount  *int    `toml:"retention_count" env:"MIREN_APP_VERSION_RETENTION_COUNT"`
+	RetentionPeriod *string `toml:"retention_period" env:"MIREN_APP_VERSION_RETENTION_PERIOD"`
+}
+
+// GetRetentionCount returns the value of RetentionCount or its zero value if nil
+func (c *AppVersionConfig) GetRetentionCount() int {
+	if c.RetentionCount != nil {
+		return *c.RetentionCount
+	}
+	return 0
+}
+
+// SetRetentionCount sets the value of RetentionCount
+func (c *AppVersionConfig) SetRetentionCount(v int) {
+	c.RetentionCount = &v
+}
+
+// GetRetentionPeriod returns the value of RetentionPeriod or its zero value if nil
+func (c *AppVersionConfig) GetRetentionPeriod() string {
+	if c.RetentionPeriod != nil {
+		return *c.RetentionPeriod
+	}
+	return ""
+}
+
+// SetRetentionPeriod sets the value of RetentionPeriod
+func (c *AppVersionConfig) SetRetentionPeriod(v string) {
+	c.RetentionPeriod = &v
+}
+
 // BuildkitConfig BuildKit daemon configuration
 type BuildkitConfig struct {
 	GcKeepDuration *string `toml:"gc_keep_duration" env:"MIREN_BUILDKIT_GC_KEEP_DURATION"`
@@ -82,6 +114,7 @@ func (c *BuildkitConfig) SetStartEmbedded(v bool) {
 
 // Config Complete server configuration from all sources
 type Config struct {
+	AppVersion      AppVersionConfig      `toml:"app_version"`
 	Buildkit        BuildkitConfig        `toml:"buildkit"`
 	Containerd      ContainerdConfig      `toml:"containerd"`
 	Etcd            EtcdConfig            `toml:"etcd"`
@@ -155,12 +188,13 @@ func (c *ContainerdConfig) SetStartEmbedded(v bool) {
 
 // EtcdConfig Etcd configuration
 type EtcdConfig struct {
-	ClientPort     *int     `toml:"client_port" env:"MIREN_ETCD_CLIENT_PORT"`
-	Endpoints      []string `toml:"endpoints" env:"MIREN_ETCD_ENDPOINTS"`
-	HTTPClientPort *int     `toml:"http_client_port" env:"MIREN_ETCD_HTTP_CLIENT_PORT"`
-	PeerPort       *int     `toml:"peer_port" env:"MIREN_ETCD_PEER_PORT"`
-	Prefix         *string  `toml:"prefix" env:"MIREN_ETCD_PREFIX"`
-	StartEmbedded  *bool    `toml:"start_embedded" env:"MIREN_ETCD_START_EMBEDDED"`
+	ClientPort        *int     `toml:"client_port" env:"MIREN_ETCD_CLIENT_PORT"`
+	Endpoints         []string `toml:"endpoints" env:"MIREN_ETCD_ENDPOINTS"`
+	HTTPClientPort    *int     `toml:"http_client_port" env:"MIREN_ETCD_HTTP_CLIENT_PORT"`
+	PeerPort          *int     `toml:"peer_port" env:"MIREN_ETCD_PEER_PORT"`
+	Prefix            *string  `toml:"prefix" env:"MIREN_ETCD_PREFIX"`
+	QuotaBackendBytes *int     `toml:"quota_backend_bytes" env:"MIREN_ETCD_QUOTA_BACKEND_BYTES"`
+	StartEmbedded     *bool    `toml:"start_embedded" env:"MIREN_ETCD_START_EMBEDDED"`
 }
 
 // GetClientPort returns the value of ClientPort or its zero value if nil
@@ -213,6 +247,19 @@ func (c *EtcdConfig) GetPrefix() string {
 // SetPrefix sets the value of Prefix
 func (c *EtcdConfig) SetPrefix(v string) {
 	c.Prefix = &v
+}
+
+// GetQuotaBackendBytes returns the value of QuotaBackendBytes or its zero value if nil
+func (c *EtcdConfig) GetQuotaBackendBytes() int {
+	if c.QuotaBackendBytes != nil {
+		return *c.QuotaBackendBytes
+	}
+	return 0
+}
+
+// SetQuotaBackendBytes sets the value of QuotaBackendBytes
+func (c *EtcdConfig) SetQuotaBackendBytes(v int) {
+	c.QuotaBackendBytes = &v
 }
 
 // GetStartEmbedded returns the value of StartEmbedded or its zero value if nil

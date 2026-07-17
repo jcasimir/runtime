@@ -1127,6 +1127,61 @@ func (v *ErrorBreakdown) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &v.data)
 }
 
+type boundPortData struct {
+	Port    *int64  `cbor:"0,keyasint,omitempty" json:"port,omitempty"`
+	Address *string `cbor:"1,keyasint,omitempty" json:"address,omitempty"`
+}
+
+type BoundPort struct {
+	data boundPortData
+}
+
+func (v *BoundPort) HasPort() bool {
+	return v.data.Port != nil
+}
+
+func (v *BoundPort) Port() int64 {
+	if v.data.Port == nil {
+		return 0
+	}
+	return *v.data.Port
+}
+
+func (v *BoundPort) SetPort(port int64) {
+	v.data.Port = &port
+}
+
+func (v *BoundPort) HasAddress() bool {
+	return v.data.Address != nil
+}
+
+func (v *BoundPort) Address() string {
+	if v.data.Address == nil {
+		return ""
+	}
+	return *v.data.Address
+}
+
+func (v *BoundPort) SetAddress(address string) {
+	v.data.Address = &address
+}
+
+func (v *BoundPort) MarshalCBOR() ([]byte, error) {
+	return cbor.Marshal(v.data)
+}
+
+func (v *BoundPort) UnmarshalCBOR(data []byte) error {
+	return cbor.Unmarshal(data, &v.data)
+}
+
+func (v *BoundPort) MarshalJSON() ([]byte, error) {
+	return json.Marshal(v.data)
+}
+
+func (v *BoundPort) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, &v.data)
+}
+
 type poolStatusData struct {
 	Name      *string          `cbor:"0,keyasint,omitempty" json:"name,omitempty"`
 	Windows   *[]*WindowStatus `cbor:"1,keyasint,omitempty" json:"windows,omitempty"`
@@ -1301,6 +1356,12 @@ type applicationStatusData struct {
 	RequestStats      *[]*RequestStat     `cbor:"11,keyasint,omitempty" json:"request_stats,omitempty"`
 	TopPaths          *[]*PathStat        `cbor:"12,keyasint,omitempty" json:"top_paths,omitempty"`
 	ErrorBreakdown    *[]*ErrorBreakdown  `cbor:"13,keyasint,omitempty" json:"error_breakdown,omitempty"`
+	Health            *string             `cbor:"14,keyasint,omitempty" json:"health,omitempty"`
+	ReadyInstances    *int32              `cbor:"15,keyasint,omitempty" json:"ready_instances,omitempty"`
+	DesiredInstances  *int32              `cbor:"16,keyasint,omitempty" json:"desired_instances,omitempty"`
+	CrashCount        *int64              `cbor:"17,keyasint,omitempty" json:"crash_count,omitempty"`
+	CooldownSeconds   *int32              `cbor:"18,keyasint,omitempty" json:"cooldown_seconds,omitempty"`
+	BoundPorts        *[]*BoundPort       `cbor:"19,keyasint,omitempty" json:"bound_ports,omitempty"`
 }
 
 type ApplicationStatus struct {
@@ -1519,6 +1580,97 @@ func (v *ApplicationStatus) ErrorBreakdown() []*ErrorBreakdown {
 func (v *ApplicationStatus) SetErrorBreakdown(errorBreakdown []*ErrorBreakdown) {
 	x := slices.Clone(errorBreakdown)
 	v.data.ErrorBreakdown = &x
+}
+
+func (v *ApplicationStatus) HasHealth() bool {
+	return v.data.Health != nil
+}
+
+func (v *ApplicationStatus) Health() string {
+	if v.data.Health == nil {
+		return ""
+	}
+	return *v.data.Health
+}
+
+func (v *ApplicationStatus) SetHealth(health string) {
+	v.data.Health = &health
+}
+
+func (v *ApplicationStatus) HasReadyInstances() bool {
+	return v.data.ReadyInstances != nil
+}
+
+func (v *ApplicationStatus) ReadyInstances() int32 {
+	if v.data.ReadyInstances == nil {
+		return 0
+	}
+	return *v.data.ReadyInstances
+}
+
+func (v *ApplicationStatus) SetReadyInstances(readyInstances int32) {
+	v.data.ReadyInstances = &readyInstances
+}
+
+func (v *ApplicationStatus) HasDesiredInstances() bool {
+	return v.data.DesiredInstances != nil
+}
+
+func (v *ApplicationStatus) DesiredInstances() int32 {
+	if v.data.DesiredInstances == nil {
+		return 0
+	}
+	return *v.data.DesiredInstances
+}
+
+func (v *ApplicationStatus) SetDesiredInstances(desiredInstances int32) {
+	v.data.DesiredInstances = &desiredInstances
+}
+
+func (v *ApplicationStatus) HasCrashCount() bool {
+	return v.data.CrashCount != nil
+}
+
+func (v *ApplicationStatus) CrashCount() int64 {
+	if v.data.CrashCount == nil {
+		return 0
+	}
+	return *v.data.CrashCount
+}
+
+func (v *ApplicationStatus) SetCrashCount(crashCount int64) {
+	v.data.CrashCount = &crashCount
+}
+
+func (v *ApplicationStatus) HasCooldownSeconds() bool {
+	return v.data.CooldownSeconds != nil
+}
+
+func (v *ApplicationStatus) CooldownSeconds() int32 {
+	if v.data.CooldownSeconds == nil {
+		return 0
+	}
+	return *v.data.CooldownSeconds
+}
+
+func (v *ApplicationStatus) SetCooldownSeconds(cooldownSeconds int32) {
+	v.data.CooldownSeconds = &cooldownSeconds
+}
+
+func (v *ApplicationStatus) HasBoundPorts() bool {
+	return v.data.BoundPorts != nil
+}
+
+func (v *ApplicationStatus) BoundPorts() []*BoundPort {
+	if v.data.BoundPorts == nil {
+		return nil
+	}
+	return *v.data.BoundPorts
+}
+
+func (v *ApplicationStatus) SetBoundPorts(boundPorts []*BoundPort) {
+	x := slices.Clone(boundPorts)
+	v.data.BoundPorts = &x
 }
 
 func (v *ApplicationStatus) MarshalCBOR() ([]byte, error) {
@@ -3134,6 +3286,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"name"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.New(ctx, &CrudNew{Call: call})
 			},
@@ -3143,6 +3296,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "configuration"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.SetConfiguration(ctx, &CrudSetConfiguration{Call: call})
 			},
@@ -3152,6 +3306,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.GetConfiguration(ctx, &CrudGetConfiguration{Call: call})
 			},
@@ -3161,6 +3316,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "host"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.SetHost(ctx, &CrudSetHost{Call: call})
 			},
@@ -3170,6 +3326,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.List(ctx, &CrudList{Call: call})
 			},
@@ -3179,6 +3336,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"name"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Destroy(ctx, &CrudDestroy{Call: call})
 			},
@@ -3188,6 +3346,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "key", "value", "sensitive", "service"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.SetEnvVar(ctx, &CrudSetEnvVar{Call: call})
 			},
@@ -3197,6 +3356,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "vars", "service"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.SetEnvVars(ctx, &CrudSetEnvVars{Call: call})
 			},
@@ -3206,6 +3366,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "vars", "service"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.SetInitialEnvVars(ctx, &CrudSetInitialEnvVars{Call: call})
 			},
@@ -3215,6 +3376,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "key", "service"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.DeleteEnvVar(ctx, &CrudDeleteEnvVar{Call: call})
 			},
@@ -3224,6 +3386,7 @@ func AdaptCrud(t Crud) *rpc.Interface {
 			InterfaceName: "Crud",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "service"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Restart(ctx, &CrudRestart{Call: call})
 			},
@@ -3753,6 +3916,7 @@ func AdaptUserQuery(t UserQuery) *rpc.Interface {
 			InterfaceName: "UserQuery",
 			Index:         0,
 			Public:        false,
+			Params:        []string{},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.WhoAmI(ctx, &UserQueryWhoAmI{Call: call})
 			},
@@ -3914,6 +4078,7 @@ func AdaptAppStatus(t AppStatus) *rpc.Interface {
 			InterfaceName: "AppStatus",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"application"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.AppInfo(ctx, &AppStatusAppInfo{Call: call})
 			},
@@ -4231,6 +4396,7 @@ type logsStreamLogChunksArgsData struct {
 	Follow *bool               `cbor:"2,keyasint,omitempty" json:"follow,omitempty"`
 	Filter *string             `cbor:"3,keyasint,omitempty" json:"filter,omitempty"`
 	Chunks *rpc.Capability     `cbor:"4,keyasint,omitempty" json:"chunks,omitempty"`
+	To     *standard.Timestamp `cbor:"5,keyasint,omitempty" json:"to,omitempty"`
 }
 
 type LogsStreamLogChunksArgs struct {
@@ -4285,6 +4451,14 @@ func (v *LogsStreamLogChunksArgs) Chunks() *stream.SendStreamClient[*LogChunk] {
 		return nil
 	}
 	return &stream.SendStreamClient[*LogChunk]{Client: v.call.NewClient(v.data.Chunks)}
+}
+
+func (v *LogsStreamLogChunksArgs) HasTo() bool {
+	return v.data.To != nil
+}
+
+func (v *LogsStreamLogChunksArgs) To() *standard.Timestamp {
+	return v.data.To
 }
 
 func (v *LogsStreamLogChunksArgs) MarshalCBOR() ([]byte, error) {
@@ -4468,6 +4642,7 @@ func AdaptLogs(t Logs) *rpc.Interface {
 			InterfaceName: "Logs",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"application", "from", "follow"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.AppLogs(ctx, &LogsAppLogs{Call: call})
 			},
@@ -4477,6 +4652,7 @@ func AdaptLogs(t Logs) *rpc.Interface {
 			InterfaceName: "Logs",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"sandbox", "from", "follow"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.SandboxLogs(ctx, &LogsSandboxLogs{Call: call})
 			},
@@ -4486,6 +4662,7 @@ func AdaptLogs(t Logs) *rpc.Interface {
 			InterfaceName: "Logs",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"target", "from", "follow", "logs"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.StreamLogs(ctx, &LogsStreamLogs{Call: call})
 			},
@@ -4495,6 +4672,7 @@ func AdaptLogs(t Logs) *rpc.Interface {
 			InterfaceName: "Logs",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"target", "from", "follow", "filter", "chunks", "to"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.StreamLogChunks(ctx, &LogsStreamLogChunks{Call: call})
 			},
@@ -4612,7 +4790,7 @@ type LogsClientStreamLogChunksResults struct {
 	data   logsStreamLogChunksResultsData
 }
 
-func (v LogsClient) StreamLogChunks(ctx context.Context, target *LogTarget, from *standard.Timestamp, follow bool, filter string, chunks stream.SendStream[*LogChunk]) (*LogsClientStreamLogChunksResults, error) {
+func (v LogsClient) StreamLogChunks(ctx context.Context, target *LogTarget, from *standard.Timestamp, follow bool, filter string, chunks stream.SendStream[*LogChunk], to *standard.Timestamp) (*LogsClientStreamLogChunksResults, error) {
 	args := LogsStreamLogChunksArgs{}
 	caps := map[rpc.OID]*rpc.InlineCapability{}
 	args.data.Target = target
@@ -4624,6 +4802,7 @@ func (v LogsClient) StreamLogChunks(ctx context.Context, target *LogTarget, from
 		args.data.Chunks = c
 		caps[oid] = ic
 	}
+	args.data.To = to
 
 	var ret logsStreamLogChunksResultsData
 
@@ -5127,6 +5306,7 @@ func AdaptDisks(t Disks) *rpc.Interface {
 			InterfaceName: "Disks",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"name", "capacity"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.New(ctx, &DisksNew{Call: call})
 			},
@@ -5136,6 +5316,7 @@ func AdaptDisks(t Disks) *rpc.Interface {
 			InterfaceName: "Disks",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"id"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.GetById(ctx, &DisksGetById{Call: call})
 			},
@@ -5145,6 +5326,7 @@ func AdaptDisks(t Disks) *rpc.Interface {
 			InterfaceName: "Disks",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"name"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.GetByName(ctx, &DisksGetByName{Call: call})
 			},
@@ -5154,6 +5336,7 @@ func AdaptDisks(t Disks) *rpc.Interface {
 			InterfaceName: "Disks",
 			Index:         0,
 			Public:        false,
+			Params:        []string{},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.List(ctx, &DisksList{Call: call})
 			},
@@ -5163,6 +5346,7 @@ func AdaptDisks(t Disks) *rpc.Interface {
 			InterfaceName: "Disks",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"id"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.Delete(ctx, &DisksDelete{Call: call})
 			},
@@ -5678,6 +5862,7 @@ func AdaptAddons(t Addons) *rpc.Interface {
 			InterfaceName: "Addons",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"name", "addon", "variant", "app", "version"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.CreateInstance(ctx, &AddonsCreateInstance{Call: call})
 			},
@@ -5687,6 +5872,7 @@ func AdaptAddons(t Addons) *rpc.Interface {
 			InterfaceName: "Addons",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.ListInstances(ctx, &AddonsListInstances{Call: call})
 			},
@@ -5696,6 +5882,7 @@ func AdaptAddons(t Addons) *rpc.Interface {
 			InterfaceName: "Addons",
 			Index:         0,
 			Public:        false,
+			Params:        []string{"app", "name"},
 			Handler: func(ctx context.Context, call rpc.Call) error {
 				return t.DeleteInstance(ctx, &AddonsDeleteInstance{Call: call})
 			},

@@ -74,6 +74,10 @@ type localClient struct {
 	iface *Interface
 }
 
+func (l *localClient) listMethods() methodsResponse {
+	return newMethodsResponse(l.iface.methods)
+}
+
 func (l *localClient) Call(ctx context.Context, name string, arg, ret any) error {
 	m, ok := l.iface.methods[name]
 	if !ok {
