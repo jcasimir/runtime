@@ -17,6 +17,7 @@ func DefaultConfig() *Config {
 		Saga:            DefaultSagaConfig(),
 		Secrets:         DefaultSecretsConfig(),
 		Server:          DefaultServerConfig(),
+		Telemetry:       DefaultTelemetryConfig(),
 		TLS:             DefaultTLSConfig(),
 		Victorialogs:    DefaultVictoriaLogsConfig(),
 		Victoriametrics: DefaultVictoriaMetricsConfig(),
@@ -92,8 +93,8 @@ func DefaultMetricsConfig() MetricsConfig {
 // DefaultRemoteWriteConfig returns default RemoteWriteConfig
 func DefaultRemoteWriteConfig() RemoteWriteConfig {
 	return RemoteWriteConfig{
-		URL:                      new(""),
-		WorkloadIdentityAudience: new(""),
+		URL:                      nil,
+		WorkloadIdentityAudience: nil,
 	}
 }
 
@@ -136,6 +137,30 @@ func DefaultTLSConfig() TLSConfig {
 		AdditionalNames: []string{},
 		SelfSigned:      new(false),
 		StandardTLS:     nil,
+	}
+}
+
+// DefaultTelemetryConfig returns default TelemetryConfig
+func DefaultTelemetryConfig() TelemetryConfig {
+	return TelemetryConfig{
+		Metrics: DefaultTelemetryMetricsConfig(),
+		Traces:  DefaultTelemetryTracesConfig(),
+	}
+}
+
+// DefaultTelemetryMetricsConfig returns default TelemetryMetricsConfig
+func DefaultTelemetryMetricsConfig() TelemetryMetricsConfig {
+	return TelemetryMetricsConfig{
+		RemoteWriteURL:           new(""),
+		WorkloadIdentityAudience: new(""),
+	}
+}
+
+// DefaultTelemetryTracesConfig returns default TelemetryTracesConfig
+func DefaultTelemetryTracesConfig() TelemetryTracesConfig {
+	return TelemetryTracesConfig{
+		Endpoint:                 new(""),
+		WorkloadIdentityAudience: new(""),
 	}
 }
 
