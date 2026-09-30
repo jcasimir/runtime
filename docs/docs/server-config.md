@@ -292,22 +292,22 @@ destination and are not copied into this instance.
 
 \* Defaults to `true` in standalone mode only.
 
-## `[metrics.remote_write]` — Managed Application Metrics {#managed-app-metrics}
+## `[telemetry.metrics]` — Managed Application Metrics {#managed-app-metrics}
 
 Configures the Prometheus Remote Write destination for services that enable
 managed metrics in `app.toml`. When this section is absent, Miren does not start
 vmagent and does not scrape application endpoints.
 
 ```toml
-[metrics.remote_write]
-url = "https://metrics.example.com/api/v1/write"
+[telemetry.metrics]
+remote_write_url = "https://metrics.example.com/api/v1/write"
 workload_identity_audience = "metrics.example.com"
 ```
 
 | Field | Type | Default | Description | Env Var | CLI Flag |
 |-------|------|---------|-------------|---------|----------|
-| `url` | string | — | Absolute HTTP or HTTPS remote-write endpoint | `MIREN_METRICS_REMOTE_WRITE_URL` | `--metrics-remote-write-url` |
-| `workload_identity_audience` | string | — | Audience for the short-lived `system:telemetrywriter` bearer token | `MIREN_METRICS_REMOTE_WRITE_AUDIENCE` | `--metrics-remote-write-audience` |
+| `remote_write_url` | string | — | Absolute HTTP or HTTPS remote-write endpoint | `MIREN_TELEMETRY_METRICS_REMOTE_WRITE_URL` | `--telemetry-metrics-remote-write-url` |
+| `workload_identity_audience` | string | — | Audience for the short-lived `system:telemetrywriter` bearer token | `MIREN_TELEMETRY_METRICS_AUDIENCE` | `--telemetry-metrics-audience` |
 
 :::warning[Remote-write requirements]
 Both fields must be set together. URLs containing credentials are rejected;
@@ -321,6 +321,48 @@ under `<data_path>/app-metrics`.
 Registered clusters use their Miren Cloud cluster ID for the `miren_cluster`
 label. Other clusters use [`server.config_cluster_name`](#server), so set it to
 a stable name when several clusters write to the same destination.
+:::
+
+:::note[Moved from metrics.remote_write]
+Before this section existed, the same settings lived under
+`[metrics.remote_write]` as `url` and `workload_identity_audience`
+(`MIREN_METRICS_REMOTE_WRITE_URL`, `MIREN_METRICS_REMOTE_WRITE_AUDIENCE`). Those
+still work and log a deprecation warning at startup. If both the old and new
+key are set, they must agree.
+:::
+
+## `[telemetry.traces]` — Trace Export {#telemetry-traces}
+
+Configures where Miren sends its own [OpenTelemetry traces](./observability.md#configuring-mirens-own-export)
+and how it authenticates there.
+
+```toml
+[telemetry.traces]
+endpoint = "https://traces.example.com"
+workload_identity_audience = "traces.example.com"
+```
+
+| Field | Type | Default | Description | Env Var | CLI Flag |
+|-------|------|---------|-------------|---------|----------|
+| `endpoint` | string | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL; Miren appends `/v1/traces` | `MIREN_TELEMETRY_TRACES_ENDPOINT` | `--telemetry-traces-endpoint` |
+| `workload_identity_audience` | string | — | Authenticate with a short-lived `system:telemetrywriter` bearer token for this audience | `MIREN_TELEMETRY_TRACES_AUDIENCE` | `--telemetry-traces-audience` |
+
+When `endpoint` is unset, Miren falls back to the standard
+`OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. With neither, Miren exports
+no traces.
+
+Unlike metrics, identity is optional here. Without an audience, Miren sends
+whatever static headers `OTEL_EXPORTER_OTLP_HEADERS` holds, which suits hosted
+backends that take an API key. With an audience, the token replaces any
+`Authorization` header from the environment (Miren warns once at startup), and
+other headers still go through. The collector verifies the token with OIDC
+discovery against the cluster's issuer, so it needs no shared secret.
+
+:::warning[Trace export requirements]
+An audience needs an endpoint from one of the two sources. URLs containing
+credentials are rejected. With an audience set, Miren's exporter no longer
+reads `OTEL_EXPORTER_OTLP_CERTIFICATE`, so a collector behind a private CA is
+not supported in that mode.
 :::
 
 ## `[app_version]` — Version Retention {#app-version}
