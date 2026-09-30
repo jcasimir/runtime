@@ -28,7 +28,7 @@ func TestCheckHostSkipsWhenKernelModulesAreDisabled(t *testing.T) {
 	writeFile(t, root, "proc/sys/kernel/modules_disabled", "1\n")
 	status, err := Probe(Options{Root: root, DataPath: t.TempDir()})
 	require.NoError(t, err)
-	require.ErrorContains(t, testInstaller(t, root, t.TempDir()).checkHost(status), "disabled loading modules")
+	require.ErrorContains(t, testInstaller(t, root, t.TempDir()).CheckHost(status), "disabled loading modules")
 }
 
 func TestCheckHostAllowsPossibleHostWithoutContainerRuntime(t *testing.T) {
@@ -43,7 +43,7 @@ func TestCheckHostAllowsPossibleHostWithoutContainerRuntime(t *testing.T) {
 	t.Setenv("PATH", bin)
 	status, err := Probe(Options{Root: root, DataPath: t.TempDir()})
 	require.NoError(t, err)
-	require.NoError(t, testInstaller(t, root, t.TempDir()).checkHost(status))
+	require.NoError(t, testInstaller(t, root, t.TempDir()).CheckHost(status))
 }
 
 func TestCanLoadModulesChecksEffectiveCapability(t *testing.T) {

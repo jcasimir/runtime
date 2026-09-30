@@ -71,7 +71,10 @@ func localDiskAcceleratorCluster(ctx *Context, name, serverConfigPath string) (*
 	if err != nil {
 		return nil, fmt.Errorf("reading installed server CA: %w", err)
 	}
-	cluster, err := clientconfig.LoadLocalServerCluster(name)
+	cluster, err := clientconfig.LoadLocalServerCluster("local")
+	if err != nil && name != "local" {
+		cluster, err = clientconfig.LoadLocalServerCluster(name)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -187,7 +187,7 @@ func (i *Installer) EnsureCurrent(ctx context.Context) (bool, error) {
 // checkCanBuild refuses the cases where a build would either fail confusingly
 // or produce a module that cannot be loaded, and says why.
 func (i *Installer) checkCanBuild(status Status) error {
-	if err := i.checkHost(status); err != nil {
+	if err := i.CheckHost(status); err != nil {
 		return err
 	}
 
@@ -197,8 +197,8 @@ func (i *Installer) checkCanBuild(status Status) error {
 	return nil
 }
 
-// checkHost refuses hosts that cannot build or load lbd before building.
-func (i *Installer) checkHost(status Status) error {
+// CheckHost refuses hosts that cannot build or load lbd before starting a container runtime.
+func (i *Installer) CheckHost(status Status) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("installing a kernel module requires root privileges (use sudo)")
 	}

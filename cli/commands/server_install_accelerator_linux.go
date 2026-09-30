@@ -41,6 +41,10 @@ func installServerDiskAccelerator(ctx *Context) error {
 		ctx.Completed("Accelerator mode is already ready on this host, kernel %s", status.Host.KernelRelease)
 		return nil
 	}
+	installer := &lbdmod.Installer{Log: ctx.Log, Options: options}
+	if err := installer.CheckHost(status); err != nil {
+		return err
+	}
 	socket := filepath.Join(dataPath, "containerd", "containerd.sock")
 
 	listening, err := unixSocketListening(socket)
@@ -109,12 +113,8 @@ func installServerDiskAccelerator(ctx *Context) error {
 	}
 
 	ctx.Begin("Installing the lbd kernel module on this host")
-	installer := &lbdmod.Installer{
-		Log:     ctx.Log,
-		Builder: ctrbuild.New(cc, ctx.Log),
-		Options: options,
-		Image:   image,
-	}
+	installer.Builder = ctrbuild.New(cc, ctx.Log)
+	installer.Image = image
 	status, err = installer.Install(ctx, false)
 	if err != nil {
 		return err
