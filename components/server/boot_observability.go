@@ -90,6 +90,7 @@ func (b *observabilityBoot) start(ctx context.Context, victoriaLogs victoriaLogs
 	processInfo := metrics.NewProcessInfo(log, operational)
 	go processInfo.Monitor(ctx)
 	go entitysync.NewStateMetrics(log, operational, b.inputs.entitySync).Monitor(ctx)
+	go metrics.NewLogMessages(log, operational).Monitor(ctx)
 
 	sandboxMetrics := sandbox.NewMetrics()
 	sandboxMetrics.Log = log

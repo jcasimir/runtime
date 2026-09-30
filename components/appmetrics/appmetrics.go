@@ -256,7 +256,8 @@ func (c *Component) rotateToken(ctx context.Context, path, audience string) {
 }
 
 func (c *Component) createTask(ctx context.Context, container containerd.Container) (containerd.Task, error) {
-	return container.NewTask(ctx, slogout.WithLogger(c.Log, "vmagent"))
+	return container.NewTask(ctx, slogout.WithLogger(c.Log, "vmagent",
+		slogout.WithVictoriaParsing(), slogout.WithMaxLevel(slog.LevelInfo)))
 }
 
 func (c *Component) createContainer(ctx context.Context, image containerd.Image, dataPath, remoteWriteURL string, httpPort int) (containerd.Container, error) {
