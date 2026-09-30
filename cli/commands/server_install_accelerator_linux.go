@@ -1,0 +1,194 @@
+package commands
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"golang.org/x/sys/unix"
+	"miren.dev/runtime/components/buildkit"
+	containerdcomp "miren.dev/runtime/components/containerd"
+	"miren.dev/runtime/pkg/lbdmod"
+	"miren.dev/runtime/pkg/lbdmod/ctrbuild"
+)
+
+// installServerDiskAccelerator prepares lbd before server install starts systemd.
+func installServerDiskAccelerator(ctx *Context) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("installing a kernel module requires root privileges (use sudo)")
+	}
+	dataPath := mirenDataDir
+	options := lbdmod.HostOptions(dataPath)
+	unlock, err := lockLocalDiskAccelerator(dataPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	status, err := lbdmod.Probe(options)
+	if err != nil {
+		return err
+	}
+	if status.Marker != nil && status.Available() && !status.Stale() {
+		ctx.Completed("Accelerator mode is already ready on this host, kernel %s", status.Host.KernelRelease)
+		return nil
+	}
+	socket := filepath.Join(dataPath, "containerd", "containerd.sock")
+
+	listening, err := unixSocketListening(socket)
+	if err != nil {
+		return fmt.Errorf("checking containerd socket %s: %w", socket, err)
+	}
+	if !listening {
+		binary := filepath.Join(releaseDir, "containerd")
+		if _, err := os.Stat(binary); err != nil {
+			return fmt.Errorf("server release containerd is unavailable: %w", err)
+		}
+		ctx.Begin("Starting temporary Miren containerd")
+		runtime := containerdcomp.NewContainerdComponent(ctx.Log, dataPath)
+		config := containerdcomp.EmbeddedBootConfig(ctx.Log, dataPath, binary, releaseDir, socket)
+		if err := runtime.Start(ctx, config.Embedded); err != nil {
+			return fmt.Errorf("starting containerd: %w", err)
+		}
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+			defer cancel()
+			if err := runtime.Stop(stopCtx); err != nil {
+				ctx.Log.Warn("could not stop temporary containerd", "error", err)
+			}
+		}()
+	}
+	if err := checkSocketAccess(socket); err != nil {
+		return err
+	}
+	cc, err := containerd.New(socket)
+	if err != nil {
+		return fmt.Errorf("connecting to containerd at %s: %w", socket, err)
+	}
+	defer cc.Close()
+
+	image := "localhost/miren-system/lbd-builder:" + lbdmod.BuilderVersion()
+	if _, err := cc.GetImage(namespaces.WithNamespace(ctx, ctrbuild.DefaultNamespace), image); err != nil {
+		if !errdefs.IsNotFound(err) {
+			return fmt.Errorf("checking the local lbd toolchain image: %w", err)
+		}
+		buildkitSocket := filepath.Join(dataPath, "buildkit", "socket", "buildkitd.sock")
+		listening, err := unixSocketListening(buildkitSocket)
+		if err != nil {
+			return fmt.Errorf("checking BuildKit socket %s: %w", buildkitSocket, err)
+		}
+		if !listening {
+			ctx.Begin("Starting temporary Miren BuildKit")
+			builder := buildkit.NewComponent(ctx.Log, cc, ctrbuild.DefaultNamespace, dataPath)
+			if err := builder.Start(ctx, buildkit.Config{SocketDir: filepath.Dir(buildkitSocket)}); err != nil {
+				return fmt.Errorf("starting BuildKit: %w", err)
+			}
+			defer func() {
+				stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+				defer cancel()
+				if err := builder.Stop(stopCtx); err != nil {
+					ctx.Log.Warn("could not stop temporary BuildKit", "error", err)
+				}
+			}()
+		}
+		if err := buildLocalLbdToolchain(ctx, socket, buildkitSocket, image, releaseDir); err != nil {
+			return err
+		}
+	}
+
+	ctx.Begin("Installing the lbd kernel module on this host")
+	installer := &lbdmod.Installer{
+		Log:     ctx.Log,
+		Builder: ctrbuild.New(cc, ctx.Log),
+		Options: options,
+		Image:   image,
+	}
+	status, err = installer.Install(ctx, false)
+	if err != nil {
+		return err
+	}
+	ctx.Completed("Accelerator mode is ready on this host, kernel %s", status.Host.KernelRelease)
+	return nil
+}
+
+func lockLocalDiskAccelerator(dataPath string) (func(), error) {
+	dir := filepath.Join(dataPath, "lbd")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "local-install.lock"), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another local accelerator installation is in progress: %w", err)
+		}
+		return nil, err
+	}
+	return func() {
+		unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		f.Close()
+	}, nil
+}
+
+// A stopped daemon may leave its socket inode behind; existence alone does not
+// mean another process owns the data directory.
+func unixSocketListening(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return false, fmt.Errorf("%s exists but is not a Unix socket", path)
+	}
+	conn, err := net.DialTimeout("unix", path, 3*time.Second)
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	conn.Close()
+	return true, nil
+}
+
+func buildLocalLbdToolchain(ctx *Context, socket, buildkitSocket, image, releaseDir string) error {
+	for _, name := range []string{"nerdctl", "buildctl"} {
+		if _, err := os.Stat(filepath.Join(releaseDir, name)); err != nil {
+			return fmt.Errorf("server release %s is unavailable: %w", name, err)
+		}
+	}
+	dir, err := os.MkdirTemp("", "miren-lbd-builder-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	if err := lbdmod.MaterializeBuilder(dir); err != nil {
+		return err
+	}
+
+	ctx.Begin("Building the local lbd toolchain image")
+	cmd := exec.CommandContext(ctx, filepath.Join(releaseDir, "nerdctl"), "--address", socket, "--namespace", ctrbuild.DefaultNamespace,
+		"build", "--tag", image, dir)
+	cmd.Env = append(os.Environ(), "BUILDKIT_HOST=unix://"+buildkitSocket,
+		"PATH="+releaseDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Stdout = ctx.Stdout
+	cmd.Stderr = ctx.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("building the lbd toolchain with nerdctl: %w", err)
+	}
+	return nil
+}

@@ -332,6 +332,7 @@ func ServerInstall(ctx *Context, opts struct {
 	Branch          string            `short:"b" long:"branch" description:"Branch to download if release not found"`
 	Force           bool              `short:"f" long:"force" description:"Overwrite existing service file"`
 	NoStart         bool              `long:"no-start" description:"Do not start the service after installation"`
+	DiskAccelerator bool              `long:"disk-accelerator" description:"Build and load the lbd kernel module before starting the server"`
 	WithoutCloud    bool              `long:"without-cloud" description:"Skip cloud registration setup"`
 	ClusterName     string            `short:"n" long:"name" description:"Cluster name for cloud registration"`
 	CloudURL        string            `short:"u" long:"url" description:"Cloud URL for registration" default:"https://miren.cloud"`
@@ -376,6 +377,11 @@ func ServerInstall(ctx *Context, opts struct {
 
 	if err := ensureReleaseBundlePresent(ctx, opts.Branch); err != nil {
 		return err
+	}
+	if opts.DiskAccelerator {
+		if err := installServerDiskAccelerator(ctx); err != nil {
+			return fmt.Errorf("installing disk accelerator: %w", err)
+		}
 	}
 
 	// Register with cloud unless --without-cloud is specified

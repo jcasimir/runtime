@@ -8,10 +8,8 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"slices"
 	"syscall"
 	"time"
@@ -136,11 +134,8 @@ func resolveRunnerContainerd(externalSocket string) (binaryPath, binDir string, 
 	if externalSocket != "" {
 		return "", "", nil
 	}
-	if releasePath := FindReleasePath(); releasePath != "" {
-		candidate := filepath.Join(releasePath, "containerd")
-		if _, statErr := os.Stat(candidate); statErr == nil {
-			return candidate, releasePath, nil
-		}
+	if candidate, releasePath := findBundledExecutable("containerd", FindReleasePath(), systemReleasePath); candidate != "" {
+		return candidate, releasePath, nil
 	}
 	binaryPath, err = exec.LookPath("containerd")
 	if err != nil {

@@ -1,22 +1,22 @@
 ---
 title: "miren disk accelerator install"
 sidebar_label: "disk accelerator install"
-description: "Build and load the lbd kernel module for this kernel"
+description: "Build and load the lbd kernel module on a running node"
 ---
 
 # miren disk accelerator install
 
-Build and load the lbd kernel module for this kernel
+Build and load the lbd kernel module on a running node
 
 ## Usage
 
 ```bash
-miren disk accelerator install <node> [flags]
+miren disk accelerator install [node] [flags]
 ```
 
 ## Arguments
 
-- `node` — Runner to install on (name, ID, or short ID)
+- `node` — Runner to install on (name, ID, or short ID); omit to infer this host's node
 
 ## Flags
 
@@ -31,6 +31,12 @@ miren disk accelerator install <node> [flags]
 - `--verbose, -v` — Enable verbose output
 
 ## Examples
+
+**Enable accelerator mode on this server or runner:**
+
+```bash
+sudo miren disk accelerator install
+```
 
 **Enable accelerator mode on a runner:**
 
