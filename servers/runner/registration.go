@@ -1084,7 +1084,8 @@ func (s *RegistrationServer) IssueSystemWorkloadToken(ctx context.Context, req *
 		return nil
 	}
 
-	if err := s.authorizeSystemWorkloadRequest(ctx, workload); err != nil {
+	runnerID, err := s.authorizeSystemWorkloadRequest(ctx, workload)
+	if err != nil {
 		s.Log.Warn("system workload token request denied", "system_workload", workload, "error", err)
 		results.SetError("not authorized to issue a token for this system workload")
 		return nil
@@ -1094,7 +1095,11 @@ func (s *RegistrationServer) IssueSystemWorkloadToken(ctx context.Context, req *
 	// caller-selected rather than coupled to the workload here. The receiving
 	// service verifies both the audience and expected workload before granting
 	// access.
-	opts := workloadidentity.TokenOptions{}
+	//
+	// The runner ID comes from the caller's certificate, not the request, so a
+	// service receiving the token can attribute what it carries to the runner
+	// that actually holds it.
+	opts := workloadidentity.TokenOptions{RunnerID: runnerID}
 	if args.HasAudience() {
 		opts.Audience = args.Audience()
 	}
@@ -1119,33 +1124,36 @@ func (s *RegistrationServer) IssueSystemWorkloadToken(ctx context.Context, req *
 // still registered. The registration check bounds a decommissioned runner's
 // access, since caauth has no revocation and its certificate stays valid until
 // it expires.
-func (s *RegistrationServer) authorizeSystemWorkloadRequest(ctx context.Context, workload workloadidentity.SystemWorkload) error {
+//
+// It returns the verified runner ID, which is empty only when authentication
+// is disabled and there is no caller to identify.
+func (s *RegistrationServer) authorizeSystemWorkloadRequest(ctx context.Context, workload workloadidentity.SystemWorkload) (string, error) {
 	if !slices.Contains(runnerSystemWorkloads, workload) {
-		return fmt.Errorf("system workload %q is not one a runner may request", workload)
+		return "", fmt.Errorf("system workload %q is not one a runner may request", workload)
 	}
 
 	identity, err := requireRunnerCertIdentity(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if identity == nil {
-		return nil
+		return "", nil
 	}
 
 	runnerID, ok := strings.CutPrefix(identity.Subject, "runner-")
 	if !ok || runnerID == "" {
-		return fmt.Errorf("caller %q is not a runner certificate", identity.Subject)
+		return "", fmt.Errorf("caller %q is not a runner certificate", identity.Subject)
 	}
 
 	registered, err := s.runnerIDRegistered(ctx, runnerID)
 	if err != nil {
-		return fmt.Errorf("verifying registration of runner %s: %w", runnerID, err)
+		return "", fmt.Errorf("verifying registration of runner %s: %w", runnerID, err)
 	}
 	if !registered {
-		return fmt.Errorf("runner %s is not registered", runnerID)
+		return "", fmt.Errorf("runner %s is not registered", runnerID)
 	}
 
-	return nil
+	return runnerID, nil
 }
 
 // runnerCertName is the client-certificate CommonName issued to a runner during

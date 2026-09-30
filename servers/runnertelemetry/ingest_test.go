@@ -26,7 +26,8 @@ func testLogger() *slog.Logger {
 // the part that keeps a token minted for another service from being replayed
 // here.
 type stubVerifier struct {
-	err error
+	err      error
+	runnerID string
 
 	gotToken    string
 	gotAudience string
@@ -41,6 +42,7 @@ func (v *stubVerifier) VerifySystemWorkloadToken(token, audience string, workloa
 	return &workloadidentity.WorkloadClaims{
 		IdentityType:   workloadidentity.IdentityTypeSystem,
 		SystemWorkload: workload,
+		RunnerID:       v.runnerID,
 	}, nil
 }
 
@@ -268,7 +270,8 @@ func TestMetricsHandlerSkipsDottedClusterLabel(t *testing.T) {
 
 // The shipping sink stamps the coordinator's runner ID on a point without
 // one, so a point that does not name a runner, or that names the control
-// process, would ship as the coordinator's own series.
+// process, would ship as the coordinator's own series. This is the fallback
+// for a token that names no runner, where the label is all there is to go on.
 func TestMetricsHandlerSkipsPointsNotLabeledAsARunner(t *testing.T) {
 	op := &recordingWriter{}
 	h := runnertelemetry.NewMetricsHandler(testLogger(), &stubVerifier{}, newBackend(t).address(), op)
@@ -283,6 +286,52 @@ func TestMetricsHandlerSkipsPointsNotLabeledAsARunner(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 	require.Len(t, op.points, 1)
 	require.Equal(t, 2.0, op.points[0].Value)
+}
+
+// A token that names its runner settles attribution: the label a point
+// carries is overwritten, so a runner cannot file its series under another's
+// name, and a point with no label is stamped rather than dropped.
+func TestMetricsHandlerAttributesOperationalPointsToVerifiedRunner(t *testing.T) {
+	op := &recordingWriter{}
+	h := runnertelemetry.NewMetricsHandler(testLogger(), &stubVerifier{runnerID: "r1"}, newBackend(t).address(), op)
+
+	rec := postStream(h, "a-token", runnertelemetry.StreamOperational, strings.Join([]string{
+		`go_goroutines{entity="miren/runner",miren_runner="r2"} 1 1`,
+		`go_goroutines{entity="miren/runner"} 2 1`,
+		`go_goroutines{entity="miren/runner",miren_runner="r1"} 3 1`,
+	}, "\n")+"\n")
+
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Len(t, op.points, 3)
+	for _, point := range op.points {
+		require.Equal(t, map[string]string{"entity": "miren/runner", "miren_runner": "r1"}, point.Labels)
+	}
+}
+
+// A verified runner is still not the coordinator, so naming the control
+// process is refused whatever the token says.
+func TestMetricsHandlerRefusesControlEntityFromVerifiedRunner(t *testing.T) {
+	op := &recordingWriter{}
+	h := runnertelemetry.NewMetricsHandler(testLogger(), &stubVerifier{runnerID: "r1"}, newBackend(t).address(), op)
+
+	rec := postStream(h, "a-token", runnertelemetry.StreamOperational,
+		`process_start_time_seconds{entity="miren/control",miren_runner="r1"} 1 1`+"\n")
+
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Empty(t, op.points)
+}
+
+// Relabeling and stripping the cluster label happen together on one point.
+func TestMetricsHandlerStripsClusterLabelWhileAttributing(t *testing.T) {
+	op := &recordingWriter{}
+	h := runnertelemetry.NewMetricsHandler(testLogger(), &stubVerifier{runnerID: "r1"}, newBackend(t).address(), op)
+
+	rec := postStream(h, "a-token", runnertelemetry.StreamOperational,
+		`go_goroutines{miren_cluster="someone-else",miren_runner="r2"} 1 1`+"\n")
+
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Len(t, op.points, 1)
+	require.Equal(t, map[string]string{"miren_runner": "r1"}, op.points[0].Labels)
 }
 
 // A refused write is not refused back to the runner, whose writer would keep

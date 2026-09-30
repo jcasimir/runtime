@@ -167,8 +167,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.verifier.VerifySystemWorkloadToken(token, Audience,
-		workloadidentity.SystemWorkloadTelemetryWriter); err != nil {
+	claims, err := h.verifier.VerifySystemWorkloadToken(token, Audience,
+		workloadidentity.SystemWorkloadTelemetryWriter)
+	if err != nil {
 		h.log.Warn("telemetry ingest rejected", "reason", "invalid workload token", "error", err)
 		http.Error(w, "invalid workload token", http.StatusUnauthorized)
 		return
@@ -177,7 +178,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body := http.MaxBytesReader(w, r.Body, maxIngestBytes)
 
 	if h.operational != nil && r.Header.Get(StreamHeader) == StreamOperational {
-		h.writeOperational(w, r, body)
+		h.writeOperational(w, r, body, claims.RunnerID)
 		return
 	}
 
@@ -233,6 +234,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // stripping it here leaves the coordinator's stamp as the only source.
 const clusterLabel = "miren_cluster"
 
+// runnerLabel names the runner a series belongs to. When the runner's token
+// says which runner it is, that is written over whatever the point carried.
+const runnerLabel = "miren_runner"
+
 const (
 	// maxOperationalPoints bounds what one operational batch may make the
 	// coordinator hold in memory. A runner emits a few dozen operational
@@ -247,7 +252,7 @@ const (
 	operationalChunk = 1000
 )
 
-func (h *handler) writeOperational(w http.ResponseWriter, r *http.Request, body io.Reader) {
+func (h *handler) writeOperational(w http.ResponseWriter, r *http.Request, body io.Reader, runnerID string) {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		http.Error(w, "reading telemetry failed", http.StatusBadRequest)
@@ -272,26 +277,52 @@ func (h *handler) writeOperational(w http.ResponseWriter, r *http.Request, body 
 			"lines", parsed.Invalid, "first_error", parsed.FirstInvalid)
 	}
 
+	// A token minted before the coordinator stamped runner IDs, or on a
+	// cluster with authentication disabled, does not say which runner sent it.
+	// Such a batch falls back to trusting the runner's own label rather than
+	// being dropped. The first case only lasts as long as a token minted by
+	// the previous coordinator, and dropping instead would open a gap in every
+	// runner's series right after a coordinator upgrade, which is exactly when
+	// the restart and build-skew rules are looking.
+	//
+	// That window is an hour for a runner's own telemetry client, which asks
+	// for one, but the coordinator honors any requested lifetime up to
+	// workloadidentity.MaxTTL. A runner set on choosing its own label could
+	// have asked the previous coordinator for a token that long, so MaxTTL is
+	// the real bound, not the hour.
+	if runnerID == "" {
+		h.log.Debug("operational metrics attributed by label", "reason", "token names no runner")
+	}
+
 	points := make([]metrics.MetricPoint, 0, len(parsed.Points))
-	impersonating := 0
+	impersonating, relabeled := 0, 0
 	for _, point := range parsed.Points {
-		// The telemetry token proves the batch came from some runner in this
-		// cluster, not which one, so the labels identifying a runner are the
-		// runner's own claim. What this can enforce is that the claim is a
-		// runner's: the shipping sink fills in the coordinator's runner ID on
-		// a point that has none, so a point without one, or one naming the
-		// control process, would ship as the coordinator's own series and feed
-		// the coordinator's restart and build-skew rules.
-		if point.Labels["entity"] == metrics.EntityControl || point.Labels["miren_runner"] == "" {
+		// A point naming the control process would ship as the coordinator's
+		// own series and feed the coordinator's restart and build-skew rules,
+		// whichever runner it claims to be from.
+		//
+		// Without a verified runner ID, a point with no runner label is refused
+		// too: the shipping sink fills in the coordinator's runner ID on a
+		// point that has none, so it would pass as the coordinator's as well.
+		if point.Labels["entity"] == metrics.EntityControl || (runnerID == "" && point.Labels[runnerLabel] == "") {
 			impersonating++
 			continue
 		}
-		if _, ok := point.Labels[clusterLabel]; ok {
-			labels := make(map[string]string, len(point.Labels))
+
+		_, hasCluster := point.Labels[clusterLabel]
+		stampRunner := runnerID != "" && point.Labels[runnerLabel] != runnerID
+		if hasCluster || stampRunner {
+			if stampRunner && point.Labels[runnerLabel] != "" {
+				relabeled++
+			}
+			labels := make(map[string]string, len(point.Labels)+1)
 			for name, value := range point.Labels {
 				if name != clusterLabel {
 					labels[name] = value
 				}
+			}
+			if runnerID != "" {
+				labels[runnerLabel] = runnerID
 			}
 			point.Labels = labels
 		}
@@ -300,6 +331,10 @@ func (h *handler) writeOperational(w http.ResponseWriter, r *http.Request, body 
 	if impersonating > 0 {
 		h.log.Warn("operational metrics skipped", "reason", "not labeled as a runner",
 			"points", impersonating)
+	}
+	if relabeled > 0 {
+		h.log.Warn("operational metrics relabeled", "reason", "labeled as a different runner",
+			"points", relabeled, "runner", runnerID)
 	}
 	if parsed.OverLimit > 0 {
 		h.log.Warn("operational metrics skipped", "reason", "batch over limit",
