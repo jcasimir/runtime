@@ -94,7 +94,7 @@ func newStartup(runtime *Runtime, options StartOptions) *startup {
 	ipDiscovery := newIPDiscoveryBoot(ipDiscoveryInputs(options))
 	registration := newRegistrationBoot(registrationInputs(options))
 	workloadIdentity := newWorkloadIdentityBoot(workloadIdentityInputs(options), registration.output)
-	tracing := newTracingBoot(tracingInputs(options), registration.output)
+	tracing := newTracingBoot(tracingInputs(options), registration.output, workloadIdentity.output)
 	containerdConfig := containerdBootConfig(options)
 	containerdConfig.ReportVersion = instance.SetComponent
 	containerd := containerdcomp.NewBoot("containerd", containerdConfig)
@@ -107,7 +107,7 @@ func newStartup(runtime *Runtime, options StartOptions) *startup {
 	etcd := newEtcdBoot(etcdInputs(options), ipDiscovery.output, containerd.Output, observability.output, dataRestore.component)
 	network := newNetworkBoot(networkInputs(options), etcd.output, observability.output)
 	registryHostMapping := newRegistryHostMappingBoot(registryHostMappingInputs(hostMapper), network.output)
-	buildkit := newBuildkitBoot(buildkitInputs(options), containerd.Output, registryHostMapping.output, network.output, observability.output)
+	buildkit := newBuildkitBoot(buildkitInputs(options), containerd.Output, registryHostMapping.output, network.output, observability.output, tracing.output)
 	foundation := newFoundationBoot(
 		foundationConfig(options, resolver, secretRegistry, address),
 		ipDiscovery.output,
@@ -117,6 +117,7 @@ func newStartup(runtime *Runtime, options StartOptions) *startup {
 		buildkit.output,
 		registryHostMapping.output,
 		observability.output,
+		tracing.output,
 	)
 	appData := newAppDataBoot(foundation.output)
 	secretStore := newSecretStoreBoot(foundation.output)
