@@ -47,6 +47,7 @@ func installServerDiskAccelerator(ctx *Context) error {
 	if err != nil {
 		return fmt.Errorf("checking containerd socket %s: %w", socket, err)
 	}
+	startedContainerd := !listening
 	if !listening {
 		binary := filepath.Join(releaseDir, "containerd")
 		if _, err := os.Stat(binary); err != nil {
@@ -86,6 +87,9 @@ func installServerDiskAccelerator(ctx *Context) error {
 			return fmt.Errorf("checking BuildKit socket %s: %w", buildkitSocket, err)
 		}
 		if !listening {
+			if !startedContainerd {
+				return fmt.Errorf("BuildKit is not listening at %s while server containerd is running; check the server's BuildKit socket configuration or stop the server before installing the disk accelerator", buildkitSocket)
+			}
 			ctx.Begin("Starting temporary Miren BuildKit")
 			builder := buildkit.NewComponent(ctx.Log, cc, ctrbuild.DefaultNamespace, dataPath)
 			if err := builder.Start(ctx, buildkit.Config{SocketDir: filepath.Dir(buildkitSocket)}); err != nil {

@@ -72,12 +72,12 @@ func TestLocalDiskAcceleratorClusterIgnoresRemoteLocalAlias(t *testing.T) {
 	require.NoError(t, remote.SaveTo(filepath.Join(home, "remote.yaml")))
 	leafDir := filepath.Join(home, ".config/miren/clientconfig.d")
 	require.NoError(t, os.MkdirAll(leafDir, 0700))
-	leaf := "clusters:\n  local:\n    hostname: remote.example:8443\n    ca_cert: installed-ca\n    client_cert: local-cert\n    client_key: local-key\n"
+	leaf := "clusters:\n  local:\n    hostname: localhost:9555\n    ca_cert: installed-ca\n    client_cert: local-cert\n    client_key: local-key\n"
 	require.NoError(t, os.WriteFile(filepath.Join(leafDir, "50-local.yaml"), []byte(leaf), 0600))
 	ctx := &Context{}
 	cluster, err := localDiskAcceleratorCluster(ctx, "local", serverConfig)
 	require.NoError(t, err)
-	require.Equal(t, "127.0.0.1:9443", cluster.Hostname)
+	require.Equal(t, "127.0.0.1:9555", cluster.Hostname)
 	require.Equal(t, "installed-ca", cluster.CACert)
 	require.Equal(t, "local-cert", cluster.ClientCert)
 

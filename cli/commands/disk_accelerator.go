@@ -56,7 +56,7 @@ func localDiskAcceleratorCluster(ctx *Context, name, serverConfigPath string) (*
 		return nil, fmt.Errorf("reading installed server configuration: %w", err)
 	}
 	address := runtimeserver.LocalClientAddress(ctx.Log, server.Server.GetAddress())
-	host, port, err := net.SplitHostPort(address)
+	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("invalid local server address %q: %w", address, err)
 	}
@@ -77,6 +77,10 @@ func localDiskAcceleratorCluster(ctx *Context, name, serverConfigPath string) (*
 	}
 	if string(ca) != cluster.CACert || cluster.ClientCert == "" || cluster.ClientKey == "" {
 		return nil, fmt.Errorf("local server credentials do not match the installed server; pass a node name or ID with a configured cluster")
+	}
+	_, port, err := net.SplitHostPort(cluster.Hostname)
+	if err != nil {
+		return nil, fmt.Errorf("invalid local server credential address %q: %w", cluster.Hostname, err)
 	}
 	return &clientconfig.ClusterConfig{
 		Hostname:   net.JoinHostPort(host, port),
