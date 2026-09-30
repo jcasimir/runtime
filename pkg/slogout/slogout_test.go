@@ -846,3 +846,39 @@ func TestUnsourcedWriterCountsAsMiren(t *testing.T) {
 
 	assert.Equal(t, uint64(1), counts.Load(logcount.SourceMiren, 2))
 }
+
+func TestBuildkitLogrusLines(t *testing.T) {
+	var buf bytes.Buffer
+	logger, counts := countingLogger(&buf)
+
+	var streams cio.Streams
+	loggerStreams(logger, "buildkit", WithKeyValueParsing(), WithMaxLevel(slog.LevelInfo))(&streams)
+
+	lines := strings.Join([]string{
+		`time="2026-09-28T18:00:00Z" level=debug msg="fetch response received" response.header.content-length=0 response.status="404 Not Found"`,
+		`time="2026-09-28T18:00:01Z" level=error msg="/moby.buildkit.v1.Control/Solve returned error: rpc error: code = Canceled desc = context canceled"`,
+		`2026/09/28 18:00:02 failed to upload metrics: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found)`,
+	}, "\n") + "\n"
+	_, err := streams.Stderr.Write([]byte(lines))
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.NotContains(t, out, "fetch response received", "debug chatter stays below Info")
+	assert.Contains(t, out, "orig-level=ERROR")
+	assert.Contains(t, out, "failed to upload metrics")
+
+	assert.Zero(t, counts.Load(logcount.SourceBuildkit, 0), "filtered lines are not counted")
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceBuildkit, 1))
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceBuildkit, 3))
+}
+
+func TestKeyValueKeepsDottedKeys(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	writer := newLogWriter(logger, slog.LevelInfo, LoggerOpts{ParseKeyValue: true})
+	_, err := writer.Write([]byte(`level=debug msg=fetched response.header.content-length=0` + "\n"))
+	require.NoError(t, err)
+
+	assert.Contains(t, buf.String(), "response.header.content-length=0")
+}
