@@ -352,6 +352,7 @@ func bridgeInputPorts(apiPort int) []bridgeInputPort {
 	ports := []bridgeInputPort{
 		{53, []string{"udp", "tcp"}, "container DNS resolution"},
 		{5000, []string{"tcp"}, "buildkit pushing images to the registry"},
+		{TokenServerPort, []string{"tcp"}, "workload identity tokens and metrics push"},
 	}
 
 	if apiPort > 0 {
