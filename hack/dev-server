@@ -3,6 +3,13 @@
 
 set -e
 
+# Run from the repo root so ./bin/miren resolves no matter where we were
+# invoked from (a restart from a test app's directory used to fail to start).
+# SELF is resolved first so restart can re-invoke us after the cd, whatever
+# relative path the caller used.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+cd "$(dirname "$SELF")/.."
+
 PIDFILE="/tmp/miren-server.pid"
 LOGFILE="/tmp/miren-server.log"
 
@@ -177,7 +184,10 @@ case "${1:-}" in
       fi
       echo "Sending SIGUSR1 to server (PID $PID) for graceful restart..."
       kill -USR1 "$PID"
-      if ! wait_for_exit "$PID" 15; then
+      # Same window as stop: a graceful restart drains open CLI connections
+      # first and can run well past 15s, and escalating to SIGTERM loses the
+      # outboard-preserving restart this path exists for.
+      if ! wait_for_exit "$PID" "$STOP_TIMEOUT"; then
         echo "Warning: Server did not exit after SIGUSR1, sending SIGTERM..."
         kill "$PID"
         if ! wait_for_exit "$PID" "$STOP_TIMEOUT" && ! force_kill "$PID"; then
@@ -191,7 +201,7 @@ case "${1:-}" in
       echo "Server not running"
     fi
     sleep 1
-    $0 start
+    "$SELF" start
     ;;
 
   status)
