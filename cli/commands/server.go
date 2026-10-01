@@ -28,10 +28,16 @@ func Server(ctx *Context, opts serverconfig.CLIFlags) error {
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
+	if err := cfg.ResolveDeprecatedConfig(); err != nil {
+		return fmt.Errorf("configuration validation failed: %w", err)
+	}
 	if err := cfg.ValidateIngressCoherence(); err != nil {
 		return fmt.Errorf("configuration validation failed: %w", err)
 	}
-	if err := cfg.ValidateMetricsCoherence(); err != nil {
+	if err := cfg.ValidateTelemetryCoherence(); err != nil {
+		return fmt.Errorf("configuration validation failed: %w", err)
+	}
+	if err := cfg.ValidateTelemetryEnvironment(); err != nil {
 		return fmt.Errorf("configuration validation failed: %w", err)
 	}
 	cfg.WarnDeprecatedConfig(ctx.Log)

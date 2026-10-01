@@ -118,6 +118,34 @@ This serves a frontend build written to `/app/dist`. If the app also declares a
 service, requests for files that do not exist fall through to that service; a
 static-only app returns 404 instead.
 
+### Static error pages {#static-error-pages}
+
+An app can override the cluster's HTML error page using a template in its
+versioned static artifact:
+
+```toml
+[static]
+dir = "/app/public"
+error_page = "errors/error.html"
+```
+
+`error_page` is relative to `static.dir` and must name a file in the build
+output (up to 128 KiB). Deployment fails if that file is missing, too large,
+or not a valid app error template. App templates may use `if` and `with`, but
+not `define`, `block`, `template`, or `range` actions. The only permitted
+functions are `brandLogo`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `and`, `or`, `not`,
+and `len`; this prevents expressions from growing without writing output in
+the shared ingress process. Cluster templates are not subject to this restriction.
+The file is published as a static file, so do not put
+secrets in it. The page is rendered by ingress even when the app sandbox cannot
+start. If your app needs a web process, explicitly declare `[services.web]`:
+setting `static.dir` disables the automatically synthesized web service.
+An app-specific page wins over the cluster page when an app version is resolved;
+the active version's page is also used for a maintenance window. For missing
+routes or failures before version resolution, ingress uses the cluster page.
+See [custom error pages](./server-config.md#custom-error-pages) for template
+variables, fallback behavior, and content negotiation.
+
 When no Dockerfile, image, or supported stack is detected, Miren treats the
 uploaded source tree as `/app` and archives `static.dir` directly. Thus
 `dir = "/app/public"` serves a repository's `public/` directory without building
@@ -317,7 +345,7 @@ shutdown_timeout = "10s"
 | `requests_per_instance` | int | Target concurrent requests per instance (auto mode only) | `10` |
 | `scale_down_delay` | duration | Time to wait before removing idle instances (auto mode only) | `"15m"` |
 | `num_instances` | int | Exact number of instances to run (fixed mode only) | `1` |
-| `shutdown_timeout` | duration | Time to wait for graceful shutdown during redeploy | `"10s"` |
+| `shutdown_timeout` | duration | Time a stopping instance gets to exit after `SIGTERM` before it is killed. A new value takes effect from the next deploy; see [Graceful Shutdown](./services.md#graceful-shutdown) | `"10s"` |
 
 :::note[Validation]
 - `mode` must be `"auto"` or `"fixed"`.

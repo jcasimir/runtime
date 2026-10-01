@@ -46,8 +46,8 @@ miren server [flags]
 - `--ingress-trusted-proxy-hops` — Number of trusted proxies immediately in front of Miren when ingress.mode is behind-proxy-http. Used to select the visitor address from X-Forwarded-For.
 - `--ips` — Additional IPs assigned to the server cert
 - `--labs` — Comma-separated list of Miren Labs features to enable/disable. Prefix with - to disable.
-- `--metrics-remote-write-audience` — Workload identity audience for the managed metrics destination
-- `--metrics-remote-write-url` — Prometheus Remote Write destination for managed application metrics
+- `--metrics-remote-write-audience` — Deprecated: use --telemetry-metrics-audience
+- `--metrics-remote-write-url` — Deprecated: use --telemetry-metrics-remote-write-url
 - `--mode, -m` — Server mode: standalone (default), distributed (experimental)
 - `--release-path` — Path to release directory containing binaries
 - `--runner-address` — Runner address (host:port). For IPv6 use brackets, e.g. "[::1]:8444".
@@ -63,6 +63,10 @@ miren server [flags]
 - `--start-victorialogs` — Start embedded VictoriaLogs server
 - `--start-victoriametrics` — Start embedded VictoriaMetrics server
 - `--stop-sandboxes-on-shutdown` — Stop all sandboxes when server shuts down (useful in development)
+- `--telemetry-metrics-audience` — Workload identity audience for the metrics destination
+- `--telemetry-metrics-remote-write-url` — Prometheus Remote Write destination for managed application metrics
+- `--telemetry-traces-audience` — Authenticate trace export with a workload identity token for this audience
+- `--telemetry-traces-endpoint` — OTLP/HTTP base URL for traces (defaults to OTEL_EXPORTER_OTLP_ENDPOINT)
 - `--victorialogs-addr` — VictoriaLogs address (when not using embedded)
 - `--victorialogs-http-port` — VictoriaLogs HTTP port in embedded mode
 - `--victorialogs-retention` — VictoriaLogs retention period (e.g. 30d, 2w, 1y)
@@ -96,4 +100,4 @@ miren server --mode standalone
 - [`miren server status`](./server-status.md) — Show miren service status
 - [`miren server uninstall`](./server-uninstall.md) — Remove systemd service for miren server
 - [`miren server unregister`](./server-unregister.md) — Detach this cluster from miren.cloud
-- [`miren server upgrade`](./server-upgrade.md) — Upgrade miren server (deprecated: use 'sudo miren upgrade')
+- [`miren server upgrade`](./server-upgrade.md) — Upgrade miren server (deprecated: use 'miren upgrade')

@@ -330,6 +330,22 @@ func applyCLIFlags(cfg *Config, flags *CLIFlags) {
 		cfg.TLS.StandardTLS = flags.TLSConfigStandardTLS
 	}
 
+	if flags.TelemetryMetricsConfigRemoteWriteURL != nil && *flags.TelemetryMetricsConfigRemoteWriteURL != "" {
+		cfg.Telemetry.Metrics.RemoteWriteURL = flags.TelemetryMetricsConfigRemoteWriteURL
+	}
+
+	if flags.TelemetryMetricsConfigWorkloadIdentityAudience != nil && *flags.TelemetryMetricsConfigWorkloadIdentityAudience != "" {
+		cfg.Telemetry.Metrics.WorkloadIdentityAudience = flags.TelemetryMetricsConfigWorkloadIdentityAudience
+	}
+
+	if flags.TelemetryTracesConfigEndpoint != nil && *flags.TelemetryTracesConfigEndpoint != "" {
+		cfg.Telemetry.Traces.Endpoint = flags.TelemetryTracesConfigEndpoint
+	}
+
+	if flags.TelemetryTracesConfigWorkloadIdentityAudience != nil && *flags.TelemetryTracesConfigWorkloadIdentityAudience != "" {
+		cfg.Telemetry.Traces.WorkloadIdentityAudience = flags.TelemetryTracesConfigWorkloadIdentityAudience
+	}
+
 	if flags.VictoriaLogsConfigAddress != nil && *flags.VictoriaLogsConfigAddress != "" {
 		cfg.Victorialogs.Address = flags.VictoriaLogsConfigAddress
 	}

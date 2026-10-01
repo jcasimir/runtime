@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,6 +57,9 @@ type Config struct {
 	// DNSNameservers are the nameserver addresses build steps resolve against.
 	// See generateConfig for why we override buildkit's default here.
 	DNSNameservers []string
+
+	// Traces is where buildkitd exports its spans.
+	Traces TracesExport
 }
 
 // Component manages a persistent BuildKit daemon as a containerd container,
@@ -72,6 +76,7 @@ type Component struct {
 	socketPath    string
 	socketDir     string
 	hostsPath     string             // path to custom /etc/hosts file for the container
+	otelEnv       []string           // OTEL_* env buildkitd runs with
 	external      bool               // true if connecting to external daemon (no container management)
 	monitorCancel context.CancelFunc // cancels the task exit-monitor goroutine on intentional stop
 }
@@ -101,6 +106,13 @@ func NewExternalComponent(log *slog.Logger, socketPath string) *Component {
 		socketPath: socketPath,
 		external:   true,
 	}
+}
+
+// buildkitd runs with debug = true and logs through logrus, so its lines
+// carry their own level=. Parsing it keeps that debug chatter at Debug
+// instead of flooding Info, and lets buildkit's real errors count as errors.
+var buildkitLogOptions = []slogout.LoggerOption{
+	slogout.WithKeyValueParsing(), slogout.WithMaxLevel(slog.LevelInfo),
 }
 
 // Start starts the BuildKit daemon container.
@@ -175,11 +187,19 @@ func (c *Component) Start(ctx context.Context, config Config) error {
 		c.Log.Info("updated buildkit hosts file with registry IP", "ip", config.RegistryIP)
 	}
 
+	c.otelEnv = otelEnvForBuildkitd(os.Getenv, config.Traces)
+
 	// Check if container already exists
 	existingContainer, err := c.CC.LoadContainer(ctx, buildkitContainerName)
 	if err == nil {
-		c.Log.Info("found existing buildkit container, restarting it", "container_id", existingContainer.ID())
-		return c.restartExistingContainer(ctx, existingContainer, dataPath)
+		retired, err := c.retireIfOTelEnvChanged(ctx, existingContainer)
+		if err != nil {
+			return err
+		}
+		if !retired {
+			c.Log.Info("found existing buildkit container, restarting it", "container_id", existingContainer.ID())
+			return c.restartExistingContainer(ctx, existingContainer, dataPath)
+		}
 	}
 
 	c.Log.Info("starting buildkit daemon", "data_path", dataPath, "socket_path", c.socketPath)
@@ -193,7 +213,7 @@ func (c *Component) Start(ctx context.Context, config Config) error {
 	c.container = container
 
 	// Create the task with structured logging.
-	task, err := container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit"))
+	task, err := container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit", buildkitLogOptions...))
 	if err != nil {
 		container.Delete(ctx, containerd.WithSnapshotCleanup)
 		c.container = nil
@@ -429,8 +449,9 @@ func (c *Component) SetRegistryIP(ip string) error {
 }
 
 func (c *Component) createContainer(ctx context.Context, image containerd.Image, dataPath, configPath, hostsPath string) (containerd.Container, error) {
-	// The daemon shares the host network namespace so the collector is reachable.
-	otelEnv := otelEnvForBuildkitd(os.Getenv)
+	// The daemon shares the host network namespace so the collector, or the
+	// server's loopback relay in front of it, is reachable.
+	otelEnv := c.otelEnv
 
 	opts := []oci.SpecOpts{
 		oci.WithImageConfig(image),
@@ -495,6 +516,55 @@ func (c *Component) createContainer(ctx context.Context, image containerd.Image,
 	return container, nil
 }
 
+// retireIfOTelEnvChanged deletes an existing container whose OTel env differs
+// from what buildkitd should run with now, reporting whether it did.
+//
+// A restart otherwise reuses the container, and its env is part of the spec.
+// Without this, whatever OTEL_EXPORTER_OTLP_HEADERS the server had when the
+// container was first created would ride along indefinitely, which is exactly
+// the static credential an operator removes when moving traces to workload
+// identity. The build cache lives on the bind-mounted data path, so a
+// recreated container keeps it.
+func (c *Component) retireIfOTelEnvChanged(ctx context.Context, container containerd.Container) (bool, error) {
+	spec, err := container.Spec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reading existing buildkit container spec: %w", err)
+	}
+	var current []string
+	if spec.Process != nil {
+		current = otelOnly(spec.Process.Env)
+	}
+	if slices.Equal(current, otelOnly(c.otelEnv)) {
+		return false, nil
+	}
+
+	c.Log.Info("buildkit trace export settings changed, recreating its container", "container_id", container.ID())
+	if task, err := container.Task(ctx, nil); err == nil {
+		if err := c.stopTask(ctx, task); err != nil {
+			return false, fmt.Errorf("stopping buildkit task before recreating its container: %w", err)
+		}
+	} else if !errdefs.IsNotFound(err) {
+		return false, fmt.Errorf("loading buildkit task before recreating its container: %w", err)
+	}
+	c.container = container
+	c.deleteContainerWithRetry(ctx)
+	c.container = nil
+	return true, nil
+}
+
+// otelOnly returns the sorted OTEL_* entries of env, which is all of what
+// otelEnvForBuildkitd contributes and none of what the image does.
+func otelOnly(env []string) []string {
+	var out []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "OTEL_") {
+			out = append(out, kv)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 func (c *Component) restartExistingContainer(ctx context.Context, container containerd.Container, dataPath string) error {
 	c.container = container
 
@@ -509,7 +579,7 @@ func (c *Component) restartExistingContainer(ctx context.Context, container cont
 		func(ctx context.Context, task containerd.Task) error { return c.stopTask(ctx, task) },
 		func(ctx context.Context, id string) error { return base.ReapLeakedTask(ctx, c.CC, id) },
 		func(ctx context.Context) (containerd.Task, error) {
-			return container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit"))
+			return container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit", buildkitLogOptions...))
 		})
 	if err != nil {
 		c.container = nil

@@ -34,8 +34,12 @@ normalize_args() {
   for arg in "$@"; do
     # Check if this looks like a package path (not a flag starting with -)
     if [[ ! "$arg" =~ ^- ]] && [[ "$arg" =~ / ]]; then
+      # x/ is its own module, which a ./ path from the root cannot reach,
+      # so its packages keep their import path.
+      if [[ "$arg" =~ ^miren\.dev/runtime/x(/|$) ]]; then
+        :
       # If it starts with the module path, convert to relative
-      if [[ "$arg" =~ ^miren\.dev/runtime/ ]]; then
+      elif [[ "$arg" =~ ^miren\.dev/runtime/ ]]; then
         arg="./${arg#miren.dev/runtime/}"
       # If it doesn't start with ./ and is an actual directory path (or pattern), add ./
       elif [[ ! "$arg" =~ ^\. ]]; then

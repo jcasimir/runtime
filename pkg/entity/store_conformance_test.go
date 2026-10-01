@@ -1221,10 +1221,10 @@ func TestStoreConformance_ListIndexEntitiesPage(t *testing.T) {
 	})
 }
 
-// TestStoreConformance_Sessions pins the minimal session lifecycle both
-// backends support (create yields a non-empty token; ping and revoke succeed).
-// MockStore's sessions are stubs that do not enforce scoping or expiry, so
-// anything beyond this shared contract is left out by design.
+// TestStoreConformance_Sessions pins the session lifecycle: a fresh session
+// pings, and once revoked it reports the lease as gone, which is what the
+// runner's keepalive watches for to re-establish its session (MIR-1305). The
+// mock has no clock, so expiry by TTL is the one part left to the real store.
 func TestStoreConformance_Sessions(t *testing.T) {
 	runStoreConformance(t, func(t *testing.T, store Store) {
 		ctx := t.Context()
@@ -1233,25 +1233,225 @@ func TestStoreConformance_Sessions(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotEmpty(t, token, "CreateSession must return a token")
 
+		other, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+		assert.NotEqual(t, token, other, "each session must get its own token")
+
 		assert.NoError(t, store.PingSession(ctx, token), "ping on a fresh session must succeed")
 		assert.NoError(t, store.RevokeSession(ctx, token), "revoke on a session must succeed")
+
+		err = store.PingSession(ctx, token)
+		require.Error(t, err, "pinging a revoked session must fail")
+		assert.Contains(t, err.Error(), "lease not found")
+		assert.NoError(t, store.PingSession(ctx, other), "revoking one session must leave another alone")
 	})
 }
 
-// TestStoreConformance_ListSessionEntities documents that EtcdStore scopes
-// session entities (a fresh session owns none), while MockStore's stub returns
-// every entity in the store regardless of session. Anything relying on session
-// scoping must use the real store.
+// TestStoreConformance_ListSessionEntities pins session scoping: a session
+// owns the entities bound to it and those it stored session attributes on,
+// and nothing else.
 func TestStoreConformance_ListSessionEntities(t *testing.T) {
 	runStoreConformance(t, func(t *testing.T, store Store) {
-		skipMock(t, store, "ListSessionEntities returns all entities and does not model session scoping")
-
 		ctx := t.Context()
+		applySessionIndexSchema(t, store)
+
 		token, err := store.CreateSession(ctx, 60)
 		require.NoError(t, err)
 
 		ids, err := store.ListSessionEntities(ctx, token)
 		require.NoError(t, err)
 		assert.Empty(t, ids, "a fresh session owns no session-scoped entities")
+
+		_, err = store.CreateEntity(ctx, New(Any(Ident, "conf-sess-durable"), String(Id("conf/kind"), "runner")))
+		require.NoError(t, err)
+		bound, err := store.CreateEntity(ctx, New(Any(Ident, "conf-sess-bound"), String(Id("conf/kind"), "runner")),
+			BondToSession(token))
+		require.NoError(t, err)
+		asserted, err := store.CreateEntity(ctx, New(Any(Ident, "conf-sess-asserted"), String(Id("conf/state"), "ready")),
+			WithSession(token))
+		require.NoError(t, err)
+
+		ids, err = store.ListSessionEntities(ctx, token)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []Id{bound.Id(), asserted.Id()}, ids)
+
+		require.NoError(t, store.RevokeSession(ctx, token))
+		ids, err = store.ListSessionEntities(ctx, token)
+		require.NoError(t, err)
+		assert.Empty(t, ids, "a revoked session owns nothing")
+	})
+}
+
+// applySessionIndexSchema registers an indexed attribute and a session
+// attribute, so a session write gives the indexed value a presence marker.
+func applySessionIndexSchema(t *testing.T, store Store) {
+	t.Helper()
+	ctx := t.Context()
+
+	_, err := store.CreateEntity(ctx, New(
+		Ident, "conf/kind",
+		Doc, "indexed durable string",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Index, true,
+	))
+	require.NoError(t, err)
+
+	_, err = store.CreateEntity(ctx, New(
+		Ident, "conf/state",
+		Doc, "session-scoped string",
+		Cardinality, CardinalityOne,
+		Type, TypeStr,
+		Session, true,
+	))
+	require.NoError(t, err)
+}
+
+// sessionStates returns every conf/state value the stored entity carries.
+func sessionStates(t *testing.T, store Store, id Id) []string {
+	t.Helper()
+	ent, err := store.GetEntity(t.Context(), id)
+	require.NoError(t, err)
+	var states []string
+	for _, attr := range ent.Attrs() {
+		if attr.ID == Id("conf/state") {
+			states = append(states, attr.Value.String())
+		}
+	}
+	return states
+}
+
+// TestStoreConformance_ReplaceUnderSessionWritesOnlyItsOwnBlob pins that a
+// session replacing an entity stores in its blob what the replacement carries,
+// not what other sessions hold, and that a replacement carrying no session
+// attributes leaves the writer's blob alone.
+func TestStoreConformance_ReplaceUnderSessionWritesOnlyItsOwnBlob(t *testing.T) {
+	runStoreConformance(t, func(t *testing.T, store Store) {
+		ctx := t.Context()
+		applySessionIndexSchema(t, store)
+
+		first, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+		second, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+
+		ent, err := store.CreateEntity(ctx, New(Any(Ident, "conf-replace-blob"), String(Id("conf/state"), "ready")),
+			WithSession(first))
+		require.NoError(t, err)
+
+		_, err = store.ReplaceEntity(ctx, New(Ref(DBId, ent.Id()), Any(Ident, "conf-replace-blob"),
+			String(Id("conf/state"), "busy")), WithSession(second))
+		require.NoError(t, err)
+
+		require.NoError(t, store.RevokeSession(ctx, first))
+		assert.Equal(t, []string{"busy"}, sessionStates(t, store, ent.Id()),
+			"the second session's blob holds only what its replacement carried")
+
+		_, err = store.ReplaceEntity(ctx, New(Ref(DBId, ent.Id()), Any(Ident, "conf-replace-blob"),
+			String(Id("conf/kind"), "runner")), WithSession(second))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"busy"}, sessionStates(t, store, ent.Id()),
+			"a replacement with no session attributes leaves the writer's blob alone")
+	})
+}
+
+// TestStoreConformance_SessionAttributesCannotBeIndexed pins that an attribute
+// cannot be both: only what the entity key stores is indexed, so the index
+// would never match.
+func TestStoreConformance_SessionAttributesCannotBeIndexed(t *testing.T) {
+	runStoreConformance(t, func(t *testing.T, store Store) {
+		_, err := store.CreateEntity(t.Context(), New(
+			Ident, "conf/indexed-state",
+			Doc, "indexed session-scoped string",
+			Cardinality, CardinalityOne,
+			Type, TypeStr,
+			Index, true,
+			Session, true,
+		))
+		assert.Error(t, err)
+	})
+}
+
+// indexTotal reads the index from its head and returns the entry count along
+// with the ids, so a duplicate entry shows up as a total above the id count.
+func indexTotal(t *testing.T, store Store, attr Attr) (int64, []Id) {
+	t.Helper()
+	page, err := store.ListIndexPage(t.Context(), attr, "", 0)
+	require.NoError(t, err)
+	return page.Total, page.Ids
+}
+
+// TestStoreConformance_SessionWriteOfDurableValueIndexesOnce is the MIR-1990
+// shape: a runner writes its node under its session. The durable value lists
+// and counts once (a session's presence marker is not a match), and it
+// outlives the session because the entity is not bound to it.
+func TestStoreConformance_SessionWriteOfDurableValueIndexesOnce(t *testing.T) {
+	runStoreConformance(t, func(t *testing.T, store Store) {
+		ctx := t.Context()
+		applySessionIndexSchema(t, store)
+
+		token, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+
+		kind := String(Id("conf/kind"), "runner")
+		ent, err := store.CreateEntity(ctx, New(Any(Ident, "conf-durable-once"), kind), WithSession(token))
+		require.NoError(t, err)
+		_, err = store.UpdateEntity(ctx, ent.Id(), New(String(Id("conf/state"), "ready")), WithSession(token))
+		require.NoError(t, err)
+
+		total, ids := indexTotal(t, store, kind)
+		assert.Equal(t, []Id{ent.Id()}, ids)
+		assert.EqualValues(t, 1, total, "a durable value written under a session counts once")
+
+		require.NoError(t, store.RevokeSession(ctx, token))
+
+		total, ids = indexTotal(t, store, kind)
+		assert.Equal(t, []Id{ent.Id()}, ids, "an unbound entity's durable value outlives the session")
+		assert.EqualValues(t, 1, total)
+	})
+}
+
+// TestStoreConformance_BoundEntityLeavesIndexWithSession pins MIR-1320 on both
+// backends: a bound entity, and its durable value's entry, go with the session.
+func TestStoreConformance_BoundEntityLeavesIndexWithSession(t *testing.T) {
+	runStoreConformance(t, func(t *testing.T, store Store) {
+		ctx := t.Context()
+		applySessionIndexSchema(t, store)
+
+		token, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+
+		kind := String(Id("conf/kind"), "lease")
+		ent, err := store.CreateEntity(ctx, New(Any(Ident, "conf-bound"), kind), BondToSession(token))
+		require.NoError(t, err)
+
+		total, ids := indexTotal(t, store, kind)
+		assert.Equal(t, []Id{ent.Id()}, ids)
+		assert.EqualValues(t, 1, total)
+
+		require.NoError(t, store.RevokeSession(ctx, token))
+
+		_, err = store.GetEntity(ctx, ent.Id())
+		assert.True(t, isNotFound(err), "a bound entity goes with its session, got %v", err)
+		total, ids = indexTotal(t, store, kind)
+		assert.Empty(t, ids)
+		assert.Zero(t, total)
+	})
+}
+
+// TestStoreConformance_WriteUnderRevokedSessionFails pins that a revoked
+// session cannot write: etcd refuses the put on an unknown lease.
+func TestStoreConformance_WriteUnderRevokedSessionFails(t *testing.T) {
+	runStoreConformance(t, func(t *testing.T, store Store) {
+		ctx := t.Context()
+		applySessionIndexSchema(t, store)
+
+		token, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+		require.NoError(t, store.RevokeSession(ctx, token))
+
+		_, err = store.CreateEntity(ctx, New(Any(Ident, "conf-revoked"), String(Id("conf/state"), "ready")),
+			WithSession(token))
+		assert.Error(t, err)
 	})
 }

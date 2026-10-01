@@ -77,6 +77,10 @@ func addCommands(d *mflags.Dispatcher) {
 			Body: "miren server install --without-cloud",
 		}),
 		WithExample(mflags.Example{
+			Name: "Install with accelerator mode from the first start",
+			Body: "sudo miren server install --disk-accelerator",
+		}),
+		WithExample(mflags.Example{
 			Name: "Install with an unattended enroll token",
 			Body: `miren server install --enroll-token "$(cat /etc/miren/enroll-token)"`,
 		}),
