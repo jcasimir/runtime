@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -111,6 +112,9 @@ type gen struct {
 
 func GenerateSchema(sf *schemaFile, pkg string, contributors ...*schemaFile) (string, error) {
 	if err := validateEnums(sf); err != nil {
+		return "", err
+	}
+	if err := validateIndexedSession(sf); err != nil {
 		return "", err
 	}
 
@@ -350,6 +354,34 @@ func toCamal(s string) string {
 	}
 
 	return b.String()
+}
+
+// validateIndexedSession rejects an index on anything stored in a session's
+// attribute blob: a session attribute, or a field nested in one. The entity
+// store only indexes what the entity key holds (see the index layout comment
+// in pkg/entity), so such an index would silently never match.
+func validateIndexedSession(sf *schemaFile) error {
+	var check func(path string, a *schemaAttr, inSession bool) error
+	check = func(path string, a *schemaAttr, inSession bool) error {
+		if a.Indexed && (a.Session || inSession) {
+			return fmt.Errorf("attribute %s is indexed but stored in a session; session-scoped values cannot be indexed", path)
+		}
+		for _, name := range slices.Sorted(maps.Keys(a.Attrs)) {
+			if err := check(path+"."+name, a.Attrs[name], inSession || a.Session); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, kind := range slices.Sorted(maps.Keys(sf.Kinds)) {
+		attrs := sf.Kinds[kind]
+		for _, name := range slices.Sorted(maps.Keys(attrs)) {
+			if err := check(kind+"."+name, attrs[name], false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func validateEnums(sf *schemaFile) error {

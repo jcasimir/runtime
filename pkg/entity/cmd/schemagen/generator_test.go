@@ -1625,3 +1625,32 @@ func TestNamedEnumFieldRequiresDefinition(t *testing.T) {
 		t.Fatalf("GenerateSchema() error = %v, want inline legacy choices error", err)
 	}
 }
+
+// The entity store only indexes what the entity key holds, so an index on a
+// session attribute, or on a field nested in one, would never match. Codegen
+// refuses both rather than shipping an index that silently stays empty.
+func TestGenerateSchemaRejectsIndexedSessionValues(t *testing.T) {
+	cases := map[string]schemaAttrs{
+		"session attribute": {
+			"status": &schemaAttr{Type: "string", Session: true, Indexed: true},
+		},
+		"field nested in a session component": {
+			"spec": &schemaAttr{
+				Type:    "component",
+				Session: true,
+				Attrs: map[string]*schemaAttr{
+					"name": {Type: "string", Indexed: true},
+				},
+			},
+		},
+	}
+	for name, attrs := range cases {
+		t.Run(name, func(t *testing.T) {
+			sf := &schemaFile{Domain: "test", Version: "v1", Kinds: map[string]schemaAttrs{"example": attrs}}
+			_, err := GenerateSchema(sf, "test")
+			if err == nil || !strings.Contains(err.Error(), "cannot be indexed") {
+				t.Fatalf("expected an indexed-session error, got %v", err)
+			}
+		})
+	}
+}

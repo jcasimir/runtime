@@ -645,15 +645,15 @@ func (s *stream) sendWatchResponse(link Link, response clientv3.WatchResponse, c
 
 // changes turns marker-index watch events into export changes.
 //
-// The marker index holds more than one key per entity when the entity was
-// written through a session: beside the durable index entry, the store adds
-// one leased to the writer's session so etcd drops it with the lease. A node
-// is the standing example, since a runner registers itself under its
-// coordinator health session. Those extra keys mean an entity can produce
-// several events at one revision, and can produce a DELETE event while it
-// lives on: the lease expiring is the runner losing its session, and what
-// changed is the entity (its session-scoped status is gone), not its
-// existence. So a DELETE is only a removal when the entity is absent at the
+// The marker index holds more than one key per entity when a session stores
+// attributes on it: beside the durable index entry, the store adds a presence
+// marker leased to that session so etcd drops it with the lease (see the index
+// layout comment in pkg/entity). A node is the standing example, since a
+// runner registers itself and its status under its coordinator health session.
+// Markers mean an entity can produce several events at one revision, and can
+// produce a DELETE event while it lives on: the lease expiring is the runner
+// losing its session, and what changed is the entity (its session-scoped
+// status is gone), not its existence. So a DELETE is only a removal when the entity is absent at the
 // event's revision; otherwise it exports as a change like any other, and
 // events for the same entity and revision collapse into one.
 func (s *stream) changes(events []*clientv3.Event, fallbackRevision int64) ([]Change, error) {
