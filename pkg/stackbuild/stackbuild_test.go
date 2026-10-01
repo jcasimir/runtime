@@ -1501,6 +1501,36 @@ func TestPythonUv(t *testing.T) {
 	buildLLB(t, dir, state)
 }
 
+func TestRubyDetectGem(t *testing.T) {
+	cases := []struct {
+		name    string
+		gemfile string
+		lock    string
+		want    bool
+	}{
+		{name: "declared and locked", gemfile: "gem 'rails'\n", lock: "GEM\n  specs:\n    rails (7.1.0)\n", want: true},
+		{name: "declared, double quotes, no lockfile", gemfile: "gem \"rails\", \"~> 7.1\"\n", want: true},
+		{name: "declared with parentheses", gemfile: "gem(\"rails\")\n", want: true},
+		{name: "only transitive in the lockfile", gemfile: "gem 'mylib'\n", lock: "GEM\n  specs:\n    mylib (1.0)\n      rails (>= 7)\n    rails (7.1.0)\n", want: true},
+		{name: "commented out", gemfile: "# gem \"rails\"\ngem \"sinatra\"\n", lock: "GEM\n  specs:\n    sinatra (4.1.0)\n"},
+		{name: "longer gem names", gemfile: "gem 'sprockets-rails'\n", lock: "GEM\n  specs:\n    rails-html-sanitizer (1.6.0)\n    sprockets-rails (3.4.2)\n"},
+		{name: "mentioned in a string", gemfile: "gem 'sinatra' # not rails\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "Gemfile"), []byte(tc.gemfile), 0644))
+			if tc.lock != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "Gemfile.lock"), []byte(tc.lock), 0644))
+			}
+
+			stack := &RubyStack{MetaStack: MetaStack{dir: dir}}
+			require.Equal(t, tc.want, stack.detectGem("rails"))
+		})
+	}
+}
+
 func TestRubyWebCommand(t *testing.T) {
 	testCases := []struct {
 		name     string
