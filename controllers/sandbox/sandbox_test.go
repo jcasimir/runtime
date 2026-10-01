@@ -1526,8 +1526,8 @@ func TestSandbox(t *testing.T) {
 		drainCtx, drainCancel := context.WithTimeout(ctx, time.Second)
 		defer drainCancel()
 
-		killed, err := co.destroySubContainers(drainCtx, id)
-		r.NoError(err)
+		killed, err := co.destroySubContainers(drainCtx, id, &tco)
+		r.ErrorIs(err, errDrainHandedOff)
 		r.Empty(killed, "a cancelled teardown must not be reported as a shutdown_timeout kill")
 	})
 
