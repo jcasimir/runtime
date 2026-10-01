@@ -13,6 +13,7 @@ import (
 	"miren.dev/runtime/metrics"
 	"miren.dev/runtime/observability"
 	"miren.dev/runtime/pkg/boot"
+	"miren.dev/runtime/pkg/saga"
 	"miren.dev/runtime/pkg/workloadidentity"
 	"miren.dev/runtime/servers/runnertelemetry"
 )
@@ -130,6 +131,9 @@ func (b *telemetryBoot) start(ctx context.Context, access clusterAccessBootOutpu
 		logMessages := metrics.NewLogMessages(b.inputs.log, operational)
 		logMessages.Entity = metrics.EntityRunner
 		go logMessages.Monitor(ctx)
+		sagaCounts := saga.NewCountsMetrics(b.inputs.log, operational)
+		sagaCounts.Entity = metrics.EntityRunner
+		go sagaCounts.Monitor(ctx)
 	} else {
 		b.inputs.log.Warn("no VictoriaMetrics address configured, sandbox metrics will not be recorded")
 	}

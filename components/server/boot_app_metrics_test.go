@@ -7,11 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"miren.dev/runtime/metrics"
+	"miren.dev/runtime/pkg/saga"
 )
 
 // recordingSink is a PointWriter that keeps every batch it is handed.
@@ -61,4 +63,38 @@ func TestManagedMetricsClusterLabel(t *testing.T) {
 	assert.Equal(t, "cluster-123", managedMetricsClusterLabel("cluster-123", "friendly-name"))
 	assert.Equal(t, "friendly-name", managedMetricsClusterLabel("", "friendly-name"))
 	assert.Equal(t, "local", managedMetricsClusterLabel("", ""))
+}
+
+// TestAttachShippingResendsSagaBaselines pins that a saga count recorded before
+// the shipping sink existed still reaches it with its zero baseline. Recovery
+// runs at boot and can count before the sink is attached, and without the zero
+// the shipped series' first sample is already nonzero.
+func TestAttachShippingResendsSagaBaselines(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	embedded := &recordingSink{}
+	operational := metrics.NewFanout(embedded)
+	counts := &saga.Counts{}
+	sagaCounts := &saga.CountsMetrics{Log: log, Writer: operational, Counts: counts, Entity: metrics.EntityControl}
+	observability := observabilityBootOutput{
+		operationalMetrics: operational,
+		processInfo:        metrics.NewProcessInfo(log, operational),
+		sagaCounts:         sagaCounts,
+	}
+
+	counts.Add("create-sandbox", saga.EventRecoveryFailed, 1)
+	require.NoError(t, sagaCounts.Emit(t.Context(), time.Now()))
+
+	shipping := &recordingSink{}
+	b := &appMetricsBoot{}
+	b.attachShipping(t.Context(), log, observability, shipping, map[string]string{"miren_cluster": "c1"})
+
+	var values []float64
+	for _, batch := range shipping.batches {
+		for _, p := range batch {
+			if p.Name == "saga_recoveries_total" && p.Labels["outcome"] == "failed" {
+				values = append(values, p.Value)
+			}
+		}
+	}
+	assert.Equal(t, []float64{0, 1}, values, "the shipping sink gets the zero baseline, then the count")
 }
