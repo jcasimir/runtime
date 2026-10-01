@@ -1168,10 +1168,15 @@ func (h *Server) logRequestFromStats(appEntityID, appName string, stats httputil
 		Stream:    observability.UserOOB,
 		Body:      logMsg,
 		Attributes: map[string]string{
-			"source": "router",
-			"method": stats.RequestMethod,
-			"path":   stats.RequestPath,
-			"host":   stats.RequestHost,
+			"source":      "router",
+			"status":      fmt.Sprint(stats.StatusCode),
+			"method":      stats.RequestMethod,
+			"path":        path,
+			"duration_ms": fmt.Sprint(stats.Duration.Milliseconds()),
+			"response":    fmt.Sprint(stats.ResponseBytes),
+			"body":        fmt.Sprint(stats.ContentLength),
+			"host":        stats.RequestHost,
+			"source_ip":   stats.RemoteAddr,
 		},
 	})
 	if err != nil {
@@ -1682,10 +1687,13 @@ func (h *Server) logInternalRequest(appEntityID, method, path string, statusCode
 		Stream:    observability.UserOOB,
 		Body:      logMsg,
 		Attributes: map[string]string{
-			"source": "router",
-			"access": "internal",
-			"method": method,
-			"path":   path,
+			"source":      "router",
+			"status":      fmt.Sprint(statusCode),
+			"method":      method,
+			"path":        path,
+			"access":      "internal",
+			"duration_ms": fmt.Sprint(duration.Milliseconds()),
+			"response":    fmt.Sprint(responseBytes),
 		},
 	})
 	if err != nil {

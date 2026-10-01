@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"miren.dev/runtime/observability"
 	"miren.dev/runtime/pkg/entity"
 	"miren.dev/runtime/pkg/entity/testutils"
+	"miren.dev/runtime/pkg/httputil"
 )
 
 func TestServeStaticArtifact(t *testing.T) {
@@ -264,6 +266,58 @@ func TestStaticOnlyRequestWritesRouterAccessLog(t *testing.T) {
 			assert.Equal(t, "router", logs.entries[0].Attributes["source"])
 		})
 	}
+}
+
+func TestRouterAccessLogAttributes(t *testing.T) {
+	logs := &recordingLogWriter{}
+	server := &Server{logWriter: logs}
+	server.logRequestFromStats("app-1", "app", httputil.ProxyStats{
+		StatusCode:    http.StatusCreated,
+		RequestMethod: http.MethodPost,
+		RequestPath:   "/uploads",
+		RequestQuery:  "part=2",
+		RequestHost:   "example.com",
+		RemoteAddr:    "192.0.2.15",
+		ContentLength: 17,
+		ResponseBytes: 41,
+		Duration:      27 * time.Millisecond,
+	})
+
+	require.Len(t, logs.entries, 1)
+	assert.Equal(t, map[string]string{
+		"source":      "router",
+		"status":      "201",
+		"method":      "POST",
+		"path":        "/uploads?part=2",
+		"duration_ms": "27",
+		"response":    "41",
+		"body":        "17",
+		"host":        "example.com",
+		"source_ip":   "192.0.2.15",
+	}, logs.entries[0].Attributes)
+	assert.Equal(t, `status=201 method=POST path="/uploads?part=2" duration_ms=27 response=41 body=17 host=example.com source_ip=192.0.2.15`, logs.entries[0].Body)
+}
+
+func TestInternalRouterAccessLogAttributes(t *testing.T) {
+	logs := &recordingLogWriter{}
+	server := &Server{logWriter: logs}
+	server.logInternalRequest("app-1", http.MethodGet, "/health?deep=1", http.StatusNoContent, 13, time.Now().Add(-2*time.Second))
+
+	require.Len(t, logs.entries, 1)
+	duration := logs.entries[0].Attributes["duration_ms"]
+	durationMs, err := strconv.Atoi(duration)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, durationMs, 2000)
+	assert.Equal(t, map[string]string{
+		"source":      "router",
+		"status":      "204",
+		"method":      "GET",
+		"path":        "/health?deep=1",
+		"access":      "internal",
+		"duration_ms": duration,
+		"response":    "13",
+	}, logs.entries[0].Attributes)
+	assert.Equal(t, `status=204 method=GET path="/health?deep=1" access=internal duration_ms=`+duration+` response=13`, logs.entries[0].Body)
 }
 
 func TestRequestSourceIPHonorsProxyTrust(t *testing.T) {
