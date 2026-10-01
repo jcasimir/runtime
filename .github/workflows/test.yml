@@ -110,6 +110,14 @@ jobs:
     - name: Check go generate
       run: make generate-check
 
+    # Runs after generate-check, which guarantees the committed contract is
+    # what the schema produces. The token reads cloud's embedded contract.
+    - name: Check cloud export contract
+      run: make contract-check
+      env:
+        GH_TOKEN: ${{ secrets.CLOUD_REPO_TOKEN }}
+        FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
   # Which parts of the tree a PR touches, for jobs that are too expensive to
   # run on every PR but too important to leave to someone remembering a label.
   # Only consulted for pull_request; other events don't gate on it at all.
