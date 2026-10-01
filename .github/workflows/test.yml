@@ -624,6 +624,9 @@ jobs:
         # early on is far from the end of the log by the time we get here. A
         # tail window reliably misses it (MIR-1469 was diagnosed twice from logs
         # that started five minutes after the failure), so dump the logs whole.
+        # Same session `make dev-distributed` brought the peers up in; a bare
+        # iso call would otherwise look in its shared "peers" session.
+        export ISO_SESSION="dev-$(basename "$PWD")"
         echo "=== Coordinator server logs ==="
         iso peers exec coordinator -- cat /tmp/miren-server.log 2>&1 || true
         echo "=== Runner logs ==="
