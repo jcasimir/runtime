@@ -468,7 +468,10 @@ var (
 // routerBodyHidden are the fields the router already prints in its logfmt body,
 // so re-surfacing them from attributes would double-print. Suppressed only for
 // router lines; other attributes (e.g. future app.* promoted fields) still show.
-var routerBodyHidden = map[string]bool{"method": true, "path": true, "host": true, "access": true}
+var routerBodyHidden = map[string]bool{
+	"status": true, "method": true, "path": true, "query": true, "access": true,
+	"duration_ms": true, "response": true, "body": true, "host": true, "source_ip": true,
+}
 
 // logStatusStyle picks a status color by class. Unrecognized codes render quiet.
 func logStatusStyle(code string) lipgloss.Style {
