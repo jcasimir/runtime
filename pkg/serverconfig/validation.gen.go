@@ -61,6 +61,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("server: %w", err)
 	}
 
+	if err := c.Telemetry.Validate(); err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+
 	if err := c.TLS.Validate(); err != nil {
 		return fmt.Errorf("tls: %w", err)
 	}
@@ -267,6 +271,30 @@ func (c *TLSConfig) Validate() error {
 	}
 
 	// Check for port conflicts in TLSConfig
+
+	return nil
+}
+
+// Validate validates TelemetryConfig
+func (c *TelemetryConfig) Validate() error {
+
+	// Check for port conflicts in TelemetryConfig
+
+	return nil
+}
+
+// Validate validates TelemetryMetricsConfig
+func (c *TelemetryMetricsConfig) Validate() error {
+
+	// Check for port conflicts in TelemetryMetricsConfig
+
+	return nil
+}
+
+// Validate validates TelemetryTracesConfig
+func (c *TelemetryTracesConfig) Validate() error {
+
+	// Check for port conflicts in TelemetryTracesConfig
 
 	return nil
 }

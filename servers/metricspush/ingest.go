@@ -123,7 +123,7 @@ func (i *Ingest) Push(ctx context.Context, p Push) error {
 
 	if !i.enabled.Load() {
 		return errorf(http.StatusServiceUnavailable,
-			"managed metrics is not enabled on this cluster (no metrics.remote_write destination)")
+			"managed metrics is not enabled on this cluster (no telemetry.metrics destination)")
 	}
 	backend, ok := i.armed()
 	if !ok {

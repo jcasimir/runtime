@@ -13,6 +13,7 @@ import (
 	"miren.dev/runtime/metrics"
 	"miren.dev/runtime/observability"
 	"miren.dev/runtime/pkg/boot"
+	"miren.dev/runtime/pkg/workloadidentity"
 	"miren.dev/runtime/servers/runnertelemetry"
 )
 
@@ -49,7 +50,7 @@ type telemetryBoot struct {
 	metrics     *metrics.VictoriaMetricsWriter
 	operational *metrics.VictoriaMetricsWriter
 	batch       *observability.BatchLogWriter
-	tokenSource *runnertelemetry.IssuerTokenSource
+	tokenSource *workloadidentity.SystemTokenSource
 	output      boot.Output[telemetryBootOutput]
 }
 
@@ -81,7 +82,7 @@ func (b *telemetryBoot) start(ctx context.Context, access clusterAccessBootOutpu
 	// only signals that the cluster records each kind of telemetry.
 	if b.inputs.victoriaMetricsAddress != "" || b.inputs.victoriaLogsAddress != "" {
 		issuer := access.access.WorkloadIssuer()
-		b.tokenSource = runnertelemetry.NewIssuerTokenSource()
+		b.tokenSource = runnertelemetry.NewTokenSource()
 		b.tokenSource.SetIssuer(issuer)
 		if issuer == nil {
 			b.inputs.log.Error("no workload identity issuer available; telemetry cannot be shipped")

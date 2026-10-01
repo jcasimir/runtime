@@ -67,6 +67,11 @@ configs:
         toml: metrics
         nested: true
 
+      telemetry:
+        type: TelemetryConfig
+        toml: telemetry
+        nested: true
+
       containerd:
         type: ContainerdConfig
         toml: containerd
@@ -475,7 +480,7 @@ configs:
           format: host:port
 
   MetricsConfig:
-    description: Managed application metrics configuration
+    description: "Deprecated: superseded by [telemetry.metrics]"
     fields:
       remote_write:
         type: RemoteWriteConfig
@@ -483,24 +488,79 @@ configs:
         nested: true
 
   RemoteWriteConfig:
-    description: Destination for managed application metrics
+    description: "Deprecated: superseded by [telemetry.metrics]. Values set here still apply when the telemetry.metrics equivalents are unset."
     fields:
       url:
         type: string
-        default: ""
         cli:
           long: metrics-remote-write-url
-          description: Prometheus Remote Write destination for managed application metrics
+          description: "Deprecated: use --telemetry-metrics-remote-write-url"
+          hidden: true
         env: MIREN_METRICS_REMOTE_WRITE_URL
         toml: url
 
       workload_identity_audience:
         type: string
-        default: ""
         cli:
           long: metrics-remote-write-audience
-          description: Workload identity audience for the managed metrics destination
+          description: "Deprecated: use --telemetry-metrics-audience"
+          hidden: true
         env: MIREN_METRICS_REMOTE_WRITE_AUDIENCE
+        toml: workload_identity_audience
+
+  TelemetryConfig:
+    description: Where the cluster ships its own telemetry
+    fields:
+      metrics:
+        type: TelemetryMetricsConfig
+        toml: metrics
+        nested: true
+
+      traces:
+        type: TelemetryTracesConfig
+        toml: traces
+        nested: true
+
+  TelemetryMetricsConfig:
+    description: Destination for managed application metrics and the runtime's operational series
+    fields:
+      remote_write_url:
+        type: string
+        default: ""
+        cli:
+          long: telemetry-metrics-remote-write-url
+          description: Prometheus Remote Write destination for managed application metrics
+        env: MIREN_TELEMETRY_METRICS_REMOTE_WRITE_URL
+        toml: remote_write_url
+
+      workload_identity_audience:
+        type: string
+        default: ""
+        cli:
+          long: telemetry-metrics-audience
+          description: Workload identity audience for the metrics destination
+        env: MIREN_TELEMETRY_METRICS_AUDIENCE
+        toml: workload_identity_audience
+
+  TelemetryTracesConfig:
+    description: OTLP destination for the runtime's own traces
+    fields:
+      endpoint:
+        type: string
+        default: ""
+        cli:
+          long: telemetry-traces-endpoint
+          description: OTLP/HTTP base URL for traces (defaults to OTEL_EXPORTER_OTLP_ENDPOINT)
+        env: MIREN_TELEMETRY_TRACES_ENDPOINT
+        toml: endpoint
+
+      workload_identity_audience:
+        type: string
+        default: ""
+        cli:
+          long: telemetry-traces-audience
+          description: Authenticate trace export with a workload identity token for this audience
+        env: MIREN_TELEMETRY_TRACES_AUDIENCE
         toml: workload_identity_audience
 
   ContainerdConfig:

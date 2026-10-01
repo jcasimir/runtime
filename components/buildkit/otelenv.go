@@ -1,5 +1,7 @@
 package buildkit
 
+import "slices"
+
 // otelEnvForBuildkitd builds the OTEL_* environment handed to buildkitd so the
 // daemon can export its internal spans to the same collector the runtime uses.
 //
@@ -19,7 +21,11 @@ package buildkit
 // off unless the operator points metrics somewhere explicitly. If buildkit's
 // metrics ever earn a home, buildkitd already serves a Prometheus /metrics on
 // --debugaddr, which fits the vmagent scrape pipeline better than OTLP push.
-func otelEnvForBuildkitd(getenv func(string) string) []string {
+//
+// traces overlays the server's resolved traces destination on the env it
+// inherited; see TracesExport.
+func otelEnvForBuildkitd(getenv func(string) string, traces TracesExport) []string {
+	getenv = traces.overlay(getenv)
 	var env []string
 	for _, key := range []string{
 		"OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -62,4 +68,69 @@ func otelEnvForBuildkitd(getenv func(string) string) []string {
 		env = append(env, "OTEL_METRICS_EXPORTER=none")
 	}
 	return env
+}
+
+// TracesExport says where buildkitd sends its spans, as the server resolved it.
+// The zero value forwards the server's OTel env untouched.
+type TracesExport struct {
+	// Endpoint replaces OTEL_EXPORTER_OTLP_ENDPOINT, for a destination that
+	// came from server config rather than the env.
+	Endpoint string
+
+	// Relayed means Endpoint is the server's loopback relay, which holds the
+	// credentials. buildkitd lives far longer than a workload identity token
+	// and has no way to refresh one, so it gets no credentials at all and
+	// speaks the only protocol the relay does.
+	Relayed bool
+
+	// Disabled keeps buildkitd from exporting traces. It is what traces get
+	// when they need a token and the relay isn't there to supply one: better
+	// no build spans than a static credential the operator asked to retire.
+	Disabled bool
+}
+
+var traceKeys = []string{
+	"OTEL_EXPORTER_OTLP_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_HEADERS",
+	"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+	"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+}
+
+func (t TracesExport) overlay(getenv func(string) string) func(string) string {
+	var set map[string]string
+	switch {
+	case t.Disabled:
+		set = map[string]string{}
+	case t.Relayed:
+		set = map[string]string{
+			"OTEL_EXPORTER_OTLP_ENDPOINT": t.Endpoint,
+			// The signal-specific protocol beats a generic one the operator
+			// may have set for metrics.
+			"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+		}
+	case t.Endpoint != "":
+		return func(k string) string {
+			switch k {
+			case "OTEL_EXPORTER_OTLP_ENDPOINT":
+				return t.Endpoint
+			case "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":
+				// buildkitd lets the signal-specific endpoint win over the
+				// generic one, so a stale one in the env would keep build
+				// spans going to the old collector. The server's own exporter
+				// is pointed at the configured endpoint explicitly, and
+				// buildkitd has to agree with it.
+				return ""
+			}
+			return getenv(k)
+		}
+	default:
+		return getenv
+	}
+	return func(k string) string {
+		if slices.Contains(traceKeys, k) {
+			return set[k]
+		}
+		return getenv(k)
+	}
 }

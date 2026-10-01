@@ -38,8 +38,8 @@ type appMetricsBoot struct {
 func appMetricsInputs(options StartOptions) appMetricsBootInputs {
 	return appMetricsBootInputs{
 		config: appmetrics.Config{
-			RemoteWriteURL: options.Config.Metrics.RemoteWrite.GetURL(),
-			Audience:       options.Config.Metrics.RemoteWrite.GetWorkloadIdentityAudience(),
+			RemoteWriteURL: options.Config.Telemetry.Metrics.GetRemoteWriteURL(),
+			Audience:       options.Config.Telemetry.Metrics.GetWorkloadIdentityAudience(),
 		},
 		configuredClusterName: options.Config.Server.GetConfigClusterName(),
 		runnerID:              options.Config.Server.GetRunnerID(),

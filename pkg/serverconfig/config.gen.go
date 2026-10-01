@@ -126,6 +126,7 @@ type Config struct {
 	Saga            SagaConfig            `toml:"saga"`
 	Secrets         SecretsConfig         `toml:"secrets"`
 	Server          ServerConfig          `toml:"server"`
+	Telemetry       TelemetryConfig       `toml:"telemetry"`
 	TLS             TLSConfig             `toml:"tls"`
 	Victorialogs    VictoriaLogsConfig    `toml:"victorialogs"`
 	Victoriametrics VictoriaMetricsConfig `toml:"victoriametrics"`
@@ -371,12 +372,12 @@ func (c *IngressConfig) SetTrustedProxyHops(v int) {
 	c.TrustedProxyHops = &v
 }
 
-// MetricsConfig Managed application metrics configuration
+// MetricsConfig Deprecated: superseded by [telemetry.metrics]
 type MetricsConfig struct {
 	RemoteWrite RemoteWriteConfig `toml:"remote_write"`
 }
 
-// RemoteWriteConfig Destination for managed application metrics
+// RemoteWriteConfig Deprecated: superseded by [telemetry.metrics]. Values set here still apply when the telemetry.metrics equivalents are unset.
 type RemoteWriteConfig struct {
 	URL                      *string `toml:"url" env:"MIREN_METRICS_REMOTE_WRITE_URL"`
 	WorkloadIdentityAudience *string `toml:"workload_identity_audience" env:"MIREN_METRICS_REMOTE_WRITE_AUDIENCE"`
@@ -648,6 +649,76 @@ func (c *TLSConfig) GetStandardTLS() bool {
 // SetStandardTLS sets the value of StandardTLS
 func (c *TLSConfig) SetStandardTLS(v bool) {
 	c.StandardTLS = &v
+}
+
+// TelemetryConfig Where the cluster ships its own telemetry
+type TelemetryConfig struct {
+	Metrics TelemetryMetricsConfig `toml:"metrics"`
+	Traces  TelemetryTracesConfig  `toml:"traces"`
+}
+
+// TelemetryMetricsConfig Destination for managed application metrics and the runtime's operational series
+type TelemetryMetricsConfig struct {
+	RemoteWriteURL           *string `toml:"remote_write_url" env:"MIREN_TELEMETRY_METRICS_REMOTE_WRITE_URL"`
+	WorkloadIdentityAudience *string `toml:"workload_identity_audience" env:"MIREN_TELEMETRY_METRICS_AUDIENCE"`
+}
+
+// GetRemoteWriteURL returns the value of RemoteWriteURL or its zero value if nil
+func (c *TelemetryMetricsConfig) GetRemoteWriteURL() string {
+	if c.RemoteWriteURL != nil {
+		return *c.RemoteWriteURL
+	}
+	return ""
+}
+
+// SetRemoteWriteURL sets the value of RemoteWriteURL
+func (c *TelemetryMetricsConfig) SetRemoteWriteURL(v string) {
+	c.RemoteWriteURL = &v
+}
+
+// GetWorkloadIdentityAudience returns the value of WorkloadIdentityAudience or its zero value if nil
+func (c *TelemetryMetricsConfig) GetWorkloadIdentityAudience() string {
+	if c.WorkloadIdentityAudience != nil {
+		return *c.WorkloadIdentityAudience
+	}
+	return ""
+}
+
+// SetWorkloadIdentityAudience sets the value of WorkloadIdentityAudience
+func (c *TelemetryMetricsConfig) SetWorkloadIdentityAudience(v string) {
+	c.WorkloadIdentityAudience = &v
+}
+
+// TelemetryTracesConfig OTLP destination for the runtime's own traces
+type TelemetryTracesConfig struct {
+	Endpoint                 *string `toml:"endpoint" env:"MIREN_TELEMETRY_TRACES_ENDPOINT"`
+	WorkloadIdentityAudience *string `toml:"workload_identity_audience" env:"MIREN_TELEMETRY_TRACES_AUDIENCE"`
+}
+
+// GetEndpoint returns the value of Endpoint or its zero value if nil
+func (c *TelemetryTracesConfig) GetEndpoint() string {
+	if c.Endpoint != nil {
+		return *c.Endpoint
+	}
+	return ""
+}
+
+// SetEndpoint sets the value of Endpoint
+func (c *TelemetryTracesConfig) SetEndpoint(v string) {
+	c.Endpoint = &v
+}
+
+// GetWorkloadIdentityAudience returns the value of WorkloadIdentityAudience or its zero value if nil
+func (c *TelemetryTracesConfig) GetWorkloadIdentityAudience() string {
+	if c.WorkloadIdentityAudience != nil {
+		return *c.WorkloadIdentityAudience
+	}
+	return ""
+}
+
+// SetWorkloadIdentityAudience sets the value of WorkloadIdentityAudience
+func (c *TelemetryTracesConfig) SetWorkloadIdentityAudience(v string) {
+	c.WorkloadIdentityAudience = &v
 }
 
 // VictoriaLogsConfig VictoriaLogs configuration

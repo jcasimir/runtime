@@ -16,6 +16,7 @@ import (
 	"miren.dev/runtime/metrics"
 	"miren.dev/runtime/observability"
 	"miren.dev/runtime/pkg/caauth"
+	"miren.dev/runtime/pkg/otlpexport"
 	"miren.dev/runtime/pkg/secret"
 	"miren.dev/runtime/pkg/workloadidentity"
 )
@@ -101,6 +102,10 @@ type CoordinatorConfig struct {
 	// falls back to the default.
 	DeploymentRetentionCount  int
 	DeploymentRetentionPeriod time.Duration
+
+	// TracesDestination is where spans reported by CLI commands are relayed.
+	// Nil when the cluster exports no traces.
+	TracesDestination *otlpexport.Destination
 
 	// WorkloadIssuer signs workload identity tokens for sandbox containers
 	WorkloadIssuer *workloadidentity.Issuer

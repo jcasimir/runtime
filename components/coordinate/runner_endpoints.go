@@ -95,6 +95,6 @@ func (c *RunnerEndpoints) Start(context.Context) error {
 		RPC: c.state,
 	})
 	server.ExposeValue(rpc.ServiceRunner, runner_v1alpha.AdaptRunnerRegistration(runnerReg))
-	server.ExposeValue("dev.miren.runtime/telemetry", telemetry_v1alpha.AdaptTelemetry(telemetrysrv.NewServer(c.Log)))
+	server.ExposeValue("dev.miren.runtime/telemetry", telemetry_v1alpha.AdaptTelemetry(telemetrysrv.NewServer(c.Log, c.TracesDestination)))
 	return nil
 }
