@@ -4,11 +4,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/cli/cli/config"
 	"github.com/docker/docker/api/types/container"
@@ -32,15 +34,28 @@ import (
 // helper function to execute LLB locally
 func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Reader)) {
 	t.Helper()
-	solveLLB(t, startBuildkit(t), "/tmp/test-cache", dir, state, check...)
+	// A cache dir on the host carries layers between the throwaway buildkitd
+	// containers the Docker path starts, but parallel tests would race on its
+	// index, so it's opt-in for serial runs (go test -parallel 1).
+	solveLLB(t, startBuildkit(t), os.Getenv("STACKBUILD_TEST_CACHE"), dir, state, check...)
 }
 
-// startBuildkit runs a throwaway buildkitd container and returns a client for
-// it. Solving more than once against the same client shares its cache, which
-// is how a test checks what a rebuild reuses.
+// startBuildkit returns a client for a running buildkitd, starting a throwaway
+// one in Docker when there isn't one already. Solving more than once against
+// the same client shares its cache, which is how a test checks what a rebuild
+// reuses.
 func startBuildkit(t *testing.T) *buildkit.Client {
 	t.Helper()
 	ctx := context.Background()
+
+	if addr := localBuildkitAddr(); addr != "" {
+		c, err := buildkit.New(ctx, addr)
+		require.NoError(t, err)
+		t.Cleanup(func() { c.Close() })
+		_, err = c.Info(ctx)
+		require.NoError(t, err)
+		return c
+	}
 
 	cl, err := client.NewClientWithOpts(client.FromEnv)
 	require.NoError(t, err)
@@ -240,15 +255,48 @@ func readFile(t *testing.T, path string) string {
 	return string(content)
 }
 
-func checkDocker() bool {
-	_, err := os.Stat("/var/run/docker.sock")
-	return err == nil
+// localBuildkitSocket is where the iso test container's buildkitd listens
+// (hack/common-setup.sh), which is how these tests run in CI.
+const localBuildkitSocket = "/run/buildkit/buildkitd.sock"
+
+// localBuildkitAddr returns the address of an already-running buildkitd, or ""
+// when the tests should start their own in Docker.
+func localBuildkitAddr() string {
+	if addr := os.Getenv("BUILDKIT_HOST"); addr != "" {
+		return addr
+	}
+	if _, err := os.Stat(localBuildkitSocket); err == nil {
+		return "unix://" + localBuildkitSocket
+	}
+	return ""
+}
+
+// runNonce returns a manifest comment unique to this test run, so the builds
+// that include it don't hit cache entries left by earlier runs.
+func runNonce(comment string) string {
+	return fmt.Sprintf("\n%s test run %d\n", comment, time.Now().UnixNano())
+}
+
+// requireBuildkit skips the test unless it can reach a buildkitd, either one
+// already running or one it can start in Docker. STACKBUILD_SKIP_BUILDKIT
+// skips regardless: CI's general test runners set it, since these tests pull
+// images and packages from upstream and get a job of their own.
+func requireBuildkit(t *testing.T) {
+	t.Helper()
+	if os.Getenv("STACKBUILD_SKIP_BUILDKIT") != "" {
+		t.Skip("STACKBUILD_SKIP_BUILDKIT is set")
+	}
+	if localBuildkitAddr() != "" {
+		return
+	}
+	if _, err := os.Stat("/var/run/docker.sock"); err != nil {
+		t.Skip("no buildkitd or Docker available")
+	}
 }
 
 func TestRails(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -278,19 +326,21 @@ func TestRails(t *testing.T) {
 			dir: dir,
 		},
 	}
-	state, err := stack.GenerateLLB(context.Background(), dir, BuildOptions{Version: "3.2"})
+	opts := BuildOptions{Version: "3.2"}
+	stack.Init(opts)
+	state, err := stack.GenerateLLB(context.Background(), dir, opts)
 	require.NoError(t, err)
 
 	buildLLB(t, dir, state)
 
-	img := stack.Image()
-	require.Equal(t, []string{"/bin/sh", "-c", "exec bundle exec rails server -b 0.0.0.0 -p $PORT"}, img.Config.Entrypoint)
+	// The start command reaches the app through its Procfile, not the image
+	// entrypoint, so check the stack's default for it.
+	require.Equal(t, "rails server -b 0.0.0.0 -p $PORT", stack.WebCommand())
 }
 
 func TestRuby(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -311,18 +361,21 @@ func TestRuby(t *testing.T) {
 			dir: dir,
 		},
 	}
-	state, err := stack.GenerateLLB(context.Background(), dir, BuildOptions{Version: "3.2"})
+	opts := BuildOptions{Version: "3.2"}
+	stack.Init(opts)
+	state, err := stack.GenerateLLB(context.Background(), dir, opts)
 	require.NoError(t, err)
 
 	buildLLB(t, dir, state)
-	img := stack.Image()
-	require.Equal(t, []string{"/bin/sh", "-c", "exec bundle exec puma -b tcp://0.0.0.0 -p $PORT"}, img.Config.Entrypoint)
+
+	// The start command reaches the app through its Procfile, not the image
+	// entrypoint, so check the stack's default for it.
+	require.Equal(t, "puma -b tcp://0.0.0.0 -p $PORT", stack.WebCommand())
 }
 
 func TestPython(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -366,9 +419,8 @@ func TestPython(t *testing.T) {
 }
 
 func TestPythonPoetry(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -394,9 +446,8 @@ func TestPythonPoetry(t *testing.T) {
 }
 
 func TestNode(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -574,9 +625,8 @@ func TestNodeNextjs(t *testing.T) {
 }
 
 func TestBun(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -729,9 +779,8 @@ func TestBunDetect(t *testing.T) {
 }
 
 func TestGo(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -795,16 +844,17 @@ func TestGo(t *testing.T) {
 // are keyed on what the app imports rather than on its source: an edit that
 // keeps the imports reuses them, and a changed import set reruns the step.
 func TestGoDepsLayerSurvivesSourceEdits(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
 
 	mainGo := readFile(t, "go/main.go")
 	files := map[string]string{
-		"go.mod":  readFile(t, "go/go.mod"),
+		// The nonce gives this run its own cache keys, so the first build is cold
+		// even on a buildkitd that outlives test runs, as iso's does.
+		"go.mod":  readFile(t, "go/go.mod") + runNonce("//"),
 		"go.sum":  readFile(t, "go/go.sum"),
 		"main.go": mainGo,
 	}
@@ -856,9 +906,8 @@ func TestGoDepsLayerSurvivesSourceEdits(t *testing.T) {
 // dirs) so it can read them at runtime, while the Go source and module/vendor
 // build inputs are left behind on the builder.
 func TestGoRuntimeIncludesNonGoFiles(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -910,9 +959,8 @@ func TestGoRuntimeIncludesNonGoFiles(t *testing.T) {
 }
 
 func TestGoCgo(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -1016,9 +1064,8 @@ func TestGoDepsSplitBlocker(t *testing.T) {
 }
 
 func TestGoWithVendor(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -1213,9 +1260,8 @@ func TestRubyVersionDetection(t *testing.T) {
 }
 
 func TestRust(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -1260,9 +1306,8 @@ func TestRust(t *testing.T) {
 // are keyed on Cargo.toml and Cargo.lock, and that a source edit still reaches
 // the binary despite the placeholder build that came before it.
 func TestRustDepsLayerSurvivesSourceEdits(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
@@ -1270,7 +1315,8 @@ func TestRustDepsLayerSurvivesSourceEdits(t *testing.T) {
 	mainRs := readFile(t, "rust-deps/src/main.rs")
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "src"), 0755))
 	for name, content := range map[string]string{
-		"Cargo.toml":  readFile(t, "rust-deps/Cargo.toml"),
+		// See TestGoDepsLayerSurvivesSourceEdits for the nonce.
+		"Cargo.toml":  readFile(t, "rust-deps/Cargo.toml") + runNonce("#"),
 		"Cargo.lock":  readFile(t, "rust-deps/Cargo.lock"),
 		"src/main.rs": mainRs,
 	} {
@@ -1425,9 +1471,8 @@ func TestRustDepsSplitBlocker(t *testing.T) {
 }
 
 func TestPythonUv(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	root := t.TempDir()
 	dir := setupTestDir(root, t)
