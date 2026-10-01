@@ -48,6 +48,9 @@ jobs:
       run: bun run lint
       working-directory: docs
 
+    - name: Test CI grouping tools
+      run: python3 -B -m unittest discover -s hack -p 'test_calc_test_groups.py'
+
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
@@ -205,6 +208,11 @@ jobs:
         go-version-file: 'go.mod'
         cache: true
 
+    # Test fixtures intentionally emit compiler errors. testfmt reports real
+    # failures explicitly; the Go matcher would also annotate fixture output.
+    - name: Disable Go problem matcher for tests
+      run: echo '::remove-matcher owner=go::'
+
     - name: Resolve iso version
       id: iso-version
       run: |
@@ -306,6 +314,9 @@ jobs:
         go-version-file: 'go.mod'
         cache: true
 
+    - name: Disable Go problem matcher for tests
+      run: echo '::remove-matcher owner=go::'
+
     - name: Resolve iso version
       id: iso-version
       run: |
@@ -389,6 +400,9 @@ jobs:
       with:
         go-version-file: 'go.mod'
         cache: true
+
+    - name: Disable Go problem matcher for tests
+      run: echo '::remove-matcher owner=go::'
 
     - name: Resolve iso version
       id: iso-version
@@ -574,6 +588,9 @@ jobs:
       with:
         go-version-file: 'go.mod'
         cache: true
+
+    - name: Disable Go problem matcher for tests
+      run: echo '::remove-matcher owner=go::'
 
     - name: Resolve iso version
       id: iso-version
