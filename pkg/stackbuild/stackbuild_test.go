@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/docker/cli/cli/config"
@@ -29,6 +30,14 @@ import (
 
 // helper function to execute LLB locally
 func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Reader)) {
+	t.Helper()
+	solveLLB(t, startBuildkit(t), "/tmp/test-cache", dir, state, check...)
+}
+
+// startBuildkit runs a throwaway buildkitd container and returns a client for
+// it. Solving more than once against the same client shares its cache, which
+// is how a test checks what a rebuild reuses.
+func startBuildkit(t *testing.T) *buildkit.Client {
 	t.Helper()
 	ctx := context.Background()
 
@@ -62,7 +71,7 @@ func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Rea
 	)
 	require.NoError(t, err)
 
-	defer func() {
+	t.Cleanup(func() {
 		err := cl.ContainerKill(ctx, resp.ID, "KILL")
 		if err != nil {
 			t.Logf("failed to kill container: %v", err)
@@ -74,7 +83,7 @@ func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Rea
 		if err != nil {
 			t.Logf("failed to remove container: %v", err)
 		}
-	}()
+	})
 
 	var buf bytes.Buffer
 
@@ -88,7 +97,6 @@ func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Rea
 			t.Logf("failed to get container logs: %v", err)
 		}
 		defer r.Close()
-
 		io.Copy(&buf, r)
 	}()
 
@@ -97,16 +105,45 @@ func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Rea
 
 	c, err := buildkit.New(ctx, "docker-container://"+resp.ID)
 	require.NoError(t, err)
-	defer c.Close()
+	t.Cleanup(func() { c.Close() })
 
 	_, err = c.Info(ctx)
 	require.NoError(t, err)
+
+	return c
+}
+
+// solveLLB builds state on c, runs each check against the exported tar, and
+// returns the vertices the solve reported, so a caller can see which steps
+// came from cache. A non-empty cacheDir imports and exports a cache on the
+// host. Leave it empty to rely only on c's own cache, as the cluster builder
+// does; the export keeps only final image layers, so builder steps restored
+// from it are never stored locally and miss on the next solve.
+func solveLLB(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb.State, check ...func(f io.Reader)) map[string]*buildkit.Vertex {
+	t.Helper()
+	ctx := context.Background()
 
 	def, err := state.Marshal(ctx)
 	require.NoError(t, err)
 
 	pw, err := progresswriter.NewPrinter(ctx, os.Stdout, "plain")
 	require.NoError(t, err)
+
+	// Tee the status stream: the printer gets everything, and we keep the
+	// final state of each vertex by name.
+	vertices := map[string]*buildkit.Vertex{}
+	status := make(chan *buildkit.SolveStatus)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(pw.Status())
+		for st := range status {
+			for _, v := range st.Vertexes {
+				vertices[v.Name] = v
+			}
+			pw.Status() <- st
+		}
+	}()
 
 	f, err := os.CreateTemp(t.TempDir(), "buildkit-llb")
 	require.NoError(t, err)
@@ -118,7 +155,7 @@ func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Rea
 
 	da := authprovider.NewDockerAuthProvider(cfg, nil)
 
-	_, err = c.Solve(ctx, def, buildkit.SolveOpt{
+	solveOpt := buildkit.SolveOpt{
 		Session: []session.Attachable{
 			da,
 		},
@@ -133,23 +170,29 @@ func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Rea
 				},
 			},
 		},
-		CacheExports: []buildkit.CacheOptionsEntry{
+	}
+	if cacheDir != "" {
+		solveOpt.CacheExports = []buildkit.CacheOptionsEntry{
 			{
 				Type: "local",
 				Attrs: map[string]string{
-					"dest": "/tmp/test-cache",
+					"dest": cacheDir,
 				},
 			},
-		},
-		CacheImports: []buildkit.CacheOptionsEntry{
+		}
+		solveOpt.CacheImports = []buildkit.CacheOptionsEntry{
 			{
 				Type: "local",
 				Attrs: map[string]string{
-					"src": "/tmp/test-cache",
+					"src": cacheDir,
 				},
 			},
-		},
-	}, pw.Status())
+		}
+	}
+
+	_, err = c.Solve(ctx, def, solveOpt, status)
+	<-done
+	<-pw.Done()
 	require.NoError(t, err)
 
 	f, err = os.Open(f.Name())
@@ -160,7 +203,7 @@ func buildLLB(t *testing.T, dir string, state *llb.State, check ...func(f io.Rea
 		cf(f)
 	}
 
-	require.NoError(t, err)
+	return vertices
 }
 
 func setupTestDir(root string, t *testing.T) string {
@@ -689,7 +732,11 @@ func TestGo(t *testing.T) {
 			dir: dir,
 		},
 	}
-	state, err := stack.GenerateLLB(context.Background(), dir, BuildOptions{Version: "1.23"})
+	opts := BuildOptions{Version: "1.23"}
+	stack.Init(opts)
+	require.True(t, stack.splitDeps, "a plain module should compile its dependencies in their own layer")
+
+	state, err := stack.GenerateLLB(context.Background(), dir, opts)
 	require.NoError(t, err)
 
 	buildLLB(t, dir, state, func(r io.Reader) {
@@ -723,6 +770,66 @@ func TestGo(t *testing.T) {
 		require.False(t, names["usr/local/go/bin/go"], "runtime image must not carry the Go toolchain")
 		require.True(t, names["etc/passwd"], "distroless runtime should have an app-user passwd entry")
 	})
+}
+
+// TestGoDepsLayerSurvivesSourceEdits verifies that the compiled dependencies
+// are keyed on what the app imports rather than on its source: an edit that
+// keeps the imports reuses them, and a changed import set reruns the step.
+func TestGoDepsLayerSurvivesSourceEdits(t *testing.T) {
+	if !checkDocker() {
+		t.Skip("Docker not available")
+	}
+
+	root := t.TempDir()
+	dir := setupTestDir(root, t)
+
+	mainGo := readFile(t, "go/main.go")
+	files := map[string]string{
+		"go.mod":  readFile(t, "go/go.mod"),
+		"go.sum":  readFile(t, "go/go.sum"),
+		"main.go": mainGo,
+	}
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0644))
+	}
+
+	build := func(c *buildkit.Client) map[string]*buildkit.Vertex {
+		stack := &GoStack{MetaStack: MetaStack{dir: dir}}
+		opts := BuildOptions{Version: "1.23"}
+		stack.Init(opts)
+		state, err := stack.GenerateLLB(context.Background(), dir, opts)
+		require.NoError(t, err)
+		return solveLLB(t, c, "", dir, state)
+	}
+
+	const (
+		compileDeps = "[phase] Compiling Go dependencies"
+		buildApp    = "[phase] Building Go application"
+	)
+
+	c := startBuildkit(t)
+
+	first := build(c)
+	require.Contains(t, first, compileDeps)
+	require.False(t, first[compileDeps].Cached, "first build has nothing to reuse")
+
+	// Same imports, different code.
+	edited := strings.Replace(mainGo, "Hello, World!", "Hello again!", 1)
+	require.NotEqual(t, mainGo, edited)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(edited), 0644))
+
+	second := build(c)
+	require.True(t, second[compileDeps].Cached, "a source edit that keeps the imports should reuse the compiled dependencies")
+	require.False(t, second[buildApp].Cached, "the application itself should rebuild")
+
+	// Dropping the only non-local import changes the list, so the dependency
+	// step reruns.
+	withoutImport := strings.Replace(edited, `_ "github.com/gorilla/mux"`, "", 1)
+	require.NotEqual(t, edited, withoutImport)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(withoutImport), 0644))
+
+	third := build(c)
+	require.False(t, third[compileDeps].Cached, "a changed import set should rerun the dependency step")
 }
 
 // TestGoRuntimeIncludesNonGoFiles verifies that a pure-Go app lands on the
@@ -830,6 +937,63 @@ func TestGoCgo(t *testing.T) {
 		_, hasToolchain := m["usr/local/go/bin/go"]
 		require.False(t, hasToolchain, "runtime image must not carry the Go toolchain")
 	})
+}
+
+func TestGoDepsSplitBlocker(t *testing.T) {
+	cases := []struct {
+		name    string
+		files   map[string]string
+		blocked string
+	}{
+		{
+			name:  "plain module",
+			files: map[string]string{"go.mod": "module example.com/app\n\ngo 1.23\n\nrequire github.com/gorilla/mux v1.8.1\n"},
+		},
+		{
+			name: "replace with another module version",
+			files: map[string]string{"go.mod": "module example.com/app\n\ngo 1.23\n\n" +
+				"replace github.com/gorilla/mux => github.com/example/mux v1.8.2\n"},
+		},
+		{
+			name: "replace with a local directory",
+			files: map[string]string{"go.mod": "module example.com/app\n\ngo 1.23\n\n" +
+				"replace example.com/lib => ./lib\n"},
+			blocked: "go.mod replaces example.com/lib with a local directory",
+		},
+		{
+			name: "workspace",
+			files: map[string]string{
+				"go.mod":  "module example.com/app\n\ngo 1.23\n",
+				"go.work": "go 1.23\n\nuse .\n",
+			},
+			blocked: "go.work workspace",
+		},
+		{
+			name: "vendored",
+			files: map[string]string{
+				"go.mod":             "module example.com/app\n\ngo 1.23\n",
+				"vendor/modules.txt": "",
+			},
+			blocked: "vendor directory",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, content := range tc.files {
+				path := filepath.Join(dir, name)
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
+				require.NoError(t, os.WriteFile(path, []byte(content), 0644))
+			}
+
+			stack := &GoStack{MetaStack: MetaStack{dir: dir}}
+			stack.Init(BuildOptions{})
+
+			require.Equal(t, tc.blocked, stack.depsSplitBlocker())
+			require.Equal(t, tc.blocked == "", stack.splitDeps)
+		})
+	}
 }
 
 func TestGoWithVendor(t *testing.T) {
