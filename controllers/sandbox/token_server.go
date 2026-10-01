@@ -17,12 +17,13 @@ import (
 	"sync"
 	"time"
 
+	"miren.dev/runtime/network"
 	"miren.dev/runtime/pkg/entity"
 	"miren.dev/runtime/pkg/workloadidentity"
 	"miren.dev/runtime/servers/metricspush"
 )
 
-const tokenServerPort = 7123
+const tokenServerPort = network.TokenServerPort
 
 // tokenSecretFilename is the host-side file (under the sandbox's data dir) where a
 // sandbox's token-request secret is persisted so it can be re-registered with the
