@@ -32,7 +32,8 @@
         "miren.dev/runtime/pkg/imagerefs",
         "miren.dev/runtime/pkg/serverconfig",
         "miren.dev/runtime/pkg/tasks",
-        "miren.dev/runtime/pkg/shellwords"
+        "miren.dev/runtime/pkg/shellwords",
+        "miren.dev/runtime/x/workloadid"
       ]
     },
     {
