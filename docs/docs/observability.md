@@ -158,11 +158,23 @@ When a remote-write destination is configured, the coordinator also ships its
 own operational series through the same pipeline: the control process's Go
 heap, goroutine count and resident memory (`go_*`, `process_resident_memory_bytes`),
 embedded etcd backend health (`etcd_db_size_bytes`, `etcd_nospace_alarm`,
-`etcd_nospace_recovery_total`, and friends), host usage (`node_*`), and reconcile
-controller queue depths (`reconcile_controller_*`). Shipped copies carry
+`etcd_nospace_recovery_total`, and friends), host usage (`node_*`), reconcile
+controller queue depths (`reconcile_controller_*`), and a count of the log lines
+it has printed (`miren_log_messages_total`). Shipped copies carry
 `miren_cluster` and `miren_runner` so series pooled from many clusters stay
 distinct. These series also remain in the cluster's embedded VictoriaMetrics,
 unlabeled, where the node is implicit.
+
+`miren_log_messages_total` is labeled by `level` (`debug`, `info`, `warn`,
+`error`) and `source`. The source is `miren` for the runtime's own lines, or
+the name of a child process whose output the runtime relays into its log:
+`vmagent`, `victoriametrics`, `victorialogs`, `buildkit`, `etcd`, `etcdutl` or
+`containerd`. A relayed line counts at the child's own level, even though the
+runtime prints most child output at `INFO`, so
+`miren_log_messages_total{source="miren", level="error"}` is the runtime's own
+error rate, and a spike under another source points at that child process. Only
+printed lines are counted, so the `debug` count depends on the log level the
+process runs at.
 
 There is no separate switch. Configuring the destination turns on application
 metrics and runtime metrics together, and delivery failures for both appear in

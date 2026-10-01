@@ -12,6 +12,8 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"miren.dev/runtime/pkg/logcount"
 )
 
 func TestLogWriter(t *testing.T) {
@@ -764,4 +766,119 @@ func TestContainerdNonJSONLogs(t *testing.T) {
 
 	err := writer.Close()
 	require.NoError(t, err)
+}
+
+func countingLogger(buf *bytes.Buffer) (*slog.Logger, *logcount.Counts) {
+	counts := &logcount.Counts{}
+	inner := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})
+	return slog.New(logcount.NewHandler(inner, counts)), counts
+}
+
+func TestClampKeepsOriginalLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	writer := newLogWriter(logger, slog.LevelInfo, LoggerOpts{
+		ParseKeyValue: true, ClampLevel: true, MaxLevel: slog.LevelInfo,
+	})
+	_, err := writer.Write([]byte(`level=error msg="failed to dial"` + "\n"))
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.Contains(t, out, "level=INFO")
+	assert.Contains(t, out, "orig-level=ERROR")
+}
+
+func TestVictoriaParsing(t *testing.T) {
+	var buf bytes.Buffer
+	logger, counts := countingLogger(&buf)
+
+	writer := newLogWriter(logger, slog.LevelInfo, LoggerOpts{
+		ParseVictoria: true, ClampLevel: true, MaxLevel: slog.LevelInfo,
+		Source: logcount.SourceVMAgent,
+	})
+	lines := strings.Join([]string{
+		"2026-09-28T18:00:00.000Z\tinfo\tVictoriaMetrics/lib/httpserver/httpserver.go:121\tstarting server at http://127.0.0.1:8429/",
+		"2026-09-28T18:00:01.000Z\terror\tVictoriaMetrics/app/vmagent/remotewrite/client.go:477\tunexpected status code received after sending a block to \"https://metrics.example.com/api/v1/write\": 401",
+		"2026-09-28T18:00:02.000Z\twarn\tVictoriaMetrics/app/vmagent/remotewrite/client.go:390\tcouldn't send a block",
+		"not in the victoria format",
+	}, "\n") + "\n"
+	_, err := writer.Write([]byte(lines))
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.Contains(t, out, `msg="unexpected status code received after sending a block to`)
+	assert.Contains(t, out, "caller=VictoriaMetrics/app/vmagent/remotewrite/client.go:477")
+	assert.Contains(t, out, "orig-level=ERROR")
+	assert.NotContains(t, out, " level=ERROR", "the child's error is still printed at the clamped level")
+	assert.NotContains(t, out, "2026-09-28T18:00:01", "the child's own timestamp is dropped")
+
+	assert.Equal(t, uint64(2), counts.Load(logcount.SourceVMAgent, 1), "the info line and the unparsed line")
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceVMAgent, 2))
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceVMAgent, 3))
+	for level := range logcount.Levels {
+		assert.Zero(t, counts.Load(logcount.SourceMiren, level))
+	}
+}
+
+func TestRelayCountsUnderModuleSource(t *testing.T) {
+	var buf bytes.Buffer
+	logger, counts := countingLogger(&buf)
+
+	var streams cio.Streams
+	loggerStreams(logger, "etcd", WithJSONParsing(), WithMaxLevel(slog.LevelInfo))(&streams)
+
+	_, err := streams.Stderr.Write([]byte(`{"level":"warn","msg":"slow fdatasync"}` + "\n" + `{"level":"info","msg":"ok"}` + "\n"))
+	require.NoError(t, err)
+
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceEtcd, 2))
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceEtcd, 1))
+	assert.Zero(t, counts.Load(logcount.SourceMiren, 1))
+}
+
+func TestUnsourcedWriterCountsAsMiren(t *testing.T) {
+	var buf bytes.Buffer
+	logger, counts := countingLogger(&buf)
+
+	writer := NewWriter(logger, slog.LevelWarn)
+	_, err := writer.Write([]byte("something happened\n"))
+	require.NoError(t, err)
+
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceMiren, 2))
+}
+
+func TestBuildkitLogrusLines(t *testing.T) {
+	var buf bytes.Buffer
+	logger, counts := countingLogger(&buf)
+
+	var streams cio.Streams
+	loggerStreams(logger, "buildkit", WithKeyValueParsing(), WithMaxLevel(slog.LevelInfo))(&streams)
+
+	lines := strings.Join([]string{
+		`time="2026-09-28T18:00:00Z" level=debug msg="fetch response received" response.header.content-length=0 response.status="404 Not Found"`,
+		`time="2026-09-28T18:00:01Z" level=error msg="/moby.buildkit.v1.Control/Solve returned error: rpc error: code = Canceled desc = context canceled"`,
+		`2026/09/28 18:00:02 failed to upload metrics: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found)`,
+	}, "\n") + "\n"
+	_, err := streams.Stderr.Write([]byte(lines))
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.NotContains(t, out, "fetch response received", "debug chatter stays below Info")
+	assert.Contains(t, out, "orig-level=ERROR")
+	assert.Contains(t, out, "failed to upload metrics")
+
+	assert.Zero(t, counts.Load(logcount.SourceBuildkit, 0), "filtered lines are not counted")
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceBuildkit, 1))
+	assert.Equal(t, uint64(1), counts.Load(logcount.SourceBuildkit, 3))
+}
+
+func TestKeyValueKeepsDottedKeys(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	writer := newLogWriter(logger, slog.LevelInfo, LoggerOpts{ParseKeyValue: true})
+	_, err := writer.Write([]byte(`level=debug msg=fetched response.header.content-length=0` + "\n"))
+	require.NoError(t, err)
+
+	assert.Contains(t, buf.String(), "response.header.content-length=0")
 }

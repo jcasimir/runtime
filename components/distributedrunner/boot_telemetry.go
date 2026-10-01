@@ -126,6 +126,9 @@ func (b *telemetryBoot) start(ctx context.Context, access clusterAccessBootOutpu
 		processInfo := metrics.NewProcessInfo(b.inputs.log, operational)
 		processInfo.Entity = metrics.EntityRunner
 		go processInfo.Monitor(ctx)
+		logMessages := metrics.NewLogMessages(b.inputs.log, operational)
+		logMessages.Entity = metrics.EntityRunner
+		go logMessages.Monitor(ctx)
 	} else {
 		b.inputs.log.Warn("no VictoriaMetrics address configured, sandbox metrics will not be recorded")
 	}

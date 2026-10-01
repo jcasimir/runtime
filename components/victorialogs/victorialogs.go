@@ -68,7 +68,8 @@ func NewVictoriaLogsComponent(log *slog.Logger, cc *containerd.Client, namespace
 }
 
 func (c *VictoriaLogsComponent) createTask(ctx context.Context, container containerd.Container) (containerd.Task, error) {
-	return container.NewTask(ctx, slogout.WithLogger(c.Log, "victorialogs"))
+	return container.NewTask(ctx, slogout.WithLogger(c.Log, "victorialogs",
+		slogout.WithVictoriaParsing(), slogout.WithMaxLevel(slog.LevelInfo)))
 }
 
 func (c *VictoriaLogsComponent) getReadyPort() int {
@@ -269,7 +270,8 @@ func (c *VictoriaLogsComponent) restartExistingContainer(ctx context.Context, co
 	c.httpPort = config.HTTPPort
 	c.config = config
 
-	task, err := container.Task(ctx, slogout.AttachLogger(c.Log, "victorialogs"))
+	task, err := container.Task(ctx, slogout.AttachLogger(c.Log, "victorialogs",
+		slogout.WithVictoriaParsing(), slogout.WithMaxLevel(slog.LevelInfo)))
 	if err == nil {
 		status, err := task.Status(ctx)
 		if err != nil {

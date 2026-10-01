@@ -103,6 +103,13 @@ func NewExternalComponent(log *slog.Logger, socketPath string) *Component {
 	}
 }
 
+// buildkitd runs with debug = true and logs through logrus, so its lines
+// carry their own level=. Parsing it keeps that debug chatter at Debug
+// instead of flooding Info, and lets buildkit's real errors count as errors.
+var buildkitLogOptions = []slogout.LoggerOption{
+	slogout.WithKeyValueParsing(), slogout.WithMaxLevel(slog.LevelInfo),
+}
+
 // Start starts the BuildKit daemon container.
 // For external components, this verifies the socket is accessible.
 func (c *Component) Start(ctx context.Context, config Config) error {
@@ -193,7 +200,7 @@ func (c *Component) Start(ctx context.Context, config Config) error {
 	c.container = container
 
 	// Create the task with structured logging.
-	task, err := container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit"))
+	task, err := container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit", buildkitLogOptions...))
 	if err != nil {
 		container.Delete(ctx, containerd.WithSnapshotCleanup)
 		c.container = nil
@@ -509,7 +516,7 @@ func (c *Component) restartExistingContainer(ctx context.Context, container cont
 		func(ctx context.Context, task containerd.Task) error { return c.stopTask(ctx, task) },
 		func(ctx context.Context, id string) error { return base.ReapLeakedTask(ctx, c.CC, id) },
 		func(ctx context.Context) (containerd.Task, error) {
-			return container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit"))
+			return container.NewTask(ctx, slogout.WithLogger(c.Log, "buildkit", buildkitLogOptions...))
 		})
 	if err != nil {
 		c.container = nil
