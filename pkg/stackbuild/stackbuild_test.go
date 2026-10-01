@@ -20,6 +20,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/util/progress/progresswriter"
+	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
 
 	"miren.dev/runtime/pkg/imagerefs"
@@ -113,13 +114,19 @@ func startBuildkit(t *testing.T) *buildkit.Client {
 	return c
 }
 
+// solvedVertex is a step from a solve, with the output it logged.
+type solvedVertex struct {
+	*buildkit.Vertex
+	Log string
+}
+
 // solveLLB builds state on c, runs each check against the exported tar, and
 // returns the vertices the solve reported, so a caller can see which steps
 // came from cache. A non-empty cacheDir imports and exports a cache on the
 // host. Leave it empty to rely only on c's own cache, as the cluster builder
 // does; the export keeps only final image layers, so builder steps restored
 // from it are never stored locally and miss on the next solve.
-func solveLLB(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb.State, check ...func(f io.Reader)) map[string]*buildkit.Vertex {
+func solveLLB(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb.State, check ...func(f io.Reader)) map[string]*solvedVertex {
 	t.Helper()
 	ctx := context.Background()
 
@@ -130,8 +137,9 @@ func solveLLB(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb
 	require.NoError(t, err)
 
 	// Tee the status stream: the printer gets everything, and we keep the
-	// final state of each vertex by name.
-	vertices := map[string]*buildkit.Vertex{}
+	// final state of each vertex by name, with its log.
+	vertices := map[string]*solvedVertex{}
+	byDigest := map[digest.Digest]*solvedVertex{}
 	status := make(chan *buildkit.SolveStatus)
 	done := make(chan struct{})
 	go func() {
@@ -139,7 +147,18 @@ func solveLLB(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb
 		defer close(pw.Status())
 		for st := range status {
 			for _, v := range st.Vertexes {
-				vertices[v.Name] = v
+				sv := byDigest[v.Digest]
+				if sv == nil {
+					sv = &solvedVertex{}
+					byDigest[v.Digest] = sv
+				}
+				sv.Vertex = v
+				vertices[v.Name] = sv
+			}
+			for _, l := range st.Logs {
+				if sv := byDigest[l.Vertex]; sv != nil {
+					sv.Log += string(l.Data)
+				}
 			}
 			pw.Status() <- st
 		}
@@ -793,7 +812,7 @@ func TestGoDepsLayerSurvivesSourceEdits(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0644))
 	}
 
-	build := func(c *buildkit.Client) map[string]*buildkit.Vertex {
+	build := func(c *buildkit.Client) map[string]*solvedVertex {
 		stack := &GoStack{MetaStack: MetaStack{dir: dir}}
 		opts := BuildOptions{Version: "1.23"}
 		stack.Init(opts)
@@ -1221,16 +1240,188 @@ func TestRust(t *testing.T) {
 	}
 	require.True(t, stack.Detect())
 	stack.Init(BuildOptions{Version: "1"})
+	require.True(t, stack.splitDeps, "a single-package crate should compile its dependencies in their own layer")
 	state, err := stack.GenerateLLB(context.Background(), dir, BuildOptions{Version: "1"})
 	require.NoError(t, err)
 
 	buildLLB(t, dir, state, func(r io.Reader) {
 		m, err := tarx.TarToMap(r)
 		require.NoError(t, err)
-		data, ok := m["bin/app"]
-		require.True(t, ok)
-		require.NotEmpty(t, data)
+		// /bin is a symlink to usr/bin in the rust image.
+		require.NotEmpty(t, m["usr/bin/app"], "built binary should be present at /bin/app")
+		for name := range m {
+			require.False(t, strings.HasPrefix(name, "app/target/"),
+				"the compiled dependencies must stay on the builder, found %s", name)
+		}
 	})
+}
+
+// TestRustDepsLayerSurvivesSourceEdits verifies that the compiled dependencies
+// are keyed on Cargo.toml and Cargo.lock, and that a source edit still reaches
+// the binary despite the placeholder build that came before it.
+func TestRustDepsLayerSurvivesSourceEdits(t *testing.T) {
+	if !checkDocker() {
+		t.Skip("Docker not available")
+	}
+
+	root := t.TempDir()
+	dir := setupTestDir(root, t)
+
+	mainRs := readFile(t, "rust-deps/src/main.rs")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "src"), 0755))
+	for name, content := range map[string]string{
+		"Cargo.toml":  readFile(t, "rust-deps/Cargo.toml"),
+		"Cargo.lock":  readFile(t, "rust-deps/Cargo.lock"),
+		"src/main.rs": mainRs,
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0644))
+	}
+
+	binary := func(r io.Reader) []byte {
+		m, err := tarx.TarToMap(r)
+		require.NoError(t, err)
+		return m["usr/bin/app"]
+	}
+
+	var bin []byte
+	build := func(c *buildkit.Client) map[string]*solvedVertex {
+		stack := &RustStack{MetaStack: MetaStack{dir: dir}}
+		require.True(t, stack.Detect())
+		opts := BuildOptions{Version: "1"}
+		stack.Init(opts)
+		require.True(t, stack.splitDeps)
+		state, err := stack.GenerateLLB(context.Background(), dir, opts)
+		require.NoError(t, err)
+		return solveLLB(t, c, "", dir, state, func(r io.Reader) { bin = binary(r) })
+	}
+
+	const (
+		compileDeps = "[phase] Compiling Rust dependencies"
+		buildApp    = "[phase] Building Rust application"
+	)
+
+	c := startBuildkit(t)
+
+	first := build(c)
+	require.Contains(t, first, compileDeps)
+	require.False(t, first[compileDeps].Cached, "first build has nothing to reuse")
+	require.Contains(t, string(bin), "greeting number", "the first binary should be the app, not the placeholder")
+
+	edited := strings.Replace(mainRs, "greeting number", "salutation number", 1)
+	require.NotEqual(t, mainRs, edited)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "src/main.rs"), []byte(edited), 0644))
+
+	second := build(c)
+	require.True(t, second[compileDeps].Cached, "a source edit should reuse the compiled dependencies")
+	require.False(t, second[buildApp].Cached, "the application itself should rebuild")
+	require.Contains(t, string(bin), "salutation number", "the rebuilt binary should carry the edit")
+	// A cached dependency step only helps if the app build can use it. Any
+	// drift between the two (flags, features, toolchain) would show up as
+	// cargo compiling the dependency again here.
+	require.Contains(t, second[buildApp].Log, "Compiling deps-app")
+	require.NotContains(t, second[buildApp].Log, "Compiling itoa",
+		"the application build should reuse the dependencies compiled in their own layer")
+}
+
+func TestRustDepsSplitBlocker(t *testing.T) {
+	const lock = "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n"
+	const pkg = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+
+	cases := []struct {
+		name    string
+		files   map[string]string
+		blocked string
+	}{
+		{
+			name:  "single package",
+			files: map[string]string{"Cargo.toml": pkg, "Cargo.lock": lock, "src/main.rs": ""},
+		},
+		{
+			name:  "single package with a library",
+			files: map[string]string{"Cargo.toml": pkg, "Cargo.lock": lock, "src/main.rs": "", "src/lib.rs": ""},
+		},
+		{
+			name:    "virtual workspace",
+			files:   map[string]string{"Cargo.toml": "[workspace]\nmembers = [\"a\"]\n", "Cargo.lock": lock},
+			blocked: "cargo workspace",
+		},
+		{
+			name:    "package that is also a workspace root",
+			files:   map[string]string{"Cargo.toml": pkg + "\n[workspace]\n", "Cargo.lock": lock, "src/main.rs": ""},
+			blocked: "cargo workspace",
+		},
+		{
+			name:    "build script",
+			files:   map[string]string{"Cargo.toml": pkg, "Cargo.lock": lock, "src/main.rs": "", "build.rs": ""},
+			blocked: "build script",
+		},
+		{
+			name:    "explicit binary target",
+			files:   map[string]string{"Cargo.toml": pkg + "\n[[bin]]\nname = \"x\"\npath = \"bin/x.rs\"\n", "Cargo.lock": lock, "src/main.rs": ""},
+			blocked: "custom target layout",
+		},
+		{
+			name:    "declared bench target",
+			files:   map[string]string{"Cargo.toml": pkg + "\n[[bench]]\nname = \"x\"\nharness = false\n", "Cargo.lock": lock, "src/main.rs": ""},
+			blocked: "custom target layout",
+		},
+		{
+			name: "vendored through cargo config",
+			files: map[string]string{
+				"Cargo.toml":         pkg,
+				"Cargo.lock":         lock,
+				"src/main.rs":        "",
+				".cargo/config.toml": "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n",
+			},
+			blocked: "vendored dependencies",
+		},
+		{
+			name: "cargo config naming a private registry",
+			files: map[string]string{
+				"Cargo.toml":         pkg,
+				"Cargo.lock":         lock,
+				"src/main.rs":        "",
+				".cargo/config.toml": "[registries.private]\nindex = \"sparse+https://cargo.example.com/index/\"\n",
+			},
+		},
+		{
+			name:    "binaries under src/bin",
+			files:   map[string]string{"Cargo.toml": pkg, "Cargo.lock": lock, "src/bin/x.rs": ""},
+			blocked: "custom target layout",
+		},
+		{
+			name:    "no lockfile",
+			files:   map[string]string{"Cargo.toml": pkg, "src/main.rs": ""},
+			blocked: "no Cargo.lock",
+		},
+		{
+			name: "path dependency",
+			files: map[string]string{
+				"Cargo.toml":  pkg,
+				"Cargo.lock":  lock + "\n[[package]]\nname = \"lib\"\nversion = \"0.1.0\"\n",
+				"src/main.rs": "",
+			},
+			blocked: "path dependencies",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, content := range tc.files {
+				path := filepath.Join(dir, name)
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
+				require.NoError(t, os.WriteFile(path, []byte(content), 0644))
+			}
+
+			stack := &RustStack{MetaStack: MetaStack{dir: dir}}
+			require.True(t, stack.Detect())
+			stack.Init(BuildOptions{})
+
+			require.Equal(t, tc.blocked, stack.depsSplitBlocker(stack.parseCargoToml()))
+			require.Equal(t, tc.blocked == "", stack.splitDeps)
+		})
+	}
 }
 
 func TestPythonUv(t *testing.T) {
