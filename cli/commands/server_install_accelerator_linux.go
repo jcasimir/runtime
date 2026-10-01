@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -14,9 +15,13 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
+	buildkitclient "github.com/moby/buildkit/client"
+	"github.com/tonistiigi/fsutil"
 	"golang.org/x/sys/unix"
 	"miren.dev/runtime/components/buildkit"
 	containerdcomp "miren.dev/runtime/components/containerd"
+	containerimage "miren.dev/runtime/image"
+	buildkitbuild "miren.dev/runtime/pkg/buildkit"
 	"miren.dev/runtime/pkg/lbdmod"
 	"miren.dev/runtime/pkg/lbdmod/ctrbuild"
 )
@@ -107,7 +112,7 @@ func installServerDiskAccelerator(ctx *Context) error {
 				}
 			}()
 		}
-		if err := buildLocalLbdToolchain(ctx, socket, buildkitSocket, image, releaseDir); err != nil {
+		if err := buildLocalLbdToolchain(ctx, cc, buildkitSocket, image); err != nil {
 			return err
 		}
 	}
@@ -169,12 +174,7 @@ func unixSocketListening(path string) (bool, error) {
 	return true, nil
 }
 
-func buildLocalLbdToolchain(ctx *Context, socket, buildkitSocket, image, releaseDir string) error {
-	for _, name := range []string{"nerdctl", "buildctl"} {
-		if _, err := os.Stat(filepath.Join(releaseDir, name)); err != nil {
-			return fmt.Errorf("server release %s is unavailable: %w", name, err)
-		}
-	}
+func buildLocalLbdToolchain(ctx *Context, cc *containerd.Client, buildkitSocket, image string) error {
 	dir, err := os.MkdirTemp("", "miren-lbd-builder-")
 	if err != nil {
 		return err
@@ -183,16 +183,38 @@ func buildLocalLbdToolchain(ctx *Context, socket, buildkitSocket, image, release
 	if err := lbdmod.MaterializeBuilder(dir); err != nil {
 		return err
 	}
+	bkc, err := buildkitclient.New(ctx, "unix://"+buildkitSocket)
+	if err != nil {
+		return fmt.Errorf("connecting to BuildKit: %w", err)
+	}
+	defer bkc.Close()
 
 	ctx.Begin("Building the local lbd toolchain image")
-	cmd := exec.CommandContext(ctx, filepath.Join(releaseDir, "nerdctl"), "--address", socket, "--namespace", ctrbuild.DefaultNamespace,
-		"build", "--tag", image, dir)
-	cmd.Env = append(os.Environ(), "BUILDKIT_HOST=unix://"+buildkitSocket,
-		"PATH="+releaseDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	cmd.Stdout = ctx.Stdout
-	cmd.Stderr = ctx.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("building the lbd toolchain with nerdctl: %w", err)
+	return solveAndImportLbdToolchain(ctx, ctx.Log, bkc, cc, dir, image)
+}
+
+func solveAndImportLbdToolchain(ctx context.Context, log *slog.Logger, bkc *buildkitclient.Client, cc *containerd.Client, dir, image string) error {
+	dfs, err := fsutil.NewFS(dir)
+	if err != nil {
+		return fmt.Errorf("opening the lbd builder context: %w", err)
+	}
+	r, w := io.Pipe()
+	importDone := make(chan error, 1)
+	go func() {
+		err := containerimage.NewImageImporter(cc, ctrbuild.DefaultNamespace).ImportImage(ctx, r, image)
+		r.CloseWithError(err)
+		importDone <- err
+	}()
+	_, buildErr := (&buildkitbuild.Buildkit{Client: bkc, Log: log}).BuildImage(ctx, dfs,
+		buildkitbuild.BuildStack{Stack: "dockerfile", Input: lbdmod.BuilderDockerfile},
+		func() (io.WriteCloser, error) { return w, nil })
+	w.CloseWithError(buildErr)
+	importErr := <-importDone
+	if buildErr != nil {
+		return fmt.Errorf("building the lbd toolchain image: %w", buildErr)
+	}
+	if importErr != nil {
+		return fmt.Errorf("importing the lbd toolchain image: %w", importErr)
 	}
 	return nil
 }

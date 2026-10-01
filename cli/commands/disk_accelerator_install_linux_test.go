@@ -2,16 +2,24 @@ package commands
 
 import (
 	"context"
-	"io"
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/stretchr/testify/require"
 	"miren.dev/runtime/clientconfig"
+	"miren.dev/runtime/components/buildkit"
+	"miren.dev/runtime/pkg/containerdx"
 	"miren.dev/runtime/pkg/labs"
+	"miren.dev/runtime/pkg/lbdmod"
+	"miren.dev/runtime/pkg/lbdmod/ctrbuild"
 	"miren.dev/runtime/pkg/runnerconfig"
 )
 
@@ -156,47 +164,52 @@ func TestLocalDiskAcceleratorLockCoversRuntimeLifetime(t *testing.T) {
 	unlock()
 }
 
-func TestBuildLocalLbdToolchainUsesEmbeddedContextAndLocalNamespace(t *testing.T) {
+func TestSolveAndImportLbdToolchain(t *testing.T) {
+	if os.Getenv("CONTAINERD_ADDRESS") == "" || os.Getenv("SKIP_COMPONENT_TEST") != "" {
+		t.Skip("requires the iso containerd environment")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cc, err := containerd.New(containerdx.DefaultSocket)
+	require.NoError(t, err)
+	defer cc.Close()
+	logger := slog.New(slog.DiscardHandler)
+	component := buildkit.NewComponent(logger, cc, ctrbuild.DefaultNamespace, t.TempDir())
+	require.NoError(t, component.Start(ctx, buildkit.Config{SocketDir: t.TempDir()}))
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer stopCancel()
+		require.NoError(t, component.Stop(stopCtx))
+	}()
+	bkc, err := component.Client(ctx)
+	require.NoError(t, err)
+	defer bkc.Close()
+
+	// A small context exercises the same Dockerfile solve, OCI import and
+	// unpack as the embedded toolchain without installing kernel packages.
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "buildctl"), nil, 0755))
-	argsFile := filepath.Join(dir, "args")
-	nerdctl := filepath.Join(dir, "nerdctl")
-	require.NoError(t, os.WriteFile(nerdctl, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\nprintf '%s\\n' \"$BUILDKIT_HOST\" > \"$BUILDKIT_FILE\"\ntest -f \"$8/Dockerfile\" && test -f \"$8/build.sh\"\n"), 0755))
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("ARGS_FILE", argsFile)
-	buildkitFile := filepath.Join(dir, "buildkit-host")
-	t.Setenv("BUILDKIT_FILE", buildkitFile)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\nCOPY payload /payload\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payload"), []byte("lbd toolchain test"), 0644))
+	image := fmt.Sprintf("localhost/miren-system/lbd-builder:%s-test-%d", lbdmod.BuilderVersion(), time.Now().UnixNano())
+	require.NoError(t, solveAndImportLbdToolchain(ctx, logger, bkc, cc, dir, image))
+	imageCtx := namespaces.WithNamespace(ctx, ctrbuild.DefaultNamespace)
+	imported, err := cc.GetImage(imageCtx, image)
+	require.NoError(t, err)
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		require.NoError(t, cc.ImageService().Delete(namespaces.WithNamespace(cleanupCtx, ctrbuild.DefaultNamespace), image))
+	}()
+	unpacked, err := imported.IsUnpacked(imageCtx, "")
+	require.NoError(t, err)
+	require.True(t, unpacked, "the lbd builder must be unpacked before ctrbuild can run it")
 
-	ctx := &Context{Context: context.Background(), Stderr: io.Discard, Stdout: io.Discard}
-	require.NoError(t, buildLocalLbdToolchain(ctx, "/run/example.sock", "/run/example-buildkit.sock", "localhost/lbd:test", dir))
-	args, err := os.ReadFile(argsFile)
-	require.NoError(t, err)
-	fields := strings.Split(strings.TrimSpace(string(args)), "\n")
-	require.Equal(t, []string{"--address", "/run/example.sock", "--namespace", "miren", "build", "--tag", "localhost/lbd:test"}, fields[:7])
-	buildkitHost, err := os.ReadFile(buildkitFile)
-	require.NoError(t, err)
-	require.Equal(t, "unix:///run/example-buildkit.sock\n", string(buildkitHost))
-	_, err = os.Stat(fields[7])
-	require.ErrorIs(t, err, os.ErrNotExist, "temporary build context must be removed")
-}
-
-func TestBuildLocalLbdToolchainFindsBundledBuildctl(t *testing.T) {
-	home := t.TempDir()
-	oldRelease := filepath.Join(home, ".miren", "release")
-	require.NoError(t, os.MkdirAll(oldRelease, 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(oldRelease, "nerdctl"), []byte("#!/bin/sh\nexit 9\n"), 0755))
-	release := t.TempDir()
-	require.NoError(t, os.MkdirAll(release, 0755))
-	t.Setenv("HOME", home)
-	t.Setenv("SUDO_USER", "")
-	t.Setenv("PATH", t.TempDir()) // buildctl is only in the release
-	require.NoError(t, os.WriteFile(filepath.Join(release, "buildctl"), []byte("#!/bin/sh\nexit 0\n"), 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(release, "nerdctl"), []byte("#!/bin/sh\ncommand -v buildctl > \"$FOUND_BUILDCTL\"\n"), 0755))
-	found := filepath.Join(t.TempDir(), "buildctl-path")
-	t.Setenv("FOUND_BUILDCTL", found)
-	ctx := &Context{Context: context.Background(), Stderr: io.Discard, Stdout: io.Discard}
-	require.NoError(t, buildLocalLbdToolchain(ctx, "/run/example.sock", "/run/buildkit.sock", "localhost/lbd:test", release))
-	path, err := os.ReadFile(found)
-	require.NoError(t, err)
-	require.Equal(t, filepath.Join(release, "buildctl")+"\n", string(path))
+	badDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(badDir, "Dockerfile"), []byte("FROM scratch\nCOPY missing /payload\n"), 0644))
+	badCtx, badCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer badCancel()
+	badImage := image + "-bad"
+	require.ErrorContains(t, solveAndImportLbdToolchain(badCtx, logger, bkc, cc, badDir, badImage), "building the lbd toolchain image")
+	_, err = cc.GetImage(imageCtx, badImage)
+	require.Error(t, err, "a failed solve must not publish an image")
 }

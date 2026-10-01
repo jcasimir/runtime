@@ -236,24 +236,18 @@ func printMissingNetCommandGuidance(ctx *Context, missing []string) {
 }
 
 // ensureReleaseBundlePresent checks whether the full release bundle has been
-// downloaded to /var/lib/miren/release. The CLI-only bash installer also
-// places a miren binary there, so containerd is always required. Callers may
-// require newer bundle tools as well.
-func ensureReleaseBundlePresent(ctx *Context, branch string, required ...string) error {
-	binaries := append([]string{"containerd"}, required...)
-	missing := ""
-	for _, name := range binaries {
-		path := filepath.Join(releaseDir, name)
-		if _, err := os.Stat(path); err != nil {
-			if !os.IsNotExist(err) {
-				return fmt.Errorf("failed to inspect %s: %w", path, err)
-			}
-			missing = name
-			break
+// downloaded to /var/lib/miren/release. It uses the containerd binary as the
+// sentinel rather than the miren binary, because the CLI-only bash installer
+// also places a miren binary at that path. If containerd is missing, the full
+// bundle is downloaded.
+func ensureReleaseBundlePresent(ctx *Context, branch string) error {
+	sentinelPath := filepath.Join(releaseDir, "containerd")
+
+	if _, err := os.Stat(sentinelPath); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to inspect %s: %w", sentinelPath, err)
 		}
-	}
-	if missing != "" {
-		ctx.Info("Release bundle at %s is missing %s, downloading...", releaseDir, missing)
+		ctx.Info("Release bundle not found at %s, downloading...", releaseDir)
 
 		if err := PerformDownloadRelease(ctx, DownloadReleaseOptions{
 			Branch: branch,
@@ -263,12 +257,6 @@ func ensureReleaseBundlePresent(ctx *Context, branch string, required ...string)
 		}); err != nil {
 			return fmt.Errorf("failed to download release: %w", err)
 		}
-		for _, name := range binaries {
-			if _, err := os.Stat(filepath.Join(releaseDir, name)); err != nil {
-				return fmt.Errorf("downloaded release is missing %s: %w", name, err)
-			}
-		}
-
 		ctx.Completed("Release downloaded successfully")
 		fixSELinuxContext(ctx, releaseBinPath)
 	}
@@ -386,11 +374,7 @@ func ServerInstall(ctx *Context, opts struct {
 		ctx.Info("Skipping system requirements check (--skip-system-check specified)")
 	}
 
-	var required []string
-	if opts.DiskAccelerator {
-		required = []string{"nerdctl", "buildctl"}
-	}
-	if err := ensureReleaseBundlePresent(ctx, opts.Branch, required...); err != nil {
+	if err := ensureReleaseBundlePresent(ctx, opts.Branch); err != nil {
 		return err
 	}
 	if opts.DiskAccelerator {
