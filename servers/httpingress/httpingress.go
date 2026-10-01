@@ -1688,6 +1688,7 @@ func (h *Server) logInternalRequest(appEntityID, method, path string, statusCode
 	logMsg := fmt.Sprintf("status=%d method=%s path=\"%s\" access=internal duration_ms=%d response=%d",
 		statusCode, method, path, duration.Milliseconds(), responseBytes)
 
+	requestPath, query, _ := strings.Cut(path, "?")
 	err := h.logWriter.WriteEntry(appEntityID, observability.LogEntry{
 		Timestamp: time.Now(),
 		Stream:    observability.UserOOB,
@@ -1696,7 +1697,8 @@ func (h *Server) logInternalRequest(appEntityID, method, path string, statusCode
 			"source":      "router",
 			"status":      fmt.Sprint(statusCode),
 			"method":      method,
-			"path":        path,
+			"path":        requestPath,
+			"query":       query,
 			"access":      "internal",
 			"duration_ms": fmt.Sprint(duration.Milliseconds()),
 			"response":    fmt.Sprint(responseBytes),

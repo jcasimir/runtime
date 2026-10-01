@@ -411,16 +411,19 @@ func TestRouterLineRendering(t *testing.T) {
 		e.SetTimestamp(standard.ToTimestamp(ts))
 		e.SetStream("user-oob")
 		e.SetSource("router")
-		e.SetLine(`status=200 method=GET path="/internal" access=internal duration_ms=2 response=10`)
+		e.SetLine(`status=200 method=GET path="/internal?deep=1" access=internal duration_ms=2 response=10`)
 		e.SetAttributes(map[string]string{
-			"access": "internal", "method": "GET", "path": "/internal",
+			"access": "internal", "method": "GET", "path": "/internal", "query": "deep=1",
 			"status": "200", "duration_ms": "2", "response": "10",
 		})
 		printLogEntry(ctx, e)
-		for _, field := range []string{"status=200", "method=GET", `path="/internal"`, "access=internal", "duration_ms=2", "response=10"} {
+		for _, field := range []string{"status=200", "method=GET", `path="/internal?deep=1"`, "access=internal", "duration_ms=2", "response=10"} {
 			if n := strings.Count(buf.String(), field); n != 1 {
 				t.Errorf("%s should appear once (body only), got %d in: %s", field, n, buf.String())
 			}
+		}
+		if strings.Contains(buf.String(), "query=") {
+			t.Errorf("query should appear only as part of the body path, got: %s", buf.String())
 		}
 	})
 

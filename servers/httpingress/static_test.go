@@ -363,25 +363,36 @@ func TestRouterAccessLogAttributes(t *testing.T) {
 }
 
 func TestInternalRouterAccessLogAttributes(t *testing.T) {
-	logs := &recordingLogWriter{}
-	server := &Server{logWriter: logs}
-	server.logInternalRequest("app-1", http.MethodGet, "/health?deep=1", http.StatusNoContent, 13, time.Now().Add(-2*time.Second))
+	for _, tt := range []struct {
+		path  string
+		query string
+	}{
+		{path: "/health"},
+		{path: "/health?deep=1?mode=full", query: "deep=1?mode=full"},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			logs := &recordingLogWriter{}
+			server := &Server{logWriter: logs}
+			server.logInternalRequest("app-1", http.MethodGet, tt.path, http.StatusNoContent, 13, time.Now().Add(-2*time.Second))
 
-	require.Len(t, logs.entries, 1)
-	duration := logs.entries[0].Attributes["duration_ms"]
-	durationMs, err := strconv.Atoi(duration)
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, durationMs, 2000)
-	assert.Equal(t, map[string]string{
-		"source":      "router",
-		"status":      "204",
-		"method":      "GET",
-		"path":        "/health?deep=1",
-		"access":      "internal",
-		"duration_ms": duration,
-		"response":    "13",
-	}, logs.entries[0].Attributes)
-	assert.Equal(t, `status=204 method=GET path="/health?deep=1" access=internal duration_ms=`+duration+` response=13`, logs.entries[0].Body)
+			require.Len(t, logs.entries, 1)
+			duration := logs.entries[0].Attributes["duration_ms"]
+			durationMs, err := strconv.Atoi(duration)
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, durationMs, 2000)
+			assert.Equal(t, map[string]string{
+				"source":      "router",
+				"status":      "204",
+				"method":      "GET",
+				"path":        "/health",
+				"query":       tt.query,
+				"access":      "internal",
+				"duration_ms": duration,
+				"response":    "13",
+			}, logs.entries[0].Attributes)
+			assert.Equal(t, `status=204 method=GET path="`+tt.path+`" access=internal duration_ms=`+duration+` response=13`, logs.entries[0].Body)
+		})
+	}
 }
 
 func TestRequestSourceIPHonorsProxyTrust(t *testing.T) {
