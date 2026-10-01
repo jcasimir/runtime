@@ -403,7 +403,7 @@ require (
 	gopkg.in/ns1/ns1-go.v2 v2.15.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gotest.tools/v3 v3.5.1 // indirect
-	miren.dev/runtime/x v0.0.0-00010101000000-000000000000
+	miren.dev/runtime/x v0.0.0-20261001184021-278732e65f6c
 	sigs.k8s.io/yaml v1.4.0 // indirect
 	tags.cncf.io/container-device-interface v0.8.0 // indirect
 	tags.cncf.io/container-device-interface/specs-go v0.8.0 // indirect
