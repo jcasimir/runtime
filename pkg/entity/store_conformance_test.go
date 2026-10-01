@@ -1307,6 +1307,54 @@ func applySessionIndexSchema(t *testing.T, store Store) {
 	require.NoError(t, err)
 }
 
+// sessionStates returns every conf/state value the stored entity carries.
+func sessionStates(t *testing.T, store Store, id Id) []string {
+	t.Helper()
+	ent, err := store.GetEntity(t.Context(), id)
+	require.NoError(t, err)
+	var states []string
+	for _, attr := range ent.Attrs() {
+		if attr.ID == Id("conf/state") {
+			states = append(states, attr.Value.String())
+		}
+	}
+	return states
+}
+
+// TestStoreConformance_ReplaceUnderSessionWritesOnlyItsOwnBlob pins that a
+// session replacing an entity stores in its blob what the replacement carries,
+// not what other sessions hold, and that a replacement carrying no session
+// attributes leaves the writer's blob alone.
+func TestStoreConformance_ReplaceUnderSessionWritesOnlyItsOwnBlob(t *testing.T) {
+	runStoreConformance(t, func(t *testing.T, store Store) {
+		ctx := t.Context()
+		applySessionIndexSchema(t, store)
+
+		first, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+		second, err := store.CreateSession(ctx, 60)
+		require.NoError(t, err)
+
+		ent, err := store.CreateEntity(ctx, New(Any(Ident, "conf-replace-blob"), String(Id("conf/state"), "ready")),
+			WithSession(first))
+		require.NoError(t, err)
+
+		_, err = store.ReplaceEntity(ctx, New(Ref(DBId, ent.Id()), Any(Ident, "conf-replace-blob"),
+			String(Id("conf/state"), "busy")), WithSession(second))
+		require.NoError(t, err)
+
+		require.NoError(t, store.RevokeSession(ctx, first))
+		assert.Equal(t, []string{"busy"}, sessionStates(t, store, ent.Id()),
+			"the second session's blob holds only what its replacement carried")
+
+		_, err = store.ReplaceEntity(ctx, New(Ref(DBId, ent.Id()), Any(Ident, "conf-replace-blob"),
+			String(Id("conf/kind"), "runner")), WithSession(second))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"busy"}, sessionStates(t, store, ent.Id()),
+			"a replacement with no session attributes leaves the writer's blob alone")
+	})
+}
+
 // TestStoreConformance_SessionAttributesCannotBeIndexed pins that an attribute
 // cannot be both: only what the entity key stores is indexed, so the index
 // would never match.

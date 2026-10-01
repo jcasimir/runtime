@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -521,17 +522,22 @@ func (m *MockStore) ReplaceEntity(ctx context.Context, entity *Entity, opts ...E
 		entity.SetCreatedAt(existing.GetCreatedAt())
 	}
 
-	// A replace rewrites the entity key and at most its own session's blob.
-	// Every other session's blob still holds its attributes, so they stay in
-	// the view the way GetEntity would merge them back in.
-	for tok, blob := range m.sessionBlobs[id] {
-		if tok != string(o.session) {
-			entity.attrs = append(entity.attrs, blob...)
+	// A replace rewrites the entity key and at most its own session's blob,
+	// which it fills from the replacement alone, so record that before any
+	// other session's attributes join the view. Every blob the write left
+	// alone, the writer's own included when the replacement carries no
+	// session attributes, still holds its attributes, so they stay in the
+	// view the way GetEntity would merge them back in.
+	m.recordSessionWriteLocked(entity, &o, sessionIDs)
+	rewrote := len(o.session) != 0 && slices.ContainsFunc(entity.attrs, func(a Attr) bool { return sessionIDs[a.ID] })
+	for _, tok := range slices.Sorted(maps.Keys(m.sessionBlobs[id])) {
+		if rewrote && tok == string(o.session) {
+			continue
 		}
+		entity.attrs = append(entity.attrs, m.sessionBlobs[id][tok]...)
 	}
 
 	m.Entities[id] = entity
-	m.recordSessionWriteLocked(entity, &o, sessionIDs)
 	m.commitLocked(entity, clientv3.EventTypePut, existing)
 	m.mu.Unlock()
 
