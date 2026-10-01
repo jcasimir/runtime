@@ -768,6 +768,49 @@ func TestStorageConformance_IncompleteSummaryAgreesWithIncompleteList(t *testing
 	}
 }
 
+// TestStorageConformance_IncompleteSummaryCarriesAgeAndDefinition pins what the
+// health gauges read from a summary. The execution is the one an age gauge
+// exists to catch: created long ago, retrying its undo, so LastChanged keeps
+// moving and only CreatedAt tells how long it has been stuck.
+func TestStorageConformance_IncompleteSummaryCarriesAgeAndDefinition(t *testing.T) {
+	for _, backend := range allStorageBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			storage := backend.make(t)
+
+			created := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+			touched := time.Date(2026, 7, 9, 8, 30, 0, 0, time.UTC)
+
+			exec := &Execution{
+				ID:              "saga-retrying-undo",
+				DefinitionName:  "create-sandbox",
+				Status:          StatusPending,
+				InitialInputs:   map[string]any{},
+				ExecutedActions: map[string]*ActionResult{},
+				ExecutionOrder:  []string{},
+				CreatedAt:       created,
+				UpdatedAt:       created,
+			}
+			require.NoError(t, storage.Save(ctx, exec))
+
+			exec.Status = StatusUndoing
+			exec.UpdatedAt = touched
+			require.NoError(t, storage.Save(ctx, exec))
+
+			summaries, err := collectIncompleteSummaries(ctx, storage)
+			require.NoError(t, err)
+			require.Len(t, summaries, 1)
+
+			got := summaries[0]
+			assert.Equal(t, "create-sandbox", got.DefinitionName)
+			assert.True(t, created.Equal(got.CreatedAt),
+				"CreatedAt must be the execution's start, got %v", got.CreatedAt)
+			assert.True(t, touched.Equal(got.LastChanged),
+				"LastChanged must be the latest save, got %v", got.LastChanged)
+		})
+	}
+}
+
 // TestStorageConformance_IncompleteSummaryIgnoresStaleIndex is the same guard
 // ListIncompletePage has, with a different consequence: the stalled sweep
 // writes to what this returns, so trusting a stale pending entry would mean
