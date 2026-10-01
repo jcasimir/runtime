@@ -403,6 +403,7 @@ require (
 	gopkg.in/ns1/ns1-go.v2 v2.15.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gotest.tools/v3 v3.5.1 // indirect
+	miren.dev/runtime/x v0.0.0-00010101000000-000000000000
 	sigs.k8s.io/yaml v1.4.0 // indirect
 	tags.cncf.io/container-device-interface v0.8.0 // indirect
 	tags.cncf.io/container-device-interface/specs-go v0.8.0 // indirect
@@ -420,3 +421,5 @@ replace github.com/flannel-io/flannel => github.com/mirendev/flannel v0.26.8-0.2
 // Remove this fork and AllowLegacyDraft06 once all supported coordinators
 // and runners use the modern handshake. See the fork's MIREN.md.
 replace github.com/quic-go/webtransport-go => github.com/mirendev/webtransport-go v0.13.1-0.20260909145345-cfc776d34bca
+
+replace miren.dev/runtime/x => ./x

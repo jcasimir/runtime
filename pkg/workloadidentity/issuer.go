@@ -70,6 +70,7 @@ import (
 	"github.com/google/uuid"
 
 	"miren.dev/runtime/pkg/workloadroles"
+	"miren.dev/runtime/x/workloadid"
 )
 
 type IssuerConfig struct {
@@ -126,11 +127,14 @@ var _ TokenIssuer = (*Issuer)(nil)
 // boundary itself: a token arriving from a caller decodes into whatever string
 // it contained, so verification still has to compare the value rather than
 // assume it is one of the constants below.
-type IdentityType string
+//
+// The type and its values are defined in x/workloadid, which verifiers outside
+// this repository import, so the claim cannot drift between issuer and verifier.
+type IdentityType = workloadid.IdentityType
 
 const (
-	IdentityTypeSandbox IdentityType = "sandbox"
-	IdentityTypeSystem  IdentityType = "system"
+	IdentityTypeSandbox = workloadid.IdentityTypeSandbox
+	IdentityTypeSystem  = workloadid.IdentityTypeSystem
 )
 
 type WorkloadClaims struct {

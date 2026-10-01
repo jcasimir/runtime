@@ -46,6 +46,7 @@ import (
 	"miren.dev/runtime/pkg/secret"
 	"miren.dev/runtime/pkg/workloadidentity"
 	"miren.dev/runtime/servers/metricspush"
+	"miren.dev/runtime/x/workloadid"
 
 	computeapi "miren.dev/runtime/api/compute"
 	compute "miren.dev/runtime/api/compute/compute_v1alpha"
@@ -2779,9 +2780,9 @@ func (c *SandboxController) buildSubContainerSpec(
 
 	if c.WorkloadIssuer != nil {
 		envVars = append(envVars,
-			"MIREN_IDENTITY_TOKEN_PATH=/var/run/miren/identity-token",
+			workloadid.EnvTokenPath+"=/var/run/miren/identity-token",
 			fmt.Sprintf("MIREN_OIDC_ISSUER_URL=%s", c.WorkloadIssuer.IssuerURL()),
-			fmt.Sprintf("MIREN_IDENTITY_TOKEN_URL=http://%s:%d/v1/token", c.Subnet.Router().Addr(), tokenServerPort),
+			fmt.Sprintf("%s=http://%s:%d/v1/token", workloadid.EnvTokenURL, c.Subnet.Router().Addr(), tokenServerPort),
 		)
 
 		// Point the client at the cluster API. MIREN_API_ADDRESS rather than
@@ -2801,7 +2802,7 @@ func (c *SandboxController) buildSubContainerSpec(
 				c.Log.Warn("failed to generate token request secret", "sandbox", sb.ID, "error", secretErr)
 			} else {
 				c.tokenSecrets.register(sb.ID.String(), secret)
-				envVars = append(envVars, fmt.Sprintf("MIREN_IDENTITY_TOKEN_SECRET=%s", secret))
+				envVars = append(envVars, workloadid.EnvTokenSecret+"="+secret)
 
 				// The relay authenticates with the secret above, so it is only
 				// advertised where that secret exists, and only on a cluster

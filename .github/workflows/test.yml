@@ -82,13 +82,20 @@ jobs:
       with:
         version: v2.12.2
 
+    # x/ is its own module, which ./... from the root does not reach.
+    - name: golangci-lint (x module)
+      uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
+      with:
+        version: v2.12.2
+        working-directory: x
+
     - name: Check the vendored lbd source matches go.mod
       run: ./hack/sync-lbd-src.sh --check
 
     - name: Check go.mod tidiness
       run: |
         # Run go mod tidy and check if there are any changes
-        go mod tidy -diff
+        go mod tidy -diff && (cd x && go mod tidy -diff)
         if [ $? -ne 0 ]; then
           echo ""
           echo "Error: go.mod or go.sum is not tidy."
