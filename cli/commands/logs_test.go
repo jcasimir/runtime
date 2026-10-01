@@ -345,7 +345,7 @@ func TestRouterLineRendering(t *testing.T) {
 		var buf bytes.Buffer
 		ctx := &Context{Context: context.Background(), Stdout: &buf}
 		attrs := map[string]string{
-			"status": "200", "method": "GET", "path": "/api/v1/self?full=1",
+			"status": "200", "method": "GET", "path": "/api/v1/self", "query": "full=1",
 			"duration_ms": "36", "response": "392", "body": "17",
 			"host": "miren.cloud", "source_ip": "192.0.2.15", "app.user": "usr-123",
 		}
@@ -362,6 +362,9 @@ func TestRouterLineRendering(t *testing.T) {
 		}
 		if !strings.Contains(got, "app.user=usr-123") {
 			t.Errorf("promoted app.user should still render, got: %s", got)
+		}
+		if strings.Contains(got, "query=") {
+			t.Errorf("query should appear only as part of the body path, got: %s", got)
 		}
 
 		buf.Reset()

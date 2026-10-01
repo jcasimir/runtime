@@ -469,7 +469,7 @@ var (
 // so re-surfacing them from attributes would double-print. Suppressed only for
 // router lines; other attributes (e.g. future app.* promoted fields) still show.
 var routerBodyHidden = map[string]bool{
-	"status": true, "method": true, "path": true, "access": true,
+	"status": true, "method": true, "path": true, "query": true, "access": true,
 	"duration_ms": true, "response": true, "body": true, "host": true, "source_ip": true,
 }
 
