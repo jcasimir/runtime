@@ -919,6 +919,62 @@ func TestListIndexPageAtRevisionPinsContinuationPages(t *testing.T) {
 	require.NotContains(t, got, createdAfterHead.Id(), "the pinned scan must exclude entries created after its head")
 }
 
+// TestListIndexPageAtRevisionSessionEntityOnPageBoundary covers an entity that
+// holds both a plain and a session entry in one index. Whatever page size puts
+// its plain entry last on a page, the continuation must not return it again
+// from the session entry (MIR-1990).
+func TestListIndexPageAtRevisionSessionEntityOnPageBoundary(t *testing.T) {
+	ctx := context.Background()
+	store, _ := setupTestEtcdStore(t)
+
+	attr, err := store.CreateEntity(ctx, New(
+		String(Ident, "test-session-page"),
+		Ref(Type, TypeStr),
+		Bool(Index, true),
+	))
+	require.NoError(t, err)
+	index := String(attr.Id(), "value")
+
+	var want []Id
+	for i := range 4 {
+		created, err := store.CreateEntity(ctx, New(
+			index,
+			String(Ident, fmt.Sprintf("session-page-%d", i)),
+		))
+		require.NoError(t, err)
+		want = append(want, created.Id())
+	}
+
+	sid, err := store.CreateSession(ctx, 30)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.RevokeSession(context.Background(), sid) })
+	bound, err := store.CreateEntity(ctx, New(
+		index,
+		String(Ident, "session-page-bound"),
+	), WithSession(sid))
+	require.NoError(t, err)
+	want = append(want, bound.Id())
+
+	// Every page size from 1 to the entity count, so one of them lands the
+	// bound entity's plain entry on a boundary wherever it sorts.
+	for limit := int64(1); limit <= int64(len(want)); limit++ {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			page, err := store.ListIndexPageAtRevision(ctx, index, "", limit, 0)
+			require.NoError(t, err)
+			require.Equal(t, int64(len(want)+1), page.Total, "the bound entity should hold two index entries")
+
+			got := append([]Id(nil), page.Ids...)
+			for page.Cursor != "" {
+				page, err = store.ListIndexPageAtRevision(ctx, index, page.Cursor, limit, page.Revision)
+				require.NoError(t, err)
+				got = append(got, page.Ids...)
+			}
+
+			require.ElementsMatch(t, want, got, "each entity should be listed exactly once across pages")
+		})
+	}
+}
+
 // TestWatchIndexFromRevision verifies that starting a watch at a prior revision
 // replays changes made after that revision (gap-free resume), and that starting
 // at the current revision does not replay earlier changes.
