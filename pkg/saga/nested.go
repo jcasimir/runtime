@@ -150,6 +150,7 @@ func (e *Executor) createChildExecution(ctx context.Context, def *Definition, in
 	if err := e.storage.Save(ctx, exec); err != nil {
 		return nil, fmt.Errorf("persisting initial state: %w", err)
 	}
+	e.counts.Add(def.Name, EventStarted, 1)
 
 	return exec, nil
 }
