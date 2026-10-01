@@ -53,6 +53,10 @@ type StalledResult struct {
 	// Forced is how many were past the stall window and transitioned to failed.
 	Forced int
 
+	// ForcedByDefinition splits Forced by the definition each execution ran,
+	// which is the first thing to know when something is still stranding them.
+	ForcedByDefinition map[string]int
+
 	// Failed is how many transitions errored. A sweep does not abort on one bad
 	// write; the next pass retries it.
 	Failed int
@@ -161,6 +165,10 @@ func RunStalledSweep(ctx context.Context, storage StalledStorage, cfg StalledCon
 				"id", summary.ID, "status", summary.Status,
 				"last_changed", summary.LastChanged)
 			result.Forced++
+			if result.ForcedByDefinition == nil {
+				result.ForcedByDefinition = make(map[string]int)
+			}
+			result.ForcedByDefinition[summary.DefinitionName]++
 
 			if cfg.MaxForces > 0 && result.Forced >= cfg.MaxForces {
 				capped, err := stoppedEarlyStalled(ctx, storage, page, summary.ID)
