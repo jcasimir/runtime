@@ -345,7 +345,7 @@ shutdown_timeout = "10s"
 | `requests_per_instance` | int | Target concurrent requests per instance (auto mode only) | `10` |
 | `scale_down_delay` | duration | Time to wait before removing idle instances (auto mode only) | `"15m"` |
 | `num_instances` | int | Exact number of instances to run (fixed mode only) | `1` |
-| `shutdown_timeout` | duration | Time to wait for graceful shutdown during redeploy | `"10s"` |
+| `shutdown_timeout` | duration | Time a stopping instance gets to exit after `SIGTERM` before it is killed. A new value takes effect from the next deploy; see [Graceful Shutdown](./services.md#graceful-shutdown) | `"10s"` |
 
 :::note[Validation]
 - `mode` must be `"auto"` or `"fixed"`.

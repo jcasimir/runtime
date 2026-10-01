@@ -2947,13 +2947,27 @@ func getShutdownTimeout(ctx context.Context, cont containerd.Container) time.Dur
 	return timeout
 }
 
+// forcedKill records a container that was still running when its shutdown
+// timeout ran out and had to be SIGKILLed.
+type forcedKill struct {
+	container string
+	timeout   time.Duration
+}
+
 func (c *SandboxController) DestroySubContainers(ctx context.Context, id entity.Id) error {
+	_, err := c.destroySubContainers(ctx, id)
+	return err
+}
+
+// destroySubContainers stops every subcontainer of a sandbox, giving each its
+// shutdown timeout to exit after SIGTERM, and reports the ones it had to kill.
+func (c *SandboxController) destroySubContainers(ctx context.Context, id entity.Id) ([]forcedKill, error) {
 	ctx = namespaces.WithNamespace(ctx, c.Namespace)
 
 	// Discover subcontainers from containerd
 	containerList, err := c.CC.Containers(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list containers: %w", err)
+		return nil, fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	prefix := containerPrefix(id)
@@ -2977,7 +2991,7 @@ func (c *SandboxController) DestroySubContainers(ctx context.Context, id entity.
 
 	if len(containers) == 0 {
 		c.Log.Debug("no subcontainers found to destroy", "id", id)
-		return nil
+		return nil, nil
 	}
 
 	// Set up timeout for the entire operation (max shutdown timeout + buffer)
@@ -3010,6 +3024,20 @@ func (c *SandboxController) DestroySubContainers(ctx context.Context, id entity.
 
 	// Track containers waiting for shutdown
 	tasksByID := make(map[string]*containerShutdownInfo)
+	var killed []forcedKill
+	// kill reports whether the SIGKILL was delivered. A process that exited
+	// just as its timeout fired makes Kill fail, and wasn't killed by us.
+	kill := func(info *containerShutdownInfo) bool {
+		delivered := true
+		if err := info.task.Kill(ctx, unix.SIGKILL); err != nil {
+			c.Log.Debug("failed to send SIGKILL", "id", info.id, "err", err)
+			delivered = false
+		}
+		if _, err := info.task.Delete(ctx, containerd.WithProcessKill); err != nil {
+			c.Log.Debug("failed to delete task after SIGKILL", "id", info.id, "err", err)
+		}
+		return delivered
+	}
 
 	for i := range containers {
 		info := &containers[i]
@@ -3068,19 +3096,20 @@ func (c *SandboxController) DestroySubContainers(ctx context.Context, id entity.
 
 		case <-ticker.C:
 			// Check timeouts for remaining tasks
-			for id, info := range tasksByID {
+			for cid, info := range tasksByID {
 				if time.Since(startTime) >= info.timeout {
-					c.Log.Info("shutdown timeout expired, force killing",
+					c.Log.Warn("shutdown timeout expired, force killing",
+						"sandbox_id", id,
 						"id", info.id,
 						"elapsed", time.Since(startTime),
 						"timeout", info.timeout)
-					if err := info.task.Kill(ctx, unix.SIGKILL); err != nil {
-						c.Log.Debug("failed to send SIGKILL", "id", info.id, "err", err)
+					if kill(info) {
+						killed = append(killed, forcedKill{
+							container: strings.TrimPrefix(info.id, prefix+"-"),
+							timeout:   info.timeout,
+						})
 					}
-					if _, err := info.task.Delete(ctx, containerd.WithProcessKill); err != nil {
-						c.Log.Debug("failed to delete task after SIGKILL", "id", info.id, "err", err)
-					}
-					delete(tasksByID, id)
+					delete(tasksByID, cid)
 				}
 			}
 		}
@@ -3090,15 +3119,13 @@ func (c *SandboxController) DestroySubContainers(ctx context.Context, id entity.
 	goto cleanup
 
 forceKill:
-	// Force kill any remaining tasks
+	// Force kill any remaining tasks. Only a cancelled caller gets us here,
+	// since the ticker kills each task at its own timeout well before the
+	// overall deadline. These tasks didn't overrun shutdown_timeout, so they
+	// stay out of the app-facing report.
 	for _, info := range tasksByID {
-		c.Log.Info("force killing task", "id", info.id)
-		if err := info.task.Kill(ctx, unix.SIGKILL); err != nil {
-			c.Log.Debug("failed to send SIGKILL", "id", info.id, "err", err)
-		}
-		if _, err := info.task.Delete(ctx, containerd.WithProcessKill); err != nil {
-			c.Log.Debug("failed to delete task", "id", info.id, "err", err)
-		}
+		c.Log.Warn("force killing task", "sandbox_id", id, "id", info.id)
+		kill(info)
 	}
 
 cleanup:
@@ -3125,7 +3152,7 @@ cleanup:
 	}
 
 	c.Log.Info("subcontainer destruction complete", "sandbox_id", id, "elapsed", time.Since(startTime))
-	return nil
+	return killed, nil
 }
 
 func (c *SandboxController) Delete(ctx context.Context, id entity.Id, sb *compute.Sandbox) error {
@@ -3163,6 +3190,37 @@ func entityFallbackIPs(sb *compute.Sandbox) map[string]bool {
 		}
 	}
 	return ips
+}
+
+// reportForcedKills tells the app owner, in the app's own log stream, that a
+// container outlived its shutdown timeout. Without this the only trace is the
+// gap between the STOPPED and DEAD status changes.
+func (c *SandboxController) reportForcedKills(ctx context.Context, sb *compute.Sandbox, killed []forcedKill) {
+	// StopSandbox callers hand over the sandbox without its metadata, so look
+	// up the short ID here, where it is only paid for when there is something
+	// to report. The entity may already be gone; the line still lands without it.
+	var shortID string
+	if resp, err := c.EAC.Get(ctx, sb.ID.String()); err == nil {
+		shortID = entityShortID(resp.Entity().Entity())
+	}
+
+	for _, k := range killed {
+		c.EmitSandboxEvent(sb, shortID, describeForcedKill(sb, k))
+	}
+}
+
+func describeForcedKill(sb *compute.Sandbox, k forcedKill) string {
+	setting := "concurrency.shutdown_timeout"
+	for _, attr := range sb.Spec.LogAttribute {
+		if attr.Key == "miren.service" && attr.Value != "" {
+			setting = fmt.Sprintf("services.%s.concurrency.shutdown_timeout", attr.Value)
+			break
+		}
+	}
+
+	return fmt.Sprintf(
+		"container %q was still running %s after SIGTERM and was killed (%s); raise it if your app needs longer to shut down",
+		k.container, k.timeout, setting)
 }
 
 // StopSandbox tears down a sandbox and releases every resource it holds. sb is
@@ -3271,10 +3329,13 @@ func (c *SandboxController) StopSandbox(ctx context.Context, id entity.Id, sb *c
 
 	// Destroy subcontainers - this will discover them from containerd
 	c.Log.Debug("destroying subcontainers", "id", id)
-	err = c.DestroySubContainers(ctx, id)
+	killed, err := c.destroySubContainers(ctx, id)
 	if err != nil {
 		c.Log.Error("failed to destroy subcontainers", "id", id, "err", err)
 		// Continue with cleanup even if this fails
+	}
+	if len(killed) > 0 && sb != nil {
+		c.reportForcedKills(ctx, sb, killed)
 	}
 
 	// Stop replicating sqlite disks only once the containers are gone. Doing it
