@@ -1424,7 +1424,11 @@ Warning: These commands are intended for advanced users and developers. They may
 			Body: "miren disk accelerator status",
 		}),
 	))
-	d.Dispatch("disk accelerator install", Infer("disk accelerator install", "Build and load the lbd kernel module for this kernel", DiskAcceleratorInstall,
+	d.Dispatch("disk accelerator install", Infer("disk accelerator install", "Build and load the lbd kernel module on a running node", DiskAcceleratorInstall,
+		WithExample(mflags.Example{
+			Name: "Enable accelerator mode on this server or runner",
+			Body: "sudo miren disk accelerator install",
+		}),
 		WithExample(mflags.Example{
 			Name: "Enable accelerator mode on a runner",
 			Body: "miren disk accelerator install runner1",

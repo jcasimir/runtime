@@ -20,6 +20,48 @@ func testInstaller(t *testing.T, root, dataPath string) *Installer {
 	}
 }
 
+func TestCheckHostSkipsWhenKernelModulesAreDisabled(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("host check requires root")
+	}
+	root := ubuntuRoot(t)
+	writeFile(t, root, "proc/sys/kernel/modules_disabled", "1\n")
+	status, err := Probe(Options{Root: root, DataPath: t.TempDir()})
+	require.NoError(t, err)
+	require.ErrorContains(t, testInstaller(t, root, t.TempDir()).CheckHost(status), "disabled loading modules")
+}
+
+func TestCheckHostAllowsPossibleHostWithoutContainerRuntime(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("host check requires root")
+	}
+	root := ubuntuRoot(t)
+	bin := t.TempDir()
+	for _, name := range []string{"depmod", "modprobe"} {
+		require.NoError(t, os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nexit 0\n"), 0755))
+	}
+	t.Setenv("PATH", bin)
+	status, err := Probe(Options{Root: root, DataPath: t.TempDir()})
+	require.NoError(t, err)
+	require.NoError(t, testInstaller(t, root, t.TempDir()).CheckHost(status))
+}
+
+func TestCanLoadModulesChecksEffectiveCapability(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status")
+	for _, tc := range []struct {
+		capEff string
+		want   bool
+	}{
+		{"0000000000010000", true},
+		{"0000000000001000", false},
+	} {
+		require.NoError(t, os.WriteFile(path, []byte("Name:\ttest\nCapEff:\t"+tc.capEff+"\n"), 0644))
+		actual, err := canLoadModules(path)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, actual)
+	}
+}
+
 func TestCheckCanBuildRefusesClangKernels(t *testing.T) {
 	root := ubuntuRoot(t)
 	writeFile(t, root, "proc/version",

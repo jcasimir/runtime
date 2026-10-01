@@ -1187,6 +1187,29 @@ func configHomeDir() (string, error) {
 	return u.HomeDir, nil
 }
 
+// LoadLocalServerCluster reads only the leaf written by the installed server,
+// independent of MIREN_CONFIG and other clusters in the caller's config.
+func LoadLocalServerCluster(name string) (*ClusterConfig, error) {
+	home, err := configHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(home, ".config/miren/clientconfig.d/50-local.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading local server credentials %s: %w", path, err)
+	}
+	var leaf ConfigData
+	if err := yaml.Unmarshal(data, &leaf); err != nil {
+		return nil, fmt.Errorf("parsing local server credentials %s: %w", path, err)
+	}
+	cluster := leaf.Clusters[name]
+	if cluster == nil {
+		return nil, fmt.Errorf("local server cluster %q not found in %s", name, path)
+	}
+	return cluster, nil
+}
+
 // GetActiveConfigPath returns the path to the active configuration file
 func GetActiveConfigPath() string {
 	path, _, _ := getConfigPath()

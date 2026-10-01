@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -185,12 +187,32 @@ func (i *Installer) EnsureCurrent(ctx context.Context) (bool, error) {
 // checkCanBuild refuses the cases where a build would either fail confusingly
 // or produce a module that cannot be loaded, and says why.
 func (i *Installer) checkCanBuild(status Status) error {
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("installing a kernel module requires root privileges (use sudo)")
+	if err := i.CheckHost(status); err != nil {
+		return err
 	}
 
 	if i.Builder == nil {
 		return fmt.Errorf("no container runtime to run the lbd builder in")
+	}
+	return nil
+}
+
+// CheckHost refuses hosts that cannot build or load lbd before starting a container runtime.
+func (i *Installer) CheckHost(status Status) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("installing a kernel module requires root privileges (use sudo)")
+	}
+	if data, err := os.ReadFile(filepath.Join(i.Options.root(), "proc/sys/kernel/modules_disabled")); err == nil && strings.TrimSpace(string(data)) == "1" {
+		return fmt.Errorf("this kernel has disabled loading modules")
+	}
+	if runtime.GOOS == "linux" && i.Options.root() == "/" {
+		capable, err := canLoadModules("/proc/self/status")
+		if err != nil {
+			return err
+		}
+		if !capable {
+			return fmt.Errorf("this process lacks CAP_SYS_MODULE, which is needed to load the kernel module")
+		}
 	}
 
 	if err := checkKernelTools(); err != nil {
@@ -198,6 +220,23 @@ func (i *Installer) checkCanBuild(status Status) error {
 	}
 
 	return i.checkCompilerAndHeaders(status)
+}
+
+func canLoadModules(procStatus string) (bool, error) {
+	data, err := os.ReadFile(procStatus)
+	if err != nil {
+		return false, fmt.Errorf("checking permission to load kernel modules: %w", err)
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "CapEff:"); ok {
+			capabilities, err := strconv.ParseUint(strings.TrimSpace(value), 16, 64)
+			if err != nil {
+				return false, fmt.Errorf("reading effective capabilities: %w", err)
+			}
+			return capabilities&(1<<16) != 0, nil // CAP_SYS_MODULE is bit 16.
+		}
+	}
+	return false, fmt.Errorf("no effective capabilities found in %s", procStatus)
 }
 
 // checkKernelTools makes sure the commands that load a module are present.

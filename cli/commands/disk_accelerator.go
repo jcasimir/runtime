@@ -3,11 +3,95 @@
 package commands
 
 import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"miren.dev/runtime/clientconfig"
+	runtimeserver "miren.dev/runtime/components/server"
 	"miren.dev/runtime/pkg/lbdmod"
+	"miren.dev/runtime/pkg/runnerconfig"
+	"miren.dev/runtime/pkg/serverconfig"
 	"miren.dev/runtime/pkg/ui"
 )
+
+func currentDiskAcceleratorNode(ctx *Context, runnerConfigPath, serverUnitPath, serverConfigPath string) (string, *runnerconfig.Config, string, error) {
+	runner, err := runnerconfig.Load(runnerConfigPath)
+	if err == nil {
+		if id := strings.TrimSpace(runner.RunnerID); id != "" {
+			return id, runner, "", nil
+		}
+		return "", nil, "", fmt.Errorf("runner config %s has no runner ID", runnerConfigPath)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", nil, "", fmt.Errorf("reading local runner identity: %w", err)
+	}
+	if _, err := os.Stat(serverUnitPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil, "", fmt.Errorf("no local runner or installed server found; pass a node name or ID, or use 'miren server install --disk-accelerator' before startup")
+		}
+		return "", nil, "", fmt.Errorf("checking local server installation: %w", err)
+	}
+	server, err := serverconfig.Load(serverConfigPath, serverconfig.NewCLIFlags(), ctx.Log)
+	if err != nil {
+		return "", nil, "", fmt.Errorf("reading local server identity: %w", err)
+	}
+	if id := strings.TrimSpace(server.Server.GetRunnerID()); id != "" {
+		clusterName := server.Server.GetConfigClusterName()
+		if clusterName == "" {
+			clusterName = "local"
+		}
+		return id, nil, clusterName, nil
+	}
+	return "", nil, "", fmt.Errorf("local server has no runner ID")
+}
+
+func localDiskAcceleratorCluster(ctx *Context, name, serverConfigPath string) (*clientconfig.ClusterConfig, error) {
+	server, err := serverconfig.Load(serverConfigPath, serverconfig.NewCLIFlags(), ctx.Log)
+	if err != nil {
+		return nil, fmt.Errorf("reading installed server configuration: %w", err)
+	}
+	address := runtimeserver.LocalClientAddress(ctx.Log, server.Server.GetAddress())
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid local server address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return nil, fmt.Errorf("server address %q is not loopback; pass a node name or ID with a configured cluster", address)
+	}
+	if host == "localhost" {
+		host = "127.0.0.1"
+	}
+	ca, err := os.ReadFile(filepath.Join(server.Server.GetDataPath(), "server", "ca.crt"))
+	if err != nil {
+		return nil, fmt.Errorf("reading installed server CA: %w", err)
+	}
+	cluster, err := clientconfig.LoadLocalServerCluster("local")
+	if err != nil && name != "local" {
+		cluster, err = clientconfig.LoadLocalServerCluster(name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if string(ca) != cluster.CACert || cluster.ClientCert == "" || cluster.ClientKey == "" {
+		return nil, fmt.Errorf("local server credentials do not match the installed server; pass a node name or ID with a configured cluster")
+	}
+	_, port, err := net.SplitHostPort(cluster.Hostname)
+	if err != nil {
+		return nil, fmt.Errorf("invalid local server credential address %q: %w", cluster.Hostname, err)
+	}
+	return &clientconfig.ClusterConfig{
+		Hostname:   net.JoinHostPort(host, port),
+		CACert:     cluster.CACert,
+		ClientCert: cluster.ClientCert,
+		ClientKey:  cluster.ClientKey,
+	}, nil
+}
 
 // DiskAcceleratorStatus reports whether accelerator mode can run on this host.
 // It only reads, so it does not need root.
@@ -49,13 +133,13 @@ func DiskAcceleratorStatus(ctx *Context, opts struct {
 	case status.Available() && !status.Stale():
 		return nil
 	case status.Stale():
-		ctx.Warn("The installed module no longer matches this host. Run: miren disk accelerator install <node>")
+		ctx.Warn("The installed module no longer matches this host. Run: miren disk accelerator install --force")
 	case status.Host.HeadersDir == "" && status.Host.CanFetchHeaders():
-		ctx.Info("This host has no kernel headers; the builder will fetch them. Run: miren disk accelerator install <node>")
+		ctx.Info("This host has no kernel headers; the builder will fetch them. Run: miren disk accelerator install")
 	case status.Host.HeadersDir == "":
 		ctx.Warn("This host has no kernel headers, which the build needs. %s", status.Host.InstallHint())
 	default:
-		ctx.Info("To enable accelerator mode, run: miren disk accelerator install <node>")
+		ctx.Info("To enable accelerator mode, run: miren disk accelerator install")
 	}
 	return nil
 }
