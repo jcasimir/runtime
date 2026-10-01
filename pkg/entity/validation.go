@@ -89,6 +89,10 @@ func choiceValues(choices []Value) []any {
 
 // ValidateEntity validates all attributes in an entity against their schemas
 func (v *Validator) ValidateEntity(ctx context.Context, entity *Entity) error {
+	if err := rejectIndexedSession(entity.attrs); err != nil {
+		return err
+	}
+
 	require := map[Id]struct{}{}
 
 	var valid []Attr
@@ -180,7 +184,32 @@ func (v *Validator) ValidateAttributes(ctx context.Context, attrs []Attr) error 
 // Otherwise an entity holding a now-dangling reference becomes impossible to
 // patch at all, and any controller reconciling it spins forever. See MIR-1320.
 func (v *Validator) ValidateUpdate(ctx context.Context, newAttrs, originalAttrs []Attr) error {
+	if err := rejectIndexedSession(newAttrs); err != nil {
+		return err
+	}
 	return v.validateAttributes(ctx, newAttrs, originalAttrs)
+}
+
+// rejectIndexedSession refuses an attribute definition that is both indexed
+// and session-scoped. The store indexes only what the entity key holds (see
+// the index layout comment above indexWrite), so the index would never match.
+func rejectIndexedSession(attrs []Attr) error {
+	var indexed, session bool
+	for _, attr := range attrs {
+		if attr.Value.Kind() != KindBool || !attr.Value.Bool() {
+			continue
+		}
+		switch attr.ID {
+		case Index:
+			indexed = true
+		case Session:
+			session = true
+		}
+	}
+	if indexed && session {
+		return fmt.Errorf("an attribute cannot be both indexed and session-scoped: session-scoped values are never indexed")
+	}
+	return nil
 }
 
 // matchOriginalAttrs pairs unchanged attributes as a multiset within their

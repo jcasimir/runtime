@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -111,6 +112,9 @@ type gen struct {
 
 func GenerateSchema(sf *schemaFile, pkg string, contributors ...*schemaFile) (string, error) {
 	if err := validateEnums(sf); err != nil {
+		return "", err
+	}
+	if err := validateIndexedSession(sf); err != nil {
 		return "", err
 	}
 
@@ -350,6 +354,65 @@ func toCamal(s string) string {
 	}
 
 	return b.String()
+}
+
+// validateIndexedSession rejects an index on anything stored in a session's
+// attribute blob: a session attribute, or a field nested in one, inline or
+// through a named component. The entity store only indexes what the entity
+// key holds (see the index layout comment in pkg/entity), so such an index
+// would silently never match.
+func validateIndexedSession(sf *schemaFile) error {
+	// A named component can be reached from several places, itself included,
+	// so walk each one once per session context.
+	type visit struct {
+		component string
+		inSession bool
+	}
+	visited := make(map[visit]bool)
+
+	var checkAttrs func(path string, attrs schemaAttrs, inSession bool) error
+	check := func(path string, a *schemaAttr, inSession bool) error {
+		inSession = inSession || a.Session
+		if a.Indexed && inSession {
+			return fmt.Errorf("attribute %s is indexed but stored in a session; session-scoped values cannot be indexed", path)
+		}
+		if err := checkAttrs(path, a.Attrs, inSession); err != nil {
+			return err
+		}
+		if comp, ok := sf.Components[a.Type]; ok {
+			v := visit{a.Type, inSession}
+			if !visited[v] {
+				visited[v] = true
+				return checkAttrs(path, comp, inSession)
+			}
+		}
+		return nil
+	}
+	checkAttrs = func(path string, attrs schemaAttrs, inSession bool) error {
+		for _, name := range slices.Sorted(maps.Keys(attrs)) {
+			if err := check(path+"."+name, attrs[name], inSession); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, kind := range slices.Sorted(maps.Keys(sf.Kinds)) {
+		if err := checkAttrs(kind, sf.Kinds[kind], false); err != nil {
+			return err
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(sf.Components)) {
+		v := visit{name, false}
+		if visited[v] {
+			continue
+		}
+		visited[v] = true
+		if err := checkAttrs(name, sf.Components[name], false); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateEnums(sf *schemaFile) error {

@@ -1625,3 +1625,81 @@ func TestNamedEnumFieldRequiresDefinition(t *testing.T) {
 		t.Fatalf("GenerateSchema() error = %v, want inline legacy choices error", err)
 	}
 }
+
+// The entity store only indexes what the entity key holds, so an index on a
+// session attribute, or on a field nested in one, would never match. Codegen
+// refuses both rather than shipping an index that silently stays empty.
+func TestGenerateSchemaRejectsIndexedSessionValues(t *testing.T) {
+	cases := map[string]schemaAttrs{
+		"session attribute": {
+			"status": &schemaAttr{Type: "string", Session: true, Indexed: true},
+		},
+		"field nested in a session component": {
+			"spec": &schemaAttr{
+				Type:    "component",
+				Session: true,
+				Attrs: map[string]*schemaAttr{
+					"name": {Type: "string", Indexed: true},
+				},
+			},
+		},
+	}
+	for name, attrs := range cases {
+		t.Run(name, func(t *testing.T) {
+			sf := &schemaFile{Domain: "test", Version: "v1", Kinds: map[string]schemaAttrs{"example": attrs}}
+			_, err := GenerateSchema(sf, "test")
+			if err == nil || !strings.Contains(err.Error(), "cannot be indexed") {
+				t.Fatalf("expected an indexed-session error, got %v", err)
+			}
+		})
+	}
+
+	// The same two shapes through a named component: a session field whose
+	// type names a component with an indexed field, and a standalone component
+	// definition that nests one. A component that refers to itself must not
+	// send the check around forever.
+	details := schemaAttrs{
+		"name": &schemaAttr{Type: "string", Indexed: true},
+		"next": &schemaAttr{Type: "details"},
+	}
+	named := map[string]*schemaFile{
+		"session field naming a component": {
+			Components: map[string]schemaAttrs{"details": details},
+			Kinds: map[string]schemaAttrs{"example": {
+				"details": &schemaAttr{Type: "details", Session: true},
+			}},
+		},
+		"component definition nesting one": {
+			Components: map[string]schemaAttrs{
+				"details": details,
+				"wrapper": {"inner": &schemaAttr{Type: "details", Session: true}},
+			},
+			Kinds: map[string]schemaAttrs{"example": {
+				"plain": &schemaAttr{Type: "string"},
+			}},
+		},
+	}
+	for name, sf := range named {
+		t.Run(name, func(t *testing.T) {
+			sf.Domain, sf.Version = "test", "v1"
+			_, err := GenerateSchema(sf, "test")
+			if err == nil || !strings.Contains(err.Error(), "cannot be indexed") {
+				t.Fatalf("expected an indexed-session error, got %v", err)
+			}
+		})
+	}
+
+	// A named component used outside any session keeps its index.
+	t.Run("named component outside a session", func(t *testing.T) {
+		sf := &schemaFile{
+			Domain: "test", Version: "v1",
+			Components: map[string]schemaAttrs{"details": details},
+			Kinds: map[string]schemaAttrs{"example": {
+				"details": &schemaAttr{Type: "details"},
+			}},
+		}
+		if err := validateIndexedSession(sf); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+	})
+}

@@ -409,7 +409,10 @@ func TestEtcdStore_UpdateEntity(t *testing.T) {
 			r.Len(x.Events, 1)
 			r.Equal(x.Events[0].Type, mvccpb.DELETE)
 			r.Equal(x.Events[0].PrevKv.Value, []byte(entity.Id()))
-			// This delete should be for the session-based index, not the main entity one
+			// This delete should be for the session-based index, not the main
+			// entity one: the presence marker the session's write left beside
+			// the durable entry. The entityserver delivers it to watchers as an
+			// update, since the entity lives on (see the index layout comment).
 			r.Contains(string(x.Events[0].PrevKv.Key), base58.Encode(sid))
 		}
 
@@ -920,20 +923,29 @@ func TestListIndexPageAtRevisionPinsContinuationPages(t *testing.T) {
 }
 
 // TestListIndexPageAtRevisionSessionEntityOnPageBoundary covers an entity that
-// holds both a plain and a session entry in one index. Whatever page size puts
-// its plain entry last on a page, the continuation must not return it again
-// from the session entry (MIR-1990).
+// holds more than one key in one index: its match, and a presence marker for
+// each session holding attributes on it. Whatever page size puts the match
+// last on a page, the continuation must not return the entity again from a
+// marker (MIR-1990), and the total counts matches only.
 func TestListIndexPageAtRevisionSessionEntityOnPageBoundary(t *testing.T) {
 	ctx := context.Background()
 	store, _ := setupTestEtcdStore(t)
 
-	attr, err := store.CreateEntity(ctx, New(
+	durable, err := store.CreateEntity(ctx, New(
 		String(Ident, "test-session-page"),
 		Ref(Type, TypeStr),
 		Bool(Index, true),
 	))
 	require.NoError(t, err)
-	index := String(attr.Id(), "value")
+	sessionAttr, err := store.CreateEntity(ctx, New(
+		String(Ident, "test-session-page-state"),
+		Ref(Type, TypeStr),
+		Bool(Session, true),
+	))
+	require.NoError(t, err)
+
+	index := String(durable.Id(), "value")
+	state := String(sessionAttr.Id(), "ready")
 
 	var want []Id
 	for i := range 4 {
@@ -945,31 +957,45 @@ func TestListIndexPageAtRevisionSessionEntityOnPageBoundary(t *testing.T) {
 		want = append(want, created.Id())
 	}
 
-	sid, err := store.CreateSession(ctx, 30)
+	first, err := store.CreateSession(ctx, 30)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = store.RevokeSession(context.Background(), sid) })
-	bound, err := store.CreateEntity(ctx, New(
+	t.Cleanup(func() { _ = store.RevokeSession(context.Background(), first) })
+	second, err := store.CreateSession(ctx, 30)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.RevokeSession(context.Background(), second) })
+
+	// Storing a session attribute is what gives the entity a presence marker
+	// beside its durable match.
+	marked, err := store.CreateEntity(ctx, New(
 		index,
-		String(Ident, "session-page-bound"),
-	), WithSession(sid))
+		state,
+		String(Ident, "session-page-marked"),
+	), WithSession(first))
 	require.NoError(t, err)
-	want = append(want, bound.Id())
+	want = append(want, marked.Id())
+	_, err = store.UpdateEntity(ctx, marked.Id(), New(state), WithSession(second))
+	require.NoError(t, err)
+
+	walk := func(t *testing.T, attr Attr, limit int64) (int64, []Id) {
+		t.Helper()
+		page, err := store.ListIndexPageAtRevision(ctx, attr, "", limit, 0)
+		require.NoError(t, err)
+		total := page.Total
+		got := append([]Id(nil), page.Ids...)
+		for page.Cursor != "" {
+			page, err = store.ListIndexPageAtRevision(ctx, attr, page.Cursor, limit, page.Revision)
+			require.NoError(t, err)
+			got = append(got, page.Ids...)
+		}
+		return total, got
+	}
 
 	// Every page size from 1 to the entity count, so one of them lands the
-	// bound entity's plain entry on a boundary wherever it sorts.
+	// marked entity's match on a boundary wherever it sorts.
 	for limit := int64(1); limit <= int64(len(want)); limit++ {
-		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
-			page, err := store.ListIndexPageAtRevision(ctx, index, "", limit, 0)
-			require.NoError(t, err)
-			require.Equal(t, int64(len(want)+1), page.Total, "the bound entity should hold two index entries")
-
-			got := append([]Id(nil), page.Ids...)
-			for page.Cursor != "" {
-				page, err = store.ListIndexPageAtRevision(ctx, index, page.Cursor, limit, page.Revision)
-				require.NoError(t, err)
-				got = append(got, page.Ids...)
-			}
-
+		t.Run(fmt.Sprintf("durable limit %d", limit), func(t *testing.T) {
+			total, got := walk(t, index, limit)
+			require.Equal(t, int64(len(want)), total, "a presence marker is not a match")
 			require.ElementsMatch(t, want, got, "each entity should be listed exactly once across pages")
 		})
 	}
