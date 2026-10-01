@@ -1797,10 +1797,15 @@ func (s *EtcdStore) ListIndexPageAtRevision(
 
 	seen := make(map[Id]struct{})
 
-	// resumeKey trails one behind: it is the key of the last id inside the
-	// page, captured only once we know something follows it. Setting a cursor
+	// resumeKey trails one behind: it is the last key the page consumed,
+	// captured only once we know something follows it. Setting a cursor
 	// merely because the scan hit the limit hands back a cursor to nothing
 	// whenever the index ends exactly on a page boundary.
+	//
+	// Consumed includes duplicates. An entity written with a session holds a
+	// plain entry and a session entry, <id> and <id>/<session>, adjacent in key
+	// order. Resuming after only the plain key would start the next page on the
+	// session key and return the entity a second time (MIR-1990).
 	resumeKey := ""
 	prevKey := ""
 
@@ -1815,6 +1820,7 @@ func (s *EtcdStore) ListIndexPageAtRevision(
 	scanErr := scanPagedFunc(ctx, s.client, prefix, func(kv *mvccpb.KeyValue) error {
 		id := Id(kv.Value)
 		if _, dup := seen[id]; dup {
+			prevKey = string(kv.Key)
 			return nil
 		}
 
