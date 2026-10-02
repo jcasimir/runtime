@@ -114,7 +114,7 @@ jobs:
   # run on every PR but too important to leave to someone remembering a label.
   # Only consulted for pull_request; other events don't gate on it at all.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       distributed: ${{ steps.filter.outputs.distributed }}
     steps:
@@ -155,7 +155,7 @@ jobs:
         fi
 
   test-groups:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -261,7 +261,7 @@ jobs:
       run: docker save runtime-shell -o /tmp/iso-image.tar
 
   blackbox-groups:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -530,7 +530,7 @@ jobs:
       github.event_name != 'pull_request' ||
       needs.changes.outputs.distributed == 'true' ||
       contains(github.event.pull_request.labels.*.name, 'ci:distributed') )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -669,7 +669,7 @@ jobs:
   test:
     if: always()
     needs: [changes, test-runner, blackbox-groups, test-blackbox, test-blackbox-pop, blackbox-groups-distributed, test-blackbox-distributed]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
     - name: Check results
       run: |
