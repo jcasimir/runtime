@@ -230,6 +230,30 @@ func TestPrintSagaShowUndoFailures(t *testing.T) {
 	assert.Contains(t, out, `undo error: missing required input "container_id"`)
 	assert.Contains(t, out, "29 failed undo attempts, the first")
 	assert.NotContains(t, out, "undone after", "the undo has not gone through")
+	assert.NotContains(t, out, "BLOCKED", "failing is not blocked until a build gives up")
+
+	exec.ExecutedActions["create_disk"].UndoBlockedBuild = "main:abc123"
+	exec.BlockedReason = `undo of "create_disk" ... build main:abc123 will not retry it`
+	record, err = decodeSagaRecord(sagaEntityFor(t, exec, time.Now(), time.Now()))
+	require.NoError(t, err)
+	buf.Reset()
+	printSagaShow(&Context{Stdout: &buf}, record, nil, false)
+	assert.Contains(t, buf.String(), "BLOCKED: the undo of create_disk kept failing, and this release will not retry it.")
+	assert.NotContains(t, buf.String(), "refused to resume",
+		"an undo block is not a version refusal, and saying so sends the operator after the wrong fix")
+
+	// A parent blocked on that child carries no undo block of its own.
+	parent := wedgedSaga()
+	parent.ID = "saga/sg-Parent1"
+	parent.Status = saga.StatusUndoing
+	parent.BlockedOn = exec.ID
+	parent.BlockedReason = `undo "create_disk" reached a nested saga whose undo is blocked`
+	parentRecord, err := decodeSagaRecord(sagaEntityFor(t, parent, time.Now(), time.Now()))
+	require.NoError(t, err)
+	buf.Reset()
+	printSagaShow(&Context{Stdout: &buf}, parentRecord, []*sagaRecord{record}, false)
+	assert.Contains(t, buf.String(), "BLOCKED: waiting on a child saga whose undo kept failing.")
+	assert.NotContains(t, buf.String(), "refused to resume")
 
 	shown := newSagaShowJSON(record, nil)
 	require.Len(t, shown.Actions, 2)

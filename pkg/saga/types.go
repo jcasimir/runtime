@@ -55,6 +55,10 @@ type ActionResult struct {
 
 	// UndoFailingSince is when the first counted undo attempt failed.
 	UndoFailingSince *time.Time `json:"undo_failing_since,omitempty"`
+
+	// UndoBlockedBuild is the build that gave up retrying this undo. That
+	// build leaves the execution blocked; any other build tries once more.
+	UndoBlockedBuild string `json:"undo_blocked_build,omitempty"`
 }
 
 // recordUndoFailure notes a failed attempt to undo this action.

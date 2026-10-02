@@ -298,7 +298,7 @@ func DebugSagaAbandon(ctx *Context, opts struct {
 	left, err := saga.Abandon(exec, time.Now())
 	if err != nil {
 		if errors.Is(err, saga.ErrNotBlocked) {
-			return fmt.Errorf("%w\n\nAbandon is only for executions the server refused to resume. "+
+			return fmt.Errorf("%w\n\nAbandon is only for blocked executions. "+
 				"This one will be finished or compensated by the server on its own", err)
 		}
 		return err
@@ -389,7 +389,13 @@ func printSagaShow(ctx *Context, r *sagaRecord, children []*sagaRecord, full boo
 		// Last in the header and set apart, because it changes what every
 		// other line means: nothing is driving this execution, and nothing
 		// will until someone acts.
-		ctx.Printf("\nBLOCKED: the server refused to resume this execution.\n")
+		if action, _ := saga.BlockedUndo(exec); action != "" {
+			ctx.Printf("\nBLOCKED: the undo of %s kept failing, and this release will not retry it.\n", action)
+		} else if childUndoBlocked(exec, children) {
+			ctx.Printf("\nBLOCKED: waiting on a child saga whose undo kept failing.\n")
+		} else {
+			ctx.Printf("\nBLOCKED: the server refused to resume this execution.\n")
+		}
 		ctx.Printf("  %s\n", exec.BlockedReason)
 		if exec.BlockedOn != "" {
 			ctx.Printf("  Waiting on child saga %s; nothing here runs until it can be resumed or is abandoned.\n",
@@ -434,6 +440,18 @@ func printSagaShow(ctx *Context, r *sagaRecord, children []*sagaRecord, full boo
 			ctx.Printf("  %s  %s  %s\n", ui.CleanEntityID(c.exec.ID), c.exec.DefinitionName, sagaStatusLabel(c.exec))
 		}
 	}
+}
+
+// childUndoBlocked reports whether the child exec is blocked on is itself
+// blocked on a failing undo, rather than refused by a version check.
+func childUndoBlocked(exec *saga.Execution, children []*sagaRecord) bool {
+	for _, c := range children {
+		if c.exec.ID == exec.BlockedOn {
+			action, _ := saga.BlockedUndo(c.exec)
+			return action != ""
+		}
+	}
+	return false
 }
 
 // sagaStatusLabel is the status as a person should read it. A blocked
