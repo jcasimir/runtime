@@ -281,7 +281,10 @@ generate-check: bin/miren ## Verify go generate is up to date
 	fi
 	@echo "✓ go generate is up to date"
 
-.PHONY: lint lint-fix lint-pr docs-lint generate-check
+contract-check: ## Verify the cloud export contract doesn't break what cloud embeds
+	@bash hack/contract-check.sh
+
+.PHONY: lint lint-fix lint-pr docs-lint generate-check contract-check
 
 #
 # Release Packaging
