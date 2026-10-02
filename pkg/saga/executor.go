@@ -622,12 +622,13 @@ func (e *Executor) runUndo(ctx context.Context, def *Definition, exec *Execution
 	ctx = context.WithValue(ctx, executorCtxKey{}, e)
 	ctx = context.WithValue(ctx, executionIDCtxKey{}, exec.ID)
 
-	// Build outputs map from executed actions
+	// Undone actions' outputs are included on purpose. An undo gets the inputs
+	// its action ran with, and a failed undo is retried after the pass has gone
+	// on to undo the actions before it, which are often the ones that produced
+	// those inputs. Leaving them out makes the retry fail on a missing input,
+	// every time, so the execution could never finish compensating.
 	outputs := make(map[string]json.RawMessage)
 	for actionName, result := range exec.ExecutedActions {
-		if result.UndoneAt != nil {
-			continue
-		}
 		node := def.Actions[actionName]
 		if node == nil {
 			continue
