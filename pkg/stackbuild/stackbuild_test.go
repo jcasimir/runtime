@@ -1017,6 +1017,57 @@ func TestGoCgo(t *testing.T) {
 	})
 }
 
+// TestGoWithJSAugmentation builds a Go app that ships a package.json for its
+// frontend, the case augmentations exist for. The JS install runs as the app
+// user, so the builder needs that user and an /app it can write to, even
+// though compileDeps creates /app first.
+func TestGoWithJSAugmentation(t *testing.T) {
+	requireBuildkit(t)
+	t.Parallel()
+
+	root := t.TempDir()
+	dir := setupTestDir(root, t)
+
+	files := map[string]string{
+		"go.mod":            readFile(t, "go/go.mod") + runNonce("//"),
+		"go.sum":            readFile(t, "go/go.sum"),
+		"main.go":           readFile(t, "go/main.go"),
+		"package.json":      `{"name":"assets","version":"1.0.0","dependencies":{"is-plain-obj":"4.1.0"}}`,
+		"package-lock.json": "{}",
+	}
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0644))
+	}
+
+	// DetectStack would pick Node for a package.json with dependencies, so
+	// build the Go stack the way it does for one without.
+	opts := BuildOptions{Version: "1.23"}
+	stack := &GoStack{MetaStack: MetaStack{dir: dir}}
+	stack.Init(opts)
+	attachAugmentations(stack, dir)
+	require.Equal(t, []Augmentation{AugNpm}, stack.Augmentations())
+	require.True(t, stack.splitDeps)
+
+	state, err := stack.GenerateLLB(context.Background(), dir, opts)
+	require.NoError(t, err)
+
+	solveLLB(t, startBuildkit(t), "", dir, state, func(f io.Reader) {
+		found := map[string]bool{}
+		tr := tar.NewReader(f)
+		for {
+			hdr, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+			found[hdr.Name] = true
+		}
+		// debian-slim's /bin is a symlink to /usr/bin.
+		require.True(t, found["usr/bin/app"], "Go binary missing")
+		require.True(t, found["app/node_modules/is-plain-obj/package.json"], "JS dependency missing")
+	})
+}
+
 func TestGoDepsSplitBlocker(t *testing.T) {
 	cases := []struct {
 		name    string

@@ -261,6 +261,16 @@ func (s *GoStack) GenerateLLB(ctx context.Context, dir string, opts BuildOptions
 	if s.splitDeps {
 		builder = s.compileDeps(h, builder, localCtx, cgoEnabled)
 	}
+	if len(s.Augmentations()) > 0 {
+		// The JS installs run as the app user, which the golang image doesn't
+		// have, and need /app to be theirs. compileDeps has already created
+		// /app as root, and ensureAppDir leaves an existing directory alone.
+		builder = s.addAppUser(builder)
+		builder = builder.Run(
+			llb.Shlex("sh -c 'mkdir -p /app && chown 2010:2011 /app'"),
+			llb.WithCustomName("[phase] Handing /app to the app user"),
+		).Root()
+	}
 	builder = h.applyAugmentations(builder, localCtx, s.BaseDistro(), s.Augmentations(), s.SkipJSInstall())
 
 	// Copy the application code (owned by the app user, uid 2010)
