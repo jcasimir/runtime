@@ -259,7 +259,7 @@ func (s *GoStack) GenerateLLB(ctx context.Context, dir string, opts BuildOptions
 	// the builder before fetching private deps or compiling.
 	builder := base
 	if s.splitDeps {
-		builder = s.compileDeps(builder, localCtx, cgoEnabled)
+		builder = s.compileDeps(h, builder, localCtx, cgoEnabled)
 	}
 	builder = h.applyAugmentations(builder, localCtx, s.BaseDistro(), s.Augmentations(), s.SkipJSInstall())
 
@@ -287,6 +287,7 @@ func (s *GoStack) GenerateLLB(ctx context.Context, dir string, opts BuildOptions
 		builder = builder.Dir("/app").Run(
 			llb.Shlex(buildCmd),
 			llb.AddEnv("CGO_ENABLED", cgoEnabled),
+			h.rootDepAuth(),
 
 			// This basically is just a scratch mount until we add the ability to
 			// properly export and import the cache dirs.
@@ -319,7 +320,7 @@ const goDepsListFormat = `{{if and (not .Standard) .Module (not .Module.Main)}}{
 // cache mounts after 48 hours untouched, which a lightly deployed app outlives
 // routinely. Layers stay until the builder's shared size cap evicts them, least
 // recently used first.
-func (s *GoStack) compileDeps(cur, localCtx llb.State, cgoEnabled string) llb.State {
+func (s *GoStack) compileDeps(h *highlevelBuilder, cur, localCtx llb.State, cgoEnabled string) llb.State {
 	mods := cur.File(llb.Copy(localCtx, "/", "/app", &llb.CopyInfo{
 		IncludePatterns: []string{"go.mod", "go.sum"},
 		CreateDestPath:  true,
@@ -327,6 +328,7 @@ func (s *GoStack) compileDeps(cur, localCtx llb.State, cgoEnabled string) llb.St
 
 	mods = mods.Dir("/app").Run(
 		llb.Shlex("go mod download"),
+		h.rootDepAuth(),
 		llb.WithCustomName("[phase] Downloading Go modules"),
 	).Root()
 
@@ -341,6 +343,9 @@ func (s *GoStack) compileDeps(cur, localCtx llb.State, cgoEnabled string) llb.St
 			goDepsListFormat, s.cmdDir)}),
 		llb.AddEnv("CGO_ENABLED", cgoEnabled),
 		llb.AddMount("/src", localCtx, llb.Readonly),
+		// go.mod may name a module its go.sum doesn't cover, which go list
+		// fetches.
+		h.rootDepAuth(),
 		llb.WithCustomName("[phase] Listing Go dependencies"),
 	).AddMount("/out", llb.Scratch())
 

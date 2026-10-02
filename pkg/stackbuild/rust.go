@@ -302,7 +302,7 @@ func (s *RustStack) GenerateLLB(ctx context.Context, dir string, opts BuildOptio
 		// The compiled dependencies live in the builder's target dir, which is
 		// far too big to ship, so only the binary crosses over to an image laid
 		// out like the single-step build's.
-		builder := s.compileDeps(base, localCtx)
+		builder := s.compileDeps(h, base, localCtx)
 		builder = h.copyApp(builder, localCtx)
 		builder = builder.Dir("/app").Run(
 			llb.Args([]string{"/bin/sh", "-c",
@@ -322,6 +322,8 @@ func (s *RustStack) GenerateLLB(ctx context.Context, dir string, opts BuildOptio
 				fmt.Sprintf("%s && %s", s.buildCommand(), cpCmd)}),
 			h.CacheMount("/usr/local/cargo/registry"),
 			h.CacheMount("/app/target"),
+			// No separate dependency step on this path, so the build fetches.
+			h.rootDepAuth(),
 			llb.WithCustomName("[phase] Building Rust application"),
 		).Root()
 	}
@@ -341,7 +343,7 @@ func (s *RustStack) GenerateLLB(ctx context.Context, dir string, opts BuildOptio
 // The placeholders are newer than the real sources copyApp brings in later
 // (it pins their mtime to 2021), so cargo would take the stub build as current.
 // buildCommand's clean of the app's own package is what forces the rebuild.
-func (s *RustStack) compileDeps(cur, localCtx llb.State) llb.State {
+func (s *RustStack) compileDeps(h *highlevelBuilder, cur, localCtx llb.State) llb.State {
 	cur = cur.File(llb.Copy(localCtx, "/", "/app", &llb.CopyInfo{
 		// Cargo config and toolchain pins change how the dependencies build
 		// (registries, rustflags, the rustc itself), so they key this layer
@@ -363,6 +365,7 @@ func (s *RustStack) compileDeps(cur, localCtx llb.State) llb.State {
 
 	return cur.Dir("/app").Run(
 		llb.Shlex("cargo build --release"),
+		h.rootDepAuth(),
 		llb.WithCustomName("[phase] Compiling Rust dependencies"),
 	).Root()
 }

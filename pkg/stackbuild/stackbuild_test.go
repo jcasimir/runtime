@@ -21,6 +21,7 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/auth/authprovider"
+	"github.com/moby/buildkit/session/secrets/secretsprovider"
 	"github.com/moby/buildkit/util/progress/progresswriter"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
@@ -143,6 +144,13 @@ type solvedVertex struct {
 // from it are never stored locally and miss on the next solve.
 func solveLLB(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb.State, check ...func(f io.Reader)) map[string]*solvedVertex {
 	t.Helper()
+	return solveLLBWithSecrets(t, c, cacheDir, dir, state, nil, check...)
+}
+
+// solveLLBWithSecrets is solveLLB with build secrets on the solve's session,
+// keyed by id, as the build server attaches an app's [[build.secrets]].
+func solveLLBWithSecrets(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb.State, secrets map[string][]byte, check ...func(f io.Reader)) map[string]*solvedVertex {
+	t.Helper()
 	ctx := context.Background()
 
 	def, err := state.Marshal(ctx)
@@ -204,6 +212,9 @@ func solveLLB(t *testing.T, c *buildkit.Client, cacheDir, dir string, state *llb
 				},
 			},
 		},
+	}
+	if len(secrets) > 0 {
+		solveOpt.Session = append(solveOpt.Session, secretsprovider.FromMap(secrets))
 	}
 	if cacheDir != "" {
 		solveOpt.CacheExports = []buildkit.CacheOptionsEntry{
