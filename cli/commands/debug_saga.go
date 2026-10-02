@@ -418,6 +418,10 @@ func printSagaShow(ctx *Context, r *sagaRecord, children []*sagaRecord, full boo
 			if result.Error != "" {
 				ctx.Printf("     error: %s\n", result.Error)
 			}
+			if result.UndoAttempts > 0 {
+				ctx.Printf("     undo error: %s\n", result.UndoError)
+				ctx.Printf("     %s\n", sagaUndoFailures(result))
+			}
 			if len(result.Output) > 0 {
 				ctx.Printf("     output: %s\n", formatSagaJSON(result.Output, full, 5))
 			}
@@ -475,6 +479,22 @@ func sagaActionSummary(result *saga.ActionResult) string {
 	}
 
 	return summary
+}
+
+// sagaUndoFailures says how long an action's undo has been failing, or, once
+// it went through, how many tries that took.
+func sagaUndoFailures(result *saga.ActionResult) string {
+	attempts := "1 failed undo attempt"
+	if result.UndoAttempts != 1 {
+		attempts = fmt.Sprintf("%d failed undo attempts", result.UndoAttempts)
+	}
+	if result.UndoFailingSince != nil {
+		attempts += fmt.Sprintf(", the first %s", humanFriendlyTimestamp(*result.UndoFailingSince))
+	}
+	if result.UndoneAt != nil {
+		return "undone after " + attempts
+	}
+	return attempts
 }
 
 func sagaTimestamp(t time.Time) string {
@@ -688,6 +708,10 @@ type sagaActionJSON struct {
 	UndoneAt   string          `json:"undone_at,omitempty"`
 	Error      string          `json:"error,omitempty"`
 	Output     json.RawMessage `json:"output,omitempty"`
+
+	UndoError        string `json:"undo_error,omitempty"`
+	UndoAttempts     int    `json:"undo_attempts,omitempty"`
+	UndoFailingSince string `json:"undo_failing_since,omitempty"`
 }
 
 type sagaChildJSON struct {
@@ -725,6 +749,11 @@ func newSagaShowJSON(r *sagaRecord, children []*sagaRecord) sagaShowJSON {
 				action.UndoneAt = sagaJSONTime(*result.UndoneAt)
 			}
 			action.Error = result.Error
+			action.UndoError = result.UndoError
+			action.UndoAttempts = result.UndoAttempts
+			if result.UndoFailingSince != nil {
+				action.UndoFailingSince = sagaJSONTime(*result.UndoFailingSince)
+			}
 			if len(result.Output) > 0 {
 				action.Output = json.RawMessage(result.Output)
 			}

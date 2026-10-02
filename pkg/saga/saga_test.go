@@ -1011,7 +1011,12 @@ func TestExecutor_RetriedUndoSeesOutputsOfUndoneActions(t *testing.T) {
 	require.Equal(t, StatusUndoing, exec.Status)
 	require.NotNil(t, exec.ExecutedActions["produce"].UndoneAt,
 		"the first pass carries on past the failed undo and undoes produce")
-	require.Nil(t, exec.ExecutedActions["consume"].UndoneAt)
+	consume := exec.ExecutedActions["consume"]
+	require.Nil(t, consume.UndoneAt)
+	assert.Equal(t, "transient undo failure", consume.UndoError,
+		"the undo error belongs on the record, not only in the runner's log")
+	assert.Equal(t, 1, consume.UndoAttempts)
+	require.NotNil(t, consume.UndoFailingSince)
 
 	// A finished rollback still reports the saga as failed, so the error alone
 	// can't say whether the undo went through. The record and the undo can.
@@ -1022,6 +1027,9 @@ func TestExecutor_RetriedUndoSeesOutputsOfUndoneActions(t *testing.T) {
 	assert.Equal(t, StatusFailed, exec.Status, "the retried undo should succeed and finish the rollback")
 	assert.Equal(t, []string{"handle-1"}, ctrl.undoneWith,
 		"the retried undo should get the input produce gave it originally")
+	consume = exec.ExecutedActions["consume"]
+	assert.NotNil(t, consume.UndoneAt)
+	assert.Equal(t, 1, consume.UndoAttempts, "the history of the failure stays once the undo goes through")
 }
 
 func TestExecutor_RecoveryAfterActionFailure(t *testing.T) {

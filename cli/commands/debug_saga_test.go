@@ -210,6 +210,35 @@ func TestPrintSagaShowBlocked(t *testing.T) {
 	assert.Equal(t, exec.BlockedReason, listed.BlockedReason)
 }
 
+// TestPrintSagaShowUndoFailures is MIR-2007's case: an undo that kept failing
+// left only "executed" in show, and the reason was in one runner's journal.
+func TestPrintSagaShowUndoFailures(t *testing.T) {
+	exec := wedgedSaga()
+	exec.Status = saga.StatusUndoing
+	failingSince := time.Now().Add(-28 * 24 * time.Hour)
+	exec.ExecutedActions["create_disk"].UndoError = `missing required input "container_id" for field "ContainerID"`
+	exec.ExecutedActions["create_disk"].UndoAttempts = 29
+	exec.ExecutedActions["create_disk"].UndoFailingSince = &failingSince
+
+	record, err := decodeSagaRecord(sagaEntityFor(t, exec, time.Now(), time.Now()))
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	printSagaShow(&Context{Stdout: &buf}, record, nil, false)
+	out := buf.String()
+
+	assert.Contains(t, out, `undo error: missing required input "container_id"`)
+	assert.Contains(t, out, "29 failed undo attempts, the first")
+	assert.NotContains(t, out, "undone after", "the undo has not gone through")
+
+	shown := newSagaShowJSON(record, nil)
+	require.Len(t, shown.Actions, 2)
+	assert.Equal(t, 29, shown.Actions[0].UndoAttempts)
+	assert.Contains(t, shown.Actions[0].UndoError, "container_id")
+	_, err = time.Parse(time.RFC3339, shown.Actions[0].UndoFailingSince)
+	assert.NoError(t, err)
+}
+
 func TestSagaAbandonBlockers(t *testing.T) {
 	child := func(id string, status saga.Status, blocked string) *sagaRecord {
 		return &sagaRecord{exec: &saga.Execution{ID: id, Status: status, BlockedReason: blocked}}

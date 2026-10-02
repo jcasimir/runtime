@@ -501,9 +501,9 @@ func (e *Executor) runExecution(ctx, actionCtx context.Context, def *Definition,
 				log.Error("undo failed after serialization error", "action", actionName, "error", undoErr)
 				// Record the action even though undo failed, so runUndo can retry.
 				// Output is nil since serialization failed.
-				exec.ExecutedActions[actionName] = &ActionResult{
-					ExecutedAt: now,
-				}
+				result := &ActionResult{ExecutedAt: now}
+				result.recordUndoFailure(undoErr, time.Now())
+				exec.ExecutedActions[actionName] = result
 				exec.ExecutionOrder = append(exec.ExecutionOrder, actionName)
 			} else {
 				// Record as executed and undone so runUndo skips it
@@ -676,6 +676,7 @@ func (e *Executor) runUndo(ctx context.Context, def *Definition, exec *Execution
 			if err := json.Unmarshal(result.Output, &output); err != nil {
 				log.Warn("failed to deserialize output for undo", "action", actionName, "error", err)
 				undoErrors = append(undoErrors, fmt.Errorf("deserialize output for undo %q: %w", actionName, err))
+				result.recordUndoFailure(err, time.Now())
 				continue
 			}
 		}
@@ -697,6 +698,9 @@ func (e *Executor) runUndo(ctx context.Context, def *Definition, exec *Execution
 			}
 			log.Error("undo failed", "action", actionName, "error", err)
 			undoErrors = append(undoErrors, fmt.Errorf("undo %q: %w", actionName, err))
+			if ctx.Err() == nil {
+				result.recordUndoFailure(err, time.Now())
+			}
 			// Continue with other undos even on failure
 			// Don't mark as undone - recovery should retry this action
 			continue
