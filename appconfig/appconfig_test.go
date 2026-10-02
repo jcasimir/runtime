@@ -298,6 +298,65 @@ ref = "registry/other-token"
 `,
 			wantErr: `build.secrets[1]: duplicate id "npm_token"`,
 		},
+		{
+			name: "build secret with env and file targets",
+			config: `
+name = "test-app"
+
+[[build.secrets]]
+id = "npm"
+ref = "registry/npm-token"
+env = "NPM_TOKEN"
+
+[[build.secrets]]
+id = "netrc"
+ref = "github/netrc"
+file = "~/.netrc"
+
+[[build.secrets]]
+id = "pipconf"
+ref = "pypi/pip-conf"
+file = "/etc/pip.conf"
+`,
+			wantErr: "",
+		},
+		{
+			name: "build secret with both env and file",
+			config: `
+name = "test-app"
+
+[[build.secrets]]
+id = "npm"
+ref = "registry/npm-token"
+env = "NPM_TOKEN"
+file = "~/.npmrc"
+`,
+			wantErr: "build.secrets[0]: set either env or file, not both",
+		},
+		{
+			name: "build secret invalid env name",
+			config: `
+name = "test-app"
+
+[[build.secrets]]
+id = "npm"
+ref = "registry/npm-token"
+env = "NPM-TOKEN"
+`,
+			wantErr: `build.secrets[0]: env "NPM-TOKEN" is not a valid environment variable name`,
+		},
+		{
+			name: "build secret relative file",
+			config: `
+name = "test-app"
+
+[[build.secrets]]
+id = "netrc"
+ref = "github/netrc"
+file = ".netrc"
+`,
+			wantErr: `build.secrets[0]: file ".netrc" must be an absolute path or start with ~/`,
+		},
 	}
 
 	for _, tt := range tests {

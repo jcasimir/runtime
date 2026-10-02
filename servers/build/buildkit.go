@@ -321,6 +321,10 @@ type BuildStack struct {
 	// For auto-stack builds, these are set on intermediate LLB states before
 	// onBuild commands and asset precompilation steps.
 	EnvVars map[string]string
+
+	// Secrets says where an auto-stack build mounts each build secret. The
+	// values travel separately, through WithBuildSecrets.
+	Secrets []stackbuild.Secret
 }
 
 type ImageConfig struct {
@@ -417,6 +421,7 @@ func (b *Buildkit) BuildImage(
 			Version:     bs.Version,
 			AlpineImage: bs.AlpineImage,
 			EnvVars:     bs.EnvVars,
+			Secrets:     bs.Secrets,
 		}
 
 		stack, err := stackbuild.DetectStack(bs.CodeDir, buildOpts)

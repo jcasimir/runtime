@@ -218,6 +218,7 @@ func (b *Builder) runBuildkitBuild(
 	// we don't mutate the saga input.
 	stack := in.BuildStack
 	stack.EnvVars = buildEnvVars
+	stack.Secrets = stackbuildSecrets(in.AppConfig)
 
 	tos = append(tos, WithPhaseUpdates(func(phase string) {
 		status.SendPhase(phase)

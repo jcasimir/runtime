@@ -241,6 +241,7 @@ func (s *ElixirStack) GenerateLLB(ctx context.Context, dir string, opts BuildOpt
 		builder = builder.Run(
 			llb.Shlex("sh -c 'mix deps.get --only prod && mix deps.compile'"),
 			h.CacheMount("/root/.hex/packages"),
+			h.rootDepAuth(),
 			llb.WithCustomName("[phase] Fetching and compiling Mix dependencies"),
 		).Root()
 	}
@@ -252,6 +253,8 @@ func (s *ElixirStack) GenerateLLB(ctx context.Context, dir string, opts BuildOpt
 	builder = builder.Run(
 		llb.Shlex("sh -c 'mix deps.get --only prod && mix compile'"),
 		h.CacheMount("/root/.hex/packages"),
+		// An umbrella fetches its deps here, having skipped the step above.
+		h.rootDepAuth(),
 		llb.WithCustomName("[phase] Compiling Elixir application"),
 	).Root()
 
@@ -263,6 +266,7 @@ func (s *ElixirStack) GenerateLLB(ctx context.Context, dir string, opts BuildOpt
 		builder = builder.Dir("/app/assets").Run(
 			llb.Shlex(npmCmd),
 			h.CacheMount("/root/.npm"),
+			h.rootDepAuth(),
 			llb.WithCustomName("[phase] Installing asset JS deps with npm"),
 		).Root().Dir("/app")
 	}

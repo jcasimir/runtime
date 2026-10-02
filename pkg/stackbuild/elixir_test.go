@@ -242,9 +242,8 @@ config :hello, shared: System.fetch_env!("API_TOKEN")
 }
 
 func TestElixir(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	dir := copyFixture(t, "elixir")
 	s := initElixir(t, dir)
@@ -270,9 +269,8 @@ func TestElixir(t *testing.T) {
 }
 
 func TestElixirWithNpm(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	// A root package.json triggers the npm augmentation, which installs as
 	// the app user; assets/package.json gets the Elixir stack's own install.
@@ -420,9 +418,8 @@ func TestElixirPinnedVersion(t *testing.T) {
 }
 
 func TestElixirWithoutConfigUsesBuildEnv(t *testing.T) {
-	if !checkDocker() {
-		t.Skip("Docker not available")
-	}
+	requireBuildkit(t)
+	t.Parallel()
 
 	// mix new hasn't generated config/ since Elixir 1.9, and this module
 	// reads a user env var at compile time, so the build needs both a

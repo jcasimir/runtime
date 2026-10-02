@@ -226,19 +226,24 @@ alpine_image = "alpine:3.19"
 
 ### `[[build.secrets]]` — Build-time secrets {#build-secrets}
 
-Exposes an encrypted [secret](./secrets.md) to a Dockerfile build. BuildKit keeps the value out of image layers and its own logs; your `RUN` command must not print it. Each entry is mounted by its `id`, which your Dockerfile reads with `RUN --mount=type=secret,id=<id>`. Supported for Dockerfile builds only — declaring one on an auto-detected language stack is an error. See [Using a secret at build time](./secrets.md#using-a-secret-at-build-time) for the full contract.
+Exposes an encrypted [secret](./secrets.md) to the build, so it can fetch private dependencies. An automatic language build mounts each secret on its dependency install step, at the `env` or `file` target you give it. A Dockerfile build reads it with `RUN --mount=type=secret,id=<id>` and ignores the target. BuildKit keeps the value out of image layers and its own logs. See [Using a secret at build time](./secrets.md#using-a-secret-at-build-time) for the full contract.
 
 ```toml
 [[build.secrets]]
-id = "npm_token"
-ref = "registry/npm-token"
+id = "netrc"
+ref = "github/netrc"
+file = "~/.netrc"
 ```
 
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
-| `id` | string | Mount identifier used in `--mount=type=secret,id=<id>`. Letters, digits, and `_.-` only; unique within the list | Required |
+| `id` | string | Identifier the build mounts the secret by, and the one a Dockerfile uses in `--mount=type=secret,id=<id>`. Letters, digits, and `_.-` only; unique within the list | Required |
 | `backend` | string | [Secret](./secrets.md) backend to resolve against | `cluster` (built-in store) |
 | `ref` | string | Reference naming the secret within the backend | Required |
+| `env` | string | Environment variable the dependency install step reads the secret from. Automatic language builds only | — |
+| `file` | string | Absolute path, or one starting with `~/`, where the dependency install step finds the secret as a file. Automatic language builds only | — |
+
+An automatic language build needs exactly one of `env` or `file` on each secret.
 
 ## `[services.<name>]` — Service Configuration {#services}
 

@@ -49,9 +49,11 @@ type BuildConfig struct {
 	// Secrets names secret backends to expose to the build. Each entry is mounted
 	// into the build via BuildKit's secret session, so a `RUN --mount=type=secret,id=<id>`
 	// step can read the decrypted value without it ever landing in an image layer
-	// or build log. This is distinct from a runtime [[env]] reference: a build
-	// secret reaches only the build and never becomes an environment variable in
-	// the running container.
+	// or build log. An auto-detected language stack mounts each one on its
+	// dependency install step instead, at the entry's Env or File target. This
+	// is distinct from a runtime [[env]] reference: a build secret reaches only
+	// the build and never becomes an environment variable in the running
+	// container.
 	Secrets []BuildSecret `toml:"secrets,omitempty"`
 }
 
@@ -60,10 +62,19 @@ type BuildConfig struct {
 // address the secret the same way a runtime [[env]] reference does. Backend is
 // optional and defaults to the built-in "cluster" store when omitted, matching
 // the `--backend` CLI flag.
+//
+// Env and File say where an auto-detected language stack puts the secret on its
+// dependency install step: an environment variable (an npm token a committed
+// .npmrc reads as ${NPM_TOKEN}), or a file (a netrc holding a git host token).
+// A File starting with "~/" lands in the home directory of whichever user the
+// step runs as. A Dockerfile build ignores both, since its own
+// `--mount=type=secret` decides where the secret goes.
 type BuildSecret struct {
 	ID      string `json:"id" toml:"id"`
 	Backend string `json:"backend,omitempty" toml:"backend,omitempty"`
 	Ref     string `json:"ref" toml:"ref"`
+	Env     string `json:"env,omitempty" toml:"env,omitempty"`
+	File    string `json:"file,omitempty" toml:"file,omitempty"`
 }
 
 // buildSecretIDRegexp constrains a build secret's mount id to characters
@@ -71,6 +82,10 @@ type BuildSecret struct {
 // would pass a bare non-empty check but fail cryptically mid-build, so it is
 // rejected up front with a clear message.
 var buildSecretIDRegexp = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+
+// buildSecretEnvRegexp is a POSIX shell variable name, which is what a build
+// secret's env target becomes inside the install step.
+var buildSecretEnvRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // ServiceConcurrencyConfig represents per-service concurrency configuration
 type ServiceConcurrencyConfig struct {
@@ -1177,6 +1192,21 @@ func (bs BuildSecret) validate(keyPath string) error {
 		return &ValidationError{
 			KeyPath: keyPath + ".ref",
 			Message: fmt.Sprintf("%s: ref is required to name the secret within the backend", keyPath),
+		}
+	case bs.Env != "" && bs.File != "":
+		return &ValidationError{
+			KeyPath: keyPath,
+			Message: fmt.Sprintf("%s: set either env or file, not both — declare the secret twice under different ids to get both", keyPath),
+		}
+	case bs.Env != "" && !buildSecretEnvRegexp.MatchString(bs.Env):
+		return &ValidationError{
+			KeyPath: keyPath + ".env",
+			Message: fmt.Sprintf("%s: env %q is not a valid environment variable name", keyPath, bs.Env),
+		}
+	case bs.File != "" && !strings.HasPrefix(bs.File, "/") && !strings.HasPrefix(bs.File, "~/"):
+		return &ValidationError{
+			KeyPath: keyPath + ".file",
+			Message: fmt.Sprintf("%s: file %q must be an absolute path or start with ~/", keyPath, bs.File),
 		}
 	}
 	return nil
