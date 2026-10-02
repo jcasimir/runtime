@@ -72,14 +72,19 @@ func (s *AuthorizationState) beginSession(ctx context.Context, session uplink.Se
 
 func (s *AuthorizationState) receiveSnapshot(ctx context.Context, data json.RawMessage) error {
 	var snapshot AuthorizationSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return fmt.Errorf("invalid authorization snapshot: %w", err)
-	}
+	decodeErr := json.Unmarshal(data, &snapshot)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	selection, selected := s.session.Capability(AuthorizationCapability)
 	if !selected || selection.Version != 1 || s.sessionCtx == nil || s.sessionCtx.Err() != nil || ctx.Err() != nil {
 		return fmt.Errorf("authorization snapshot outside a negotiated session")
+	}
+	if decodeErr != nil {
+		// An unreadable update may revoke previously granted access. Do not
+		// continue authorizing from state we can no longer confirm is current.
+		s.loaded = false
+		s.evaluator.ClearCache()
+		return fmt.Errorf("invalid authorization snapshot: %w", decodeErr)
 	}
 	if snapshot.SessionID != s.session.ID || snapshot.OrganizationID != s.session.OrganizationID {
 		return fmt.Errorf("authorization snapshot scope does not match session")
@@ -88,22 +93,27 @@ func (s *AuthorizationState) receiveSnapshot(ctx context.Context, data json.RawM
 		return fmt.Errorf("authorization snapshot revision is not increasing")
 	}
 	if snapshot.Memberships == nil || snapshot.Policy.Rules == nil {
+		s.loaded = false
+		s.snapshot.Revision = snapshot.Revision
+		s.evaluator.ClearCache()
 		return fmt.Errorf("authorization snapshot must contain rules and memberships")
 	}
 	s.snapshot = snapshot
 	s.loaded = true
 	s.evaluator.ClearCache()
 	s.logger.Info("cloud authorization snapshot applied", "revision", snapshot.Revision,
-		"rules", len(snapshot.Policy.Rules), "users", len(snapshot.Memberships))
+		"rules", len(snapshot.Policy.Rules), "principals", len(snapshot.Memberships))
 	return nil
 }
 
-func (s *AuthorizationState) Evaluate(req *rbac.Request, organizationID string) rbac.Decision {
+func (s *AuthorizationState) Evaluate(req *rbac.Request) rbac.Decision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.loaded || s.sessionCtx.Err() != nil || organizationID != s.snapshot.OrganizationID {
+	if !s.loaded || s.sessionCtx.Err() != nil {
 		return rbac.DecisionDeny
 	}
+	// The authenticated session scopes this authoritative principal map. Token
+	// organization claims may be absent or numeric and are not organization XIDs.
 	groups, present := s.snapshot.Memberships[req.Subject]
 	if !present {
 		return rbac.DecisionDeny

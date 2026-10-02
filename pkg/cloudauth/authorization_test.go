@@ -2,6 +2,9 @@ package cloudauth
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -41,7 +44,7 @@ func deliverSnapshot(t *testing.T, state *AuthorizationState, snapshot Authoriza
 func TestAuthorizationSnapshots(t *testing.T) {
 	s := NewAuthorizationState(t.Context(), slog.Default())
 	evaluate := func(subject, org string) rbac.Decision {
-		return s.Evaluate(&rbac.Request{Subject: subject, Groups: []string{"readers"}, Resource: "apps/demo", Action: "read"}, org)
+		return s.Evaluate(&rbac.Request{Subject: subject, Groups: []string{"readers"}, Resource: "apps/demo", Action: "read", Context: map[string]any{"organization_id": org}})
 	}
 	require.Equal(t, rbac.DecisionDeny, evaluate("alice", "org-1"))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -52,8 +55,8 @@ func TestAuthorizationSnapshots(t *testing.T) {
 	require.Equal(t, rbac.DecisionAllow, evaluate("alice", "org-1"))
 	require.Equal(t, rbac.DecisionDeny, evaluate("bob", "org-1"))
 	require.Equal(t, rbac.DecisionDeny, evaluate("missing", "org-1"))
-	require.Equal(t, rbac.DecisionDeny, evaluate("alice", "other-org"))
-	require.Equal(t, rbac.DecisionDeny, evaluate("alice", ""))
+	require.Equal(t, rbac.DecisionDeny, evaluate("foreign-principal", "org-1"))
+	require.Equal(t, rbac.DecisionAllow, evaluate("alice", ""))
 	require.Equal(t, []string{"z-other", "readers"}, s.snapshot.Memberships["alice"])
 
 	// Same user/groups/request, different rules: a cached allow must be revoked.
@@ -103,13 +106,13 @@ func TestAuthorizationLocalTagSelectorsAndEmptyState(t *testing.T) {
 		{"production", rbac.DecisionAllow},
 		{"development", rbac.DecisionDeny},
 	} {
-		require.Equal(t, tc.want, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": tc.environment}}, "org-1"))
+		require.Equal(t, tc.want, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": tc.environment}}))
 	}
 	snapshot.Revision++
 	snapshot.Policy.Rules = []rbac.Rule{}
 	snapshot.Memberships = map[string][]string{}
 	deliverSnapshot(t, s, snapshot)
-	require.Equal(t, rbac.DecisionDeny, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": "production"}}, "org-1"))
+	require.Equal(t, rbac.DecisionDeny, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": "production"}}))
 }
 
 func TestAuthorizationRejectsInvalidSnapshots(t *testing.T) {
@@ -125,8 +128,6 @@ func TestAuthorizationRejectsInvalidSnapshots(t *testing.T) {
 		{"old revision", func(s *AuthorizationSnapshot) { s.Revision = 1 }},
 		{"duplicate", func(s *AuthorizationSnapshot) { s.Revision = 2 }},
 		{"zero revision", func(s *AuthorizationSnapshot) { s.Revision = 0 }},
-		{"missing memberships", func(s *AuthorizationSnapshot) { s.Memberships = nil }},
-		{"missing rules", func(s *AuthorizationSnapshot) { s.Policy.Rules = nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshot := authorizationSnapshot("session", 3)
@@ -135,6 +136,7 @@ func TestAuthorizationRejectsInvalidSnapshots(t *testing.T) {
 			require.NoError(t, err)
 			require.Error(t, s.receiveSnapshot(t.Context(), raw))
 			require.Equal(t, uint64(2), s.snapshot.Revision)
+			require.Equal(t, rbac.DecisionAllow, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"}))
 		})
 	}
 	require.Error(t, s.receiveSnapshot(t.Context(), json.RawMessage(`{`)))
@@ -142,6 +144,34 @@ func TestAuthorizationRejectsInvalidSnapshots(t *testing.T) {
 	raw, err := json.Marshal(authorizationSnapshot("unselected", 1))
 	require.NoError(t, err)
 	require.Error(t, s.receiveSnapshot(t.Context(), raw))
+}
+
+func TestMalformedAuthorizationSnapshotRevokesCachedGrants(t *testing.T) {
+	for _, body := range []string{
+		`{"session_id":"session","organization_id":"org-1","revision":3,"policy":{"rules":null},"memberships":{}}`,
+		`{"session_id":"session","organization_id":"org-1","revision":3,"policy":{"rules":[]},"memberships":null}`,
+		`{"session_id":"session","organization_id":"org-1","revision":3}`,
+		`{"session_id":"session","organization_id":"org-1","revision":3,"policy":{"rules":"invalid"},"memberships":{}}`,
+		`{`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			s := NewAuthorizationState(t.Context(), slog.Default())
+			s.beginSession(t.Context(), authorizationSession("session"))
+			deliverSnapshot(t, s, authorizationSnapshot("session", 2))
+			evaluate := func() rbac.Decision {
+				return s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"})
+			}
+			require.Equal(t, rbac.DecisionAllow, evaluate())
+			require.Error(t, s.receiveSnapshot(t.Context(), json.RawMessage(body)))
+			require.Equal(t, rbac.DecisionDeny, evaluate())
+			stale, err := json.Marshal(authorizationSnapshot("session", 2))
+			require.NoError(t, err)
+			require.Error(t, s.receiveSnapshot(t.Context(), stale))
+			require.Equal(t, rbac.DecisionDeny, evaluate())
+			deliverSnapshot(t, s, authorizationSnapshot("session", 4))
+			require.Equal(t, rbac.DecisionAllow, evaluate())
+		})
+	}
 }
 
 func TestAuthorizationConcurrentRevocation(t *testing.T) {
@@ -152,7 +182,7 @@ func TestAuthorizationConcurrentRevocation(t *testing.T) {
 	for range 8 {
 		wg.Go(func() {
 			for range 100 {
-				s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"}, "org-1")
+				s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"})
 			}
 		})
 	}
@@ -161,7 +191,7 @@ func TestAuthorizationConcurrentRevocation(t *testing.T) {
 	deliverSnapshot(t, s, snapshot)
 	wg.Wait()
 	for range 100 {
-		require.Equal(t, rbac.DecisionDeny, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"}, "org-1"))
+		require.Equal(t, rbac.DecisionDeny, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"}))
 	}
 }
 
@@ -189,6 +219,73 @@ func TestRPCUsesPushedMembershipsWithoutHTTP(t *testing.T) {
 	require.Error(t, a.Authorize(t.Context(), identity, "apps/demo", "read"))
 	require.NoError(t, a.Authorize(t.Context(), &rpc.Identity{Method: rpc.AuthMethodCert}, "apps/demo", "read"))
 	require.Zero(t, requests.Load(), "startup and authorization must not fetch cloud state")
+}
+
+func TestRPCServiceAccountPushedMemberships(t *testing.T) {
+	a, err := NewRPCAuthenticator(t.Context(), Config{Logger: slog.Default()})
+	require.NoError(t, err)
+	a.authorization.beginSession(t.Context(), authorizationSession("session"))
+	snapshot := authorizationSnapshot("session", 1)
+	snapshot.Memberships["svc-automation"] = []string{"readers"}
+	deliverSnapshot(t, a.authorization, snapshot)
+	a.tokenCache.Set("service-token", &auth.Claims{RegisteredClaims: jwt.RegisteredClaims{Subject: "svc-automation"}, OrganizationID: "org-1", GroupIDs: []string{"stale-group"}})
+	identity, err := a.Authenticate(t.Context(), &rpc.Credentials{Authorization: "Bearer service-token"})
+	require.NoError(t, err)
+	require.Equal(t, "svc-automation", identity.Subject)
+	require.Equal(t, rpc.AuthMethodJWT, identity.Method)
+	require.NoError(t, a.Authorize(t.Context(), identity, "apps/demo", "read"))
+	snapshot.Revision++
+	snapshot.Memberships["svc-automation"] = []string{}
+	deliverSnapshot(t, a.authorization, snapshot)
+	identity.Groups = []string{"readers"}
+	require.Error(t, a.Authorize(t.Context(), identity, "apps/demo", "read"))
+	snapshot.Revision++
+	delete(snapshot.Memberships, "svc-automation")
+	deliverSnapshot(t, a.authorization, snapshot)
+	require.Error(t, a.Authorize(t.Context(), identity, "apps/demo", "read"))
+}
+
+func TestRPCCloudTokenOrganizationFormats(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/.well-known/jwks.json", r.URL.Path)
+		require.NoError(t, json.NewEncoder(w).Encode(auth.JWKS{Keys: []auth.JWK{{Kty: "OKP", Crv: "Ed25519", Kid: "cloud-key", X: base64.RawURLEncoding.EncodeToString(publicKey)}}}))
+	}))
+	defer srv.Close()
+	a, err := NewRPCAuthenticator(t.Context(), Config{CloudURL: srv.URL, Logger: slog.Default()})
+	require.NoError(t, err)
+	a.authorization.beginSession(t.Context(), authorizationSession("session"))
+	snapshot := authorizationSnapshot("session", 1)
+	snapshot.Memberships["svc-automation"] = []string{"readers"}
+	snapshot.Memberships["usr-current"] = []string{"readers"}
+	deliverSnapshot(t, a.authorization, snapshot)
+	for _, tc := range []struct {
+		name    string
+		claims  jwt.MapClaims
+		allowed bool
+	}{
+		{"user without organization", jwt.MapClaims{"sub": "usr-current"}, true},
+		{"service account numeric organization", jwt.MapClaims{"sub": "svc-automation", "organization_id": 42, "group_ids": []string{"stale-group"}}, true},
+		{"foreign user", jwt.MapClaims{"sub": "usr-foreign", "group_ids": []string{"readers"}}, false},
+		{"foreign service account", jwt.MapClaims{"sub": "svc-foreign", "organization_id": 43, "group_ids": []string{"readers"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, tc.claims)
+			token.Header["kid"] = "cloud-key"
+			raw, err := token.SignedString(privateKey)
+			require.NoError(t, err)
+			identity, err := a.Authenticate(t.Context(), &rpc.Credentials{Authorization: "Bearer " + raw})
+			require.NoError(t, err)
+			require.NotNil(t, identity)
+			err = a.Authorize(t.Context(), identity, "apps/demo", "read")
+			if tc.allowed {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
 }
 
 func TestCloudEmittedAuthorizationEnvelope(t *testing.T) {

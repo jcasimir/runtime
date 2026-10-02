@@ -180,13 +180,11 @@ func (a *RPCAuthenticator) Authorize(ctx context.Context, identity *rpc.Identity
 		Context:  map[string]any{},
 	}
 
-	var organizationID string
 	if identity.Metadata != nil {
-		organizationID, _ = identity.Metadata["organization_id"].(string)
+		req.Context["organization_id"] = identity.Metadata["organization_id"]
 	}
-	req.Context["organization_id"] = organizationID
 
-	decision := a.authorization.Evaluate(req, organizationID)
+	decision := a.authorization.Evaluate(req)
 	if decision == rbac.DecisionDeny {
 		a.logger.Warn("authorization denied",
 			"subject", identity.Subject,
