@@ -159,8 +159,9 @@ own operational series through the same pipeline: the control process's Go
 heap, goroutine count and resident memory (`go_*`, `process_resident_memory_bytes`),
 embedded etcd backend health (`etcd_db_size_bytes`, `etcd_nospace_alarm`,
 `etcd_nospace_recovery_total`, and friends), host usage (`node_*`), reconcile
-controller queue depths (`reconcile_controller_*`), and a count of the log lines
-it has printed (`miren_log_messages_total`). Shipped copies carry
+controller queue depths (`reconcile_controller_*`), saga health (`saga_*`, see
+[Saga health](#saga-health) below), and a count of the log lines it has printed
+(`miren_log_messages_total`). Shipped copies carry
 `miren_cluster` and `miren_runner` so series pooled from many clusters stay
 distinct. These series also remain in the cluster's embedded VictoriaMetrics,
 unlabeled, where the node is implicit.
@@ -179,6 +180,78 @@ process runs at.
 There is no separate switch. Configuring the destination turns on application
 metrics and runtime metrics together, and delivery failures for both appear in
 the same `miren logs system vmagent` output.
+
+### Saga health
+
+Sagas are how Miren runs multi-step work that has to either finish or unwind
+cleanly: creating sandboxes, building apps, and provisioning addons. Each
+execution is recorded as it goes, so a crash resumes or rolls back rather than
+leaking half-built resources. These series tell you whether that is working.
+
+Counters, labeled by `definition` and by `entity` (`miren/control` for the
+coordinator, `miren/runner` for a distributed runner, since sandbox sagas run
+where the sandbox runs):
+
+| Series | Meaning |
+|---|---|
+| `saga_executions_started_total` | New executions. |
+| `saga_executions_finished_total{outcome}` | Executions that ended, as `completed` or `rolled_back`. A rollback is a clean failure: everything the saga did was undone. |
+| `saga_compensation_failures_total` | Undo passes that left something not undone. The execution stays `undoing` and is retried, so one that can never be compensated keeps adding to this. |
+| `saga_recoveries_total{outcome}` | Executions resumed after a restart, as `recovered` (driven to a finished state) or `failed` (still in flight afterward, including a refusal to resume at all). |
+| `saga_stranded_forced_total` | In-flight executions that nothing would ever resume, which saga GC forced to failed after seven days without a change. |
+
+Gauges, reported by the coordinator for the whole cluster and labeled by
+`definition` and `status` (`pending`, `running`, `undoing`):
+
+| Series | Meaning |
+|---|---|
+| `saga_incomplete_executions` | How many executions are in flight. |
+| `saga_incomplete_oldest_age_seconds` | How long ago the oldest of them started. |
+
+Age is measured from when an execution started, not from its last update. An
+execution stuck retrying an undo writes on every attempt, so its last update
+always looks recent.
+
+Miren doesn't decide when an execution counts as stuck. A build can
+legitimately run for much longer than a sandbox create, so the threshold
+belongs in your alert rules. Some starting points:
+
+```promql
+# Something is still stranding sagas. Expected to be zero.
+increase(saga_stranded_forced_total[1h]) > 0
+
+# Compensation is failing, so resources may be leaking.
+increase(saga_compensation_failures_total[1h]) > 0
+
+# Recovery after a restart left executions in flight.
+increase(saga_recoveries_total{outcome="failed"}[1h]) > 0
+
+# An execution has been in flight for over an hour.
+max by (definition, status) (saga_incomplete_oldest_age_seconds) > 3600
+```
+
+When one fires, list what is in flight. The `--definition` flag narrows it to
+the definition the alert named:
+
+```bash
+miren debug saga list
+miren debug saga list --definition create-sandbox
+```
+
+Then look at the execution itself. The last action listed is where it stopped,
+and its error says why:
+
+```bash
+miren debug saga show saga/sg-4TzP9hQ2mKdX8vNfR3wLbY
+```
+
+A saga in `undoing` is retrying an undo that keeps failing, and the action's
+error usually names what is in the way, such as a resource that is gone or a
+dependency that is down. Once that is fixed, the next retry finishes the
+rollback. A saga in `running` or `pending` with no recent update has stopped
+making progress. It resumes when whatever owns it next retries it, such as
+the next reconcile of the sandbox or addon it belongs to, or at the latest
+when the server or runner that owns it restarts.
 
 ## Distributed tracing
 

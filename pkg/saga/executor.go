@@ -118,6 +118,7 @@ type Executor struct {
 	registry      *Registry
 	log           *slog.Logger
 	recoveryScope string
+	counts        *Counts
 
 	// inFlight names the executions this Executor is currently driving. A
 	// caller that names its execution after the entity it belongs to will
@@ -164,12 +165,21 @@ func WithRecoveryScope(scope string) ExecutorOption {
 	}
 }
 
+// WithCounts sets where the executor counts what its executions do. Tests use
+// it to read their own counts; everything else shares DefaultCounts.
+func WithCounts(c *Counts) ExecutorOption {
+	return func(e *Executor) {
+		e.counts = c
+	}
+}
+
 // NewExecutor creates an executor with the given storage and options.
 func NewExecutor(storage Storage, opts ...ExecutorOption) *Executor {
 	e := &Executor{
 		storage:  storage,
 		registry: globalRegistry,
 		log:      slog.Default(),
+		counts:   DefaultCounts,
 		inFlight: make(map[string]struct{}),
 	}
 	for _, opt := range opts {
@@ -351,6 +361,7 @@ func (e *Executor) execute(ctx, actionCtx context.Context, defName string, input
 	if err := e.storage.Save(ctx, exec); err != nil {
 		return fmt.Errorf("persisting initial state: %w", err)
 	}
+	e.counts.Add(defName, EventStarted, 1)
 
 	return e.runExecution(ctx, actionCtx, def, exec)
 }
@@ -579,6 +590,7 @@ func (e *Executor) runExecution(ctx, actionCtx context.Context, def *Definition,
 		return fmt.Errorf("persisting completed state: %w", err)
 	}
 
+	e.counts.Add(def.Name, EventCompleted, 1)
 	log.Info("saga completed successfully")
 	return nil
 }
@@ -681,11 +693,23 @@ func (e *Executor) runUndo(ctx context.Context, def *Definition, exec *Execution
 	}
 
 	if len(undoErrors) > 0 {
+		// A shutdown that lands during the last undo leaves that undo's error
+		// here with no later iteration to notice the cancellation. It is the
+		// same interruption the loop returns for, recovery will resume it, and
+		// counting it as a failed compensation would raise an alert on every
+		// such shutdown. Only checked when something failed: a cancellation
+		// after every undo succeeded still goes on to record the rollback.
+		if err := ctx.Err(); err != nil {
+			log.Info("context cancelled during undo, stopping", "error", err)
+			return fmt.Errorf("saga undo interrupted: %w", err)
+		}
+
 		// Keep StatusUndoing so recovery can retry failed undos
 		exec.UpdatedAt = time.Now()
 		if err := e.storage.Save(ctx, exec); err != nil {
 			log.Error("failed to persist undoing state", "error", err)
 		}
+		e.counts.Add(def.Name, EventCompensationFailed, 1)
 		log.Info("saga undo incomplete, will retry on recovery", "undo_errors", len(undoErrors))
 		return fmt.Errorf("saga failed with %d undo errors: %v", len(undoErrors), undoErrors)
 	}
@@ -695,6 +719,10 @@ func (e *Executor) runUndo(ctx context.Context, def *Definition, exec *Execution
 	exec.UpdatedAt = time.Now()
 	if err := e.storage.Save(ctx, exec); err != nil {
 		log.Error("failed to persist failed state", "error", err)
+	} else {
+		// Only once it is durable: the record still says undoing otherwise,
+		// and recovery will undo it again.
+		e.counts.Add(def.Name, EventRolledBack, 1)
 	}
 
 	log.Info("saga failed and rolled back")
@@ -821,9 +849,34 @@ func (e *Executor) recoverPage(
 		if err != nil {
 			*recoverErrors = append(*recoverErrors, err)
 		}
+		e.countRecovery(ctx, exec)
 	}
 
 	return nil
+}
+
+// countRecovery records whether a recovery attempt converged. The error resume
+// returns can't say: a saga that rolled back cleanly returns its failure as an
+// error, which for recovery is a success. What matters is whether the execution
+// is still in flight, and that holds for every way of not finishing, including a
+// refusal to resume at all.
+//
+// The stored record decides, not the one in hand. The executor sets a terminal
+// status before saving it, so a save that failed leaves the copy here claiming
+// a finish the store never saw. A record that can't be read back counts as not
+// finished, since nothing confirms it was.
+//
+// An attempt cut short by shutdown is neither. The execution will be picked up
+// again, and counting it would put a failure on every restart.
+func (e *Executor) countRecovery(ctx context.Context, exec *Execution) {
+	if ctx.Err() != nil {
+		return
+	}
+	ev := EventRecoveryFailed
+	if stored, err := e.storage.Get(ctx, exec.ID); err == nil && isTerminal(stored.Status) {
+		ev = EventRecovered
+	}
+	e.counts.Add(exec.DefinitionName, ev, 1)
 }
 
 // resume continues an execution from wherever it stopped. Both Recover and a

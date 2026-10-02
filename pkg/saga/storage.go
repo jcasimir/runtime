@@ -452,11 +452,25 @@ func incompleteSummary(ent *entity.Entity) (IncompleteSummary, summaryVerdict) {
 	}
 
 	return IncompleteSummary{
-		ID:          string(ent.Id()),
-		Status:      status,
-		ParentID:    string(s.ParentExecutionId),
-		LastChanged: changed,
+		ID:             string(ent.Id()),
+		DefinitionName: s.DefinitionName,
+		Status:         status,
+		CreatedAt:      createdAt(ent, &s),
+		LastChanged:    changed,
+		ParentID:       string(s.ParentExecutionId),
 	}, summaryOK
+}
+
+// createdAt resolves when an execution started, with the same fallback to the
+// entity store's system timestamp that lastChanged uses for records written
+// before the saga schema had one. Unlike lastChanged, a zero result is not a
+// reason to skip the execution: nothing acts on its age, so it only drops out
+// of the age gauges.
+func createdAt(ent *entity.Entity, s *saga_v1alpha.Saga) time.Time {
+	if !s.CreatedAt.IsZero() {
+		return s.CreatedAt
+	}
+	return ent.GetCreatedAt()
 }
 
 // isTerminal reports whether a status is one of the two finished states.

@@ -45,6 +45,8 @@ type EntityMaintenance struct {
 	indexGC       *indexgcctrl.GCController
 	sagaGC        *sagagcctrl.GCController
 	schemaReindex *schemareindexctrl.Controller
+
+	stopSagaMetrics context.CancelFunc
 }
 
 func (c *EntityMaintenance) Start(ctx context.Context) error {
@@ -108,11 +110,18 @@ func (c *EntityMaintenance) Start(ctx context.Context) error {
 			sagaConfig.StaleAfter = 0
 		}
 	}
+	sagaStorage := saga.NewEntityStorage(c.etcdStore, c.Log)
 	c.sagaGC = &sagagcctrl.GCController{
 		Log:     c.Log.With("module", "saga-gc"),
-		Storage: saga.NewEntityStorage(c.etcdStore, c.Log), Config: sagaConfig,
+		Storage: sagaStorage, Config: sagaConfig,
 	}
 	c.sagaGC.Start(ctx)
+	// Unlike the GC it sits beside, this is not paused by a zero retention
+	// period: it only reads, and an operator freezing the store to investigate
+	// is exactly who wants to see what is in flight.
+	sagaMetricsCtx, stopSagaMetrics := context.WithCancel(ctx)
+	c.stopSagaMetrics = stopSagaMetrics
+	go saga.NewInFlightMetrics(c.Log.With("module", "saga-metrics"), c.MetricsWriter, sagaStorage).Monitor(sagaMetricsCtx)
 	c.schemaReindex = &schemareindexctrl.Controller{
 		Log: c.Log.With("module", "schema-reindex"), Store: c.etcdStore,
 		CurrentHash: schema.IndexHash, Config: schemareindexctrl.DefaultConfig(),
@@ -122,6 +131,9 @@ func (c *EntityMaintenance) Start(ctx context.Context) error {
 }
 
 func (c *EntityMaintenance) Stop() {
+	if c.stopSagaMetrics != nil {
+		c.stopSagaMetrics()
+	}
 	if c.artifactGC != nil {
 		c.artifactGC.Stop()
 	}

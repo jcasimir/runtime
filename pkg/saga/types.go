@@ -165,18 +165,29 @@ type TerminalPage struct {
 }
 
 // IncompleteSummary summarizes an execution that is still in flight: which one,
-// what it is doing, when it last changed, and whose child it is.
+// what it is doing, how old it is, when it last changed, and whose child it is.
 //
-// Separate from Execution because the stalled sweep walks the whole in-flight
-// set to ask one question about each. Materializing every action-output blob in
+// Separate from Execution because the stalled sweep and the health gauges walk
+// the whole in-flight set to ask one or two questions about each. Materializing every action-output blob in
 // a six-figure backlog to read a timestamp is the unbounded read MIR-1785
 // removed, reintroduced for a worse reason.
 type IncompleteSummary struct {
 	// ID identifies the execution.
 	ID string
 
+	// DefinitionName is the registered definition this execution runs.
+	DefinitionName string
+
 	// Status is the decoded status, not the index the entry came from.
 	Status Status
+
+	// CreatedAt is when the execution started, resolved by createdAt. It can
+	// be zero for a record too old to carry any creation time.
+	//
+	// Age is measured from here rather than from LastChanged because an
+	// execution retrying a failing undo saves on every attempt, so its
+	// LastChanged stays fresh however long it has been stuck.
+	CreatedAt time.Time
 
 	// LastChanged is when the execution last changed state, resolved by
 	// lastChanged. The fallback matters more here than it does for retention:

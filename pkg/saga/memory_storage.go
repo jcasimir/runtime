@@ -135,10 +135,12 @@ func (m *MemoryStorage) ListIncompleteSummaryPage(ctx context.Context, q Incompl
 			continue
 		}
 		result = append(result, IncompleteSummary{
-			ID:          exec.ID,
-			Status:      exec.Status,
-			LastChanged: exec.UpdatedAt,
-			ParentID:    exec.ParentExecutionID,
+			ID:             exec.ID,
+			DefinitionName: exec.DefinitionName,
+			Status:         exec.Status,
+			CreatedAt:      exec.CreatedAt,
+			LastChanged:    exec.UpdatedAt,
+			ParentID:       exec.ParentExecutionID,
 		})
 	}
 

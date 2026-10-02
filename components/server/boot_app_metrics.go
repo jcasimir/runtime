@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"miren.dev/runtime/components/appmetrics"
 	"miren.dev/runtime/metrics"
@@ -161,6 +162,15 @@ func (b *appMetricsBoot) attachShipping(
 	b.operational.Attach(b.shipping)
 	if err := observability.processInfo.Emit(ctx); err != nil {
 		log.Warn("failed to ship control-process identity after attaching shipping sink", "error", err)
+	}
+	// Recovery at boot can count before this sink exists, and a counter whose
+	// first shipped sample is already nonzero gives increase() nothing to
+	// measure from.
+	if observability.sagaCounts != nil {
+		observability.sagaCounts.ResendBaselines()
+		if err := observability.sagaCounts.Emit(ctx, time.Now()); err != nil {
+			log.Warn("failed to ship saga count baselines after attaching shipping sink", "error", err)
+		}
 	}
 }
 
