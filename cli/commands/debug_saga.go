@@ -600,6 +600,12 @@ func sagaStatusIndex(s saga.Status) (entity.Attr, error) {
 // resolve too. The unqualified form is also what sagas minted before IDs grew
 // their namespace look like, so it stays a valid thing to type.
 func sagaIDCandidates(id string) []string {
+	// Convergent executions are named after their entity, as in
+	// create-sandbox-sandbox/web-abc, so they carry no saga/ namespace. Adding
+	// one is the natural mistake, and the error would claim the saga is gone.
+	if rest, ok := strings.CutPrefix(id, sagaIDNamespace); ok && strings.Contains(rest, "/") {
+		return []string{id, rest}
+	}
 	if strings.Contains(id, "/") {
 		return []string{id}
 	}

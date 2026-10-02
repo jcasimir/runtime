@@ -443,4 +443,11 @@ func TestSagaIDCandidates(t *testing.T) {
 	// Something addressing another kind is passed through, so the error names
 	// what the user actually asked for.
 	assert.Equal(t, []string{"app/checkout"}, sagaIDCandidates("app/checkout"))
+
+	// A convergent execution is named after its entity and has no saga/
+	// namespace, so one typed with it falls back to the name it really has.
+	assert.Equal(t,
+		[]string{"saga/create-sandbox-sandbox/web-Abc", "create-sandbox-sandbox/web-Abc"},
+		sagaIDCandidates("saga/create-sandbox-sandbox/web-Abc"))
+	assert.Equal(t, []string{"create-sandbox-sandbox/web-Abc"}, sagaIDCandidates("create-sandbox-sandbox/web-Abc"))
 }
