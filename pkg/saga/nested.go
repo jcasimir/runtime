@@ -209,7 +209,7 @@ func UndoNested(ctx context.Context, executionID string) error {
 	// for whoever started a saga but wrong for a parent asking whether its
 	// child was undone: it would read success as an undo error and never
 	// finish unwinding. Failed is only reached once every undo succeeded.
-	err = parent.runUndo(ctx, def, exec)
+	err = parent.runUndo(ctx, def, exec, nil)
 	if exec.Status == StatusFailed {
 		return nil
 	}
