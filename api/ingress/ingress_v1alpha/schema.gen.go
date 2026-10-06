@@ -116,6 +116,7 @@ func (o *HttpRoute) Encode() (attrs []entity.Attr) {
 		attrs = append(attrs, entity.Ref(HttpRouteWafProfileId, o.WafProfile))
 	}
 	attrs = append(attrs, entity.Ref(entity.EntityKind, KindHttpRoute))
+	attrs = append(attrs, entity.Bool(entity.Id("dev.miren.meta/cloud.export"), true))
 	return
 }
 
