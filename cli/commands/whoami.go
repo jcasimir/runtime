@@ -5,6 +5,7 @@ import (
 
 	"miren.dev/runtime/clientconfig"
 	"miren.dev/runtime/pkg/auth"
+	"miren.dev/runtime/pkg/userlabel"
 )
 
 // Whoami displays information about the current authenticated user
@@ -108,7 +109,7 @@ func Whoami(ctx *Context, opts struct {
 
 	if claims != nil {
 		ctx.Info("")
-		if user := describeUser(claims.Name, claims.Email); user != "" {
+		if user := userlabel.Label(claims.Name, claims.Email, ""); user != "" {
 			ctx.Info("User:          %s", user)
 		}
 		ctx.Info("User ID:       %s", claims.Subject)
@@ -124,17 +125,4 @@ func Whoami(ctx *Context, opts struct {
 	}
 
 	return nil
-}
-
-// describeUser renders a person as "Name <email>", or whichever half is known.
-// Tokens minted before cloud added these claims carry neither.
-func describeUser(name, email string) string {
-	switch {
-	case name != "" && email != "":
-		return fmt.Sprintf("%s <%s>", name, email)
-	case name != "":
-		return name
-	default:
-		return email
-	}
 }

@@ -71,10 +71,15 @@ func (s *Server) Get(_ context.Context, state *server_v1alpha.ServerLifecycleGet
 func (s *Server) Start(ctx context.Context, state *server_v1alpha.ServerLifecycleStart) error {
 	args := state.Args()
 	requestedBy := "rpc"
-	if identity := rpc.IdentityFromContext(ctx); identity != nil && identity.Subject != "" {
+	identity := rpc.IdentityFromContext(ctx)
+	if identity != nil && identity.Subject != "" {
 		requestedBy = identity.Subject
 	}
 	op := lifecycle.NewOperation(lifecycle.Action(args.Action()), requestedBy)
+	if identity != nil {
+		op.RequestedByName, _ = identity.Metadata["name"].(string)
+		op.RequestedByEmail, _ = identity.Metadata["email"].(string)
+	}
 	if args.Id() != "" {
 		op.ID = args.Id()
 	}

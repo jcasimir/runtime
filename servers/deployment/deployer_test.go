@@ -37,12 +37,12 @@ func TestDeployerReportedInHistoryAndLock(t *testing.T) {
 	assert.Equal(t, "Ada Lovelace", dep.DeployedByName())
 	assert.Equal(t, "usr-ada", dep.DeployedByUserId())
 	assert.Equal(t, "ada@example.com", dep.DeployedByUserEmail())
-	assert.Equal(t, "Ada Lovelace", dep.DeployedByUserName())
+	assert.Equal(t, "Ada Lovelace (ada@example.com)", dep.DeployedByUserName())
 
 	held, err := client.GetDeployLock(ctx, "web", "prod")
 	require.NoError(t, err)
 	require.True(t, held.HasLockInfo() && held.LockInfo() != nil)
-	assert.Equal(t, "Ada Lovelace", held.LockInfo().StartedBy())
+	assert.Equal(t, "Ada Lovelace (ada@example.com)", held.LockInfo().StartedBy())
 }
 
 // Without an identity there is nobody to name, and the lock holder says so

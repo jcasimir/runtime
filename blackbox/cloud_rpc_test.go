@@ -162,9 +162,10 @@ func TestDeployViaCloud(t *testing.T) {
 		if by.Subject != userXID || by.AuthMethod != "jwt" {
 			t.Fatalf("deployer is %s via %s, want %s via jwt", by.Subject, by.AuthMethod, userXID)
 		}
-		if by.Email != devUserEmail || by.Name != devUserName || by.Display != devUserName {
+		wantDisplay := devUserName + " (" + devUserEmail + ")"
+		if by.Email != devUserEmail || by.Name != devUserName || by.Display != wantDisplay {
 			t.Fatalf("deployer profile = email %q, name %q, display %q; want %q, %q, %q",
-				by.Email, by.Name, by.Display, devUserEmail, devUserName, devUserName)
+				by.Email, by.Name, by.Display, devUserEmail, devUserName, wantDisplay)
 		}
 
 		table := m.MustRun("app", "history", "-a", appName).Stdout
