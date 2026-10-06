@@ -182,9 +182,13 @@ uplink.
 
 **`access denied by RBAC policy`** — you reached the cluster and it refused the
 command. That is the cluster's own policy, not the relay. Check your current
-organization membership and permissions, and whether the cluster has a live
-cloud connection and has received its authorization snapshot. A newly granted
-permission becomes usable when the corresponding push arrives.
+organization membership and permissions. A newly granted permission becomes
+usable when the corresponding push arrives.
+
+**`cloud authorization is not synchronized`** — the cluster has no current
+authorization snapshot, either because its cloud connection is down or because
+it is waiting for a fresh snapshot. Check the [Connectivity](./connectivity.md)
+panel and that cloud was upgraded first; JWT access resumes after synchronization.
 
 **`the cluster's link to the cloud dropped`** — the cluster disconnected while
 your command was running. Retry it.
