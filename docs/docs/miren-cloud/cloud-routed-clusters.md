@@ -81,7 +81,7 @@ cloud.
 ## How cloud authorization stays current
 
 For cloud-authenticated callers, the runtime validates your JWT to establish
-your user ID and organization, then authorizes locally using the rules and group
+your identity, then authorizes locally using the rules and group
 memberships pushed over its cluster connection. Group claims in an older token
 do not grant access. Policy edits and membership changes are pushed without
 waiting for a polling interval or a new login.
@@ -112,15 +112,8 @@ callers on this runtime; update cloud before upgrading the runtime.
 
 :::
 
-The version 1 channel carries full `authorization.snapshot` messages scoped to
-the negotiated session and organization, with positive, increasing revisions
-within each connection. Reconnect starts a new revision sequence and sends the
-complete current state, including changes made while offline. Empty state uses
-`policy.rules: []` and `memberships: {}`. Mismatched or stale snapshots are
-rejected without changing the last valid state. Unreadable updates or newer
-in-scope snapshots with missing/null rules or memberships deny JWT authorization
-until a valid newer snapshot arrives; disconnected state is never used to grant
-access.
+After reconnecting, the cluster receives current permissions, including changes
+made while offline, before JWT access resumes.
 
 `miren debug rbac` and `miren debug rbac test` still perform an explicit, one-shot
 HTTP policy fetch for troubleshooting. They do not inspect the running cluster's

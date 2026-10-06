@@ -106,20 +106,24 @@ func (s *AuthorizationState) receiveSnapshot(ctx context.Context, data json.RawM
 	return nil
 }
 
-func (s *AuthorizationState) Evaluate(req *rbac.Request) rbac.Decision {
+func (s *AuthorizationState) Evaluate(req *rbac.Request) (rbac.Decision, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.loaded || s.sessionCtx.Err() != nil {
-		return rbac.DecisionDeny
+		return rbac.DecisionDeny, "not_synced"
 	}
 	// The authenticated session scopes this authoritative principal map. Token
 	// organization claims may be absent or numeric and are not organization XIDs.
 	groups, present := s.snapshot.Memberships[req.Subject]
 	if !present {
-		return rbac.DecisionDeny
+		return rbac.DecisionDeny, "unknown_principal"
 	}
 	// The evaluator sorts request groups for its cache key; never lend it the
 	// authoritative slice or the caller's token groups.
 	req.Groups = slices.Clone(groups)
-	return s.evaluator.Evaluate(req)
+	decision := s.evaluator.Evaluate(req)
+	if decision == rbac.DecisionDeny {
+		return decision, "no_matching_rule"
+	}
+	return decision, ""
 }

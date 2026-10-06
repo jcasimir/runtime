@@ -184,9 +184,10 @@ func (a *RPCAuthenticator) Authorize(ctx context.Context, identity *rpc.Identity
 		req.Context["organization_id"] = identity.Metadata["organization_id"]
 	}
 
-	decision := a.authorization.Evaluate(req)
+	decision, reason := a.authorization.Evaluate(req)
 	if decision == rbac.DecisionDeny {
 		a.logger.Warn("authorization denied",
+			"reason", reason,
 			"subject", identity.Subject,
 			"groups", req.Groups,
 			"resource", resource,
@@ -194,6 +195,9 @@ func (a *RPCAuthenticator) Authorize(ctx context.Context, identity *rpc.Identity
 			"tags", a.tags,
 		)
 
+		if reason == "not_synced" {
+			return fmt.Errorf("access denied: cloud authorization is not synchronized; check the cluster's cloud connection and initial snapshot")
+		}
 		return fmt.Errorf("access denied by RBAC policy")
 	}
 

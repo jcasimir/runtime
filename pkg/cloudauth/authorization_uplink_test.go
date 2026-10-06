@@ -97,7 +97,8 @@ func TestAuthorizationOverUplink(t *testing.T) {
 		require.NoError(t, wsjson.Write(ctx, conn.ws, uplink.Envelope{Type: TypeAuthorizationSnapshot, Data: raw}))
 	}
 	decision := func(subject string) rbac.Decision {
-		return s.Evaluate(&rbac.Request{Subject: subject, Resource: "apps/demo", Action: "read"})
+		decision, _ := s.Evaluate(&rbac.Request{Subject: subject, Resource: "apps/demo", Action: "read"})
+		return decision
 	}
 	waitDecision := func(subject string, want rbac.Decision) {
 		require.Eventually(t, func() bool { return decision(subject) == want }, 3*time.Second, time.Millisecond)

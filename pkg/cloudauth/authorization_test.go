@@ -1,6 +1,7 @@
 package cloudauth
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -41,10 +42,81 @@ func deliverSnapshot(t *testing.T, state *AuthorizationState, snapshot Authoriza
 	require.NoError(t, state.receiveSnapshot(t.Context(), raw))
 }
 
+func TestAuthorizationDenialDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+	}{
+		{"startup", "not_synced"},
+		{"awaiting snapshot", "not_synced"},
+		{"disconnected", "not_synced"},
+		{"reconnected", "not_synced"},
+		{"malformed snapshot", "not_synced"},
+		{"unknown principal", "unknown_principal"},
+		{"empty groups", "no_matching_rule"},
+		{"unmatched action", "no_matching_rule"},
+		{"allowed", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			a, err := NewRPCAuthenticator(t.Context(), Config{Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.name != "startup" {
+				a.authorization.beginSession(ctx, authorizationSession("session"))
+				if tc.name != "awaiting snapshot" {
+					deliverSnapshot(t, a.authorization, authorizationSnapshot("session", 1))
+				}
+			}
+			subject, action := "alice", "read"
+			switch tc.name {
+			case "disconnected":
+				cancel()
+			case "reconnected":
+				a.authorization.beginSession(ctx, authorizationSession("second"))
+			case "malformed snapshot":
+				require.Error(t, a.authorization.receiveSnapshot(ctx, json.RawMessage(`{`)))
+			case "unknown principal":
+				subject = "missing"
+			case "empty groups":
+				subject = "bob"
+			case "unmatched action":
+				action = "write"
+			}
+			decision, reason := a.authorization.Evaluate(&rbac.Request{Subject: subject, Resource: "apps/demo", Action: action})
+			require.Equal(t, tc.reason, reason)
+			logs.Reset()
+			err = a.Authorize(t.Context(), &rpc.Identity{Subject: subject, Method: rpc.AuthMethodJWT, Groups: []string{"readers"}}, "apps/demo", action)
+			if tc.reason == "" {
+				require.Equal(t, rbac.DecisionAllow, decision)
+				require.NoError(t, err)
+				require.NotContains(t, logs.String(), "authorization denied")
+				return
+			}
+			require.Equal(t, rbac.DecisionDeny, decision)
+			require.Error(t, err)
+			if tc.reason == "not_synced" {
+				require.Contains(t, err.Error(), "cloud authorization is not synchronized")
+				require.Contains(t, err.Error(), "snapshot")
+			} else {
+				require.EqualError(t, err, "access denied by RBAC policy")
+			}
+			lines := bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte("\n"))
+			var record map[string]any
+			require.NoError(t, json.Unmarshal(lines[len(lines)-1], &record))
+			require.Equal(t, "authorization denied", record["msg"])
+			require.Equal(t, "WARN", record["level"])
+			require.Equal(t, tc.reason, record["reason"])
+		})
+	}
+}
+
 func TestAuthorizationSnapshots(t *testing.T) {
 	s := NewAuthorizationState(t.Context(), slog.Default())
 	evaluate := func(subject, org string) rbac.Decision {
-		return s.Evaluate(&rbac.Request{Subject: subject, Groups: []string{"readers"}, Resource: "apps/demo", Action: "read", Context: map[string]any{"organization_id": org}})
+		decision, _ := s.Evaluate(&rbac.Request{Subject: subject, Groups: []string{"readers"}, Resource: "apps/demo", Action: "read", Context: map[string]any{"organization_id": org}})
+		return decision
 	}
 	require.Equal(t, rbac.DecisionDeny, evaluate("alice", "org-1"))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -106,13 +178,15 @@ func TestAuthorizationLocalTagSelectorsAndEmptyState(t *testing.T) {
 		{"production", rbac.DecisionAllow},
 		{"development", rbac.DecisionDeny},
 	} {
-		require.Equal(t, tc.want, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": tc.environment}}))
+		decision, _ := s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": tc.environment}})
+		require.Equal(t, tc.want, decision)
 	}
 	snapshot.Revision++
 	snapshot.Policy.Rules = []rbac.Rule{}
 	snapshot.Memberships = map[string][]string{}
 	deliverSnapshot(t, s, snapshot)
-	require.Equal(t, rbac.DecisionDeny, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": "production"}}))
+	decision, _ := s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read", Tags: map[string]any{"environment": "production"}})
+	require.Equal(t, rbac.DecisionDeny, decision)
 }
 
 func TestAuthorizationRejectsInvalidSnapshots(t *testing.T) {
@@ -136,7 +210,8 @@ func TestAuthorizationRejectsInvalidSnapshots(t *testing.T) {
 			require.NoError(t, err)
 			require.Error(t, s.receiveSnapshot(t.Context(), raw))
 			require.Equal(t, uint64(2), s.snapshot.Revision)
-			require.Equal(t, rbac.DecisionAllow, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"}))
+			decision, _ := s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"})
+			require.Equal(t, rbac.DecisionAllow, decision)
 		})
 	}
 	require.Error(t, s.receiveSnapshot(t.Context(), json.RawMessage(`{`)))
@@ -159,7 +234,8 @@ func TestMalformedAuthorizationSnapshotRevokesCachedGrants(t *testing.T) {
 			s.beginSession(t.Context(), authorizationSession("session"))
 			deliverSnapshot(t, s, authorizationSnapshot("session", 2))
 			evaluate := func() rbac.Decision {
-				return s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"})
+				decision, _ := s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"})
+				return decision
 			}
 			require.Equal(t, rbac.DecisionAllow, evaluate())
 			require.Error(t, s.receiveSnapshot(t.Context(), json.RawMessage(body)))
@@ -191,7 +267,8 @@ func TestAuthorizationConcurrentRevocation(t *testing.T) {
 	deliverSnapshot(t, s, snapshot)
 	wg.Wait()
 	for range 100 {
-		require.Equal(t, rbac.DecisionDeny, s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"}))
+		decision, _ := s.Evaluate(&rbac.Request{Subject: "alice", Resource: "apps/demo", Action: "read"})
+		require.Equal(t, rbac.DecisionDeny, decision)
 	}
 }
 
