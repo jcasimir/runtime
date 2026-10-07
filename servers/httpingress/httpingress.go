@@ -1080,7 +1080,9 @@ func (h *Server) serveAuthenticatedRequest(w http.ResponseWriter, req *http.Requ
 
 		actLease, err := h.aa.AcquireLease(actContext, &av, service)
 		if err != nil {
-			if errors.Is(err, ephemeralx.ErrDisksUnsupported) {
+			if errors.Is(err, activator.ErrAppDisabled) {
+				h.serveIngressError(w, req, fmt.Sprintf("The application %s is disabled.\n", targetAppId), http.StatusServiceUnavailable)
+			} else if errors.Is(err, ephemeralx.ErrDisksUnsupported) {
 				h.Log.Warn("disk-backed preview denied", "error", err, "app", targetAppId)
 				h.serveIngressError(w, req, "This preview uses unsupported storage. Remove disk attachments and redeploy the preview.", http.StatusLocked)
 			} else if errors.Is(err, activator.ErrSandboxDiedEarly) {
@@ -1479,7 +1481,9 @@ func (h *Server) DoRequest(ctx context.Context, req *httpingress_v1alpha.Interna
 
 	actLease, err := h.aa.AcquireLease(actContext, &av, service)
 	if err != nil {
-		if errors.Is(err, ephemeralx.ErrDisksUnsupported) {
+		if errors.Is(err, activator.ErrAppDisabled) {
+			resp.SetError("app is disabled")
+		} else if errors.Is(err, ephemeralx.ErrDisksUnsupported) {
 			resp.SetError("This preview uses unsupported storage. Remove disk attachments and redeploy the preview.")
 		} else if errors.Is(err, activator.ErrSandboxDiedEarly) {
 			resp.SetError("sandbox died early while acquiring lease")
