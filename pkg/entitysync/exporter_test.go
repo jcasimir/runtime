@@ -19,6 +19,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"miren.dev/runtime/api/compute/compute_v1alpha"
 	"miren.dev/runtime/api/core/core_v1alpha"
+	"miren.dev/runtime/api/ingress/ingress_v1alpha"
 	"miren.dev/runtime/pkg/cond"
 	"miren.dev/runtime/pkg/entity"
 	"miren.dev/runtime/pkg/uplink"
@@ -482,6 +483,67 @@ func TestSnapshotFiltersEntities(t *testing.T) {
 	require.NotContains(t, string(raw), "project/secret")
 	require.NotContains(t, string(raw), "super-secret")
 	require.NotContains(t, string(raw), string(marker))
+}
+
+// No explicit marker on the route: Encode stamps it, which is how every
+// ingress write path ends up in the export.
+func TestSnapshotExportsOnlyRoutingFactsOfARoute(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	store := entity.NewMockStore()
+
+	route := entity.New(
+		entity.Ref(entity.DBId, "www.example.com"),
+		(&ingress_v1alpha.HttpRoute{
+			ID:             "www.example.com",
+			Host:           "www.example.com",
+			App:            "app/blog",
+			Service:        "web",
+			RequestTimeout: "90s",
+			TlsCheck:       "/tls-check",
+			WafProfile:     "waf/strict",
+			AuthProvider:   "oidc/staff",
+			ClaimMappings:  []ingress_v1alpha.ClaimMappings{{Claim: "email", Header: "X-User-Email"}},
+			Maintenance:    ingress_v1alpha.Maintenance{Reason: "migrating", StartedBy: "operator@example.com"},
+		}).Encode(),
+	)
+	stampExportMetadata(route, 3)
+	store.AddEntity(route.Id(), route)
+
+	tenant := testExporter(store)
+	s := &stream{exporter: tenant, ctx: ctx, sourceEpoch: "mock-source-epoch", waiters: make(map[string]chan Ack)}
+	tenant.active = s
+	link := newFakeLink()
+	link.onSend = func(typ string, payload any) {
+		if typ != TypeSnapshotComplete {
+			return
+		}
+		complete := payload.(SnapshotComplete)
+		s.deliver(Ack{MessageID: complete.MessageID, Cursor: complete.SourceHead})
+	}
+
+	_, _, err := s.snapshot(ctx, link)
+	require.NoError(t, err)
+
+	messages := link.sent()
+	require.Equal(t, TypeSnapshotBatch, messages[1].typ)
+	batch := messages[1].payload.(SnapshotBatch)
+	require.Len(t, batch.Entities, 1)
+	sent := batch.Entities[0]
+
+	var got ingress_v1alpha.HttpRoute
+	got.Decode(sent)
+	require.Equal(t, ingress_v1alpha.HttpRoute{ID: "www.example.com", Host: "www.example.com", App: "app/blog"}, got)
+	defaultAttr, ok := sent.Get(ingress_v1alpha.HttpRouteDefaultId)
+	require.True(t, ok, "default is always encoded, so cloud can tell a host route from the catch-all")
+	require.False(t, defaultAttr.Value.Bool())
+
+	raw, err := json.Marshal(batch.Entities)
+	require.NoError(t, err)
+	for _, secret := range []string{"oidc/staff", "waf/strict", "X-User-Email", "operator@example.com", "migrating", "/tls-check", "90s"} {
+		require.NotContains(t, string(raw), secret)
+	}
+	require.NotContains(t, string(raw), string(core_v1alpha.CloudExportContract.MarkerID()))
 }
 
 func TestSnapshotReadsAndSendsOnePinnedPageAtATime(t *testing.T) {

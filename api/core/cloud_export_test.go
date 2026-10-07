@@ -48,5 +48,5 @@ func TestCloudExportContractMergesEveryContributor(t *testing.T) {
 			require.True(t, exported, "%s declares %s for the cloud export but core.go does not -export-merge it", path, id)
 		}
 	}
-	require.Positive(t, contributors, "the compute schema contributes the node kind")
+	require.GreaterOrEqual(t, contributors, 2, "compute contributes node and ingress contributes http_route")
 }
