@@ -13,20 +13,10 @@ import (
 	"miren.dev/runtime/pkg/rpc/standard"
 )
 
-// specAllowsScaleToZero reports whether an app's resolved config lets it sit at
-// zero instances on purpose. It can't if any service is pinned to a fixed
-// instance count. A nil spec defaults to true (autoscale), matching the List
-// path's default-autoscale assumption.
-func specAllowsScaleToZero(spec *core_v1alpha.ConfigSpec) bool {
-	if spec == nil {
-		return true
-	}
-	for _, svc := range spec.Services {
-		if svc.Concurrency.Mode == "fixed" {
-			return false
-		}
-	}
-	return true
+// serviceIsStopped reports whether a service is fixed at zero instances:
+// deployed, but deliberately not running.
+func serviceIsStopped(c core_v1alpha.ConfigSpecServicesConcurrency) bool {
+	return c.Mode == "fixed" && c.NumInstances == 0
 }
 
 // specNeedsNoService reports whether an app declares work or static content but
@@ -53,11 +43,46 @@ type poolHealth struct {
 	crashCount   int64
 	cooldownLeft time.Duration
 	// isAutoscale defaults to true and is cleared when any contributing pool is
-	// configured with fixed concurrency.
+	// configured with a fixed, nonzero instance count. A service fixed at zero
+	// sits at zero on purpose, so it doesn't clear it.
 	isAutoscale bool
+	// hasStopped and hasRunnable record whether any contributing service is
+	// fixed at zero instances, and whether any is not. All stopped and none
+	// runnable reads as stopped rather than idle or starting.
+	hasStopped  bool
+	hasRunnable bool
 	// needsNoService marks an app that has no pools by design, so it must not
 	// be read as one that scaled away.
 	needsNoService bool
+}
+
+// noteService folds one service's concurrency config into the aggregate.
+func (h *poolHealth) noteService(c core_v1alpha.ConfigSpecServicesConcurrency) {
+	switch {
+	case serviceIsStopped(c):
+		h.hasStopped = true
+	case c.Mode == "fixed":
+		h.isAutoscale = false
+		h.hasRunnable = true
+	default:
+		h.hasRunnable = true
+	}
+}
+
+// noteSpec folds every service in a resolved config into the aggregate. A nil
+// spec leaves the defaults, which read as autoscale.
+func (h *poolHealth) noteSpec(spec *core_v1alpha.ConfigSpec) {
+	if spec == nil {
+		return
+	}
+	for _, svc := range spec.Services {
+		h.noteService(svc.Concurrency)
+	}
+}
+
+// stopped reports whether every known service is fixed at zero instances.
+func (h poolHealth) stopped() bool {
+	return h.hasStopped && !h.hasRunnable
 }
 
 // accumulate folds one pool's state into the aggregate.
@@ -98,8 +123,8 @@ func (r *AppInfo) collectServiceHealth(ctx context.Context, pools []compute_v1al
 			h = &serviceSandboxHealth{pool: poolHealth{isAutoscale: true}}
 			if spec != nil {
 				for _, svc := range spec.Services {
-					if svc.Name == pool.Service && svc.Concurrency.Mode == "fixed" {
-						h.pool.isAutoscale = false
+					if svc.Name == pool.Service {
+						h.pool.noteService(svc.Concurrency)
 					}
 				}
 			}
@@ -209,6 +234,11 @@ func (h poolHealth) classify() string {
 		// otherwise read it as deliberately scaled away.
 		if h.needsNoService {
 			return apphealth.Ready
+		}
+		// Every service is fixed at zero: stopped by config, which is as
+		// settled as it gets. Deploy should stop waiting.
+		if h.stopped() {
+			return apphealth.Stopped
 		}
 		// Deliberately scaled to zero only applies to apps that can autoscale
 		// down. A fixed service sitting at zero isn't idle, it just isn't up

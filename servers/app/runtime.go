@@ -196,9 +196,10 @@ func (a *AppInfo) AppInfo(ctx context.Context, state *app_v1alpha.AppStatusAppIn
 				spec = resolved
 			}
 			health := poolHealth{
-				isAutoscale:    specAllowsScaleToZero(spec),
+				isAutoscale:    true,
 				needsNoService: specNeedsNoService(spec),
 			}
+			health.noteSpec(spec)
 
 			for poolsResp.Next() {
 				var pool compute_v1alpha.SandboxPool

@@ -96,6 +96,9 @@ const (
 	// decisionNoService: the app has no long-running process by design. Its
 	// tasks or static content are available, which is as "up" as it gets.
 	decisionNoService
+	// decisionStopped: every service is configured with num_instances = 0, so
+	// the version is deployed with nothing to boot.
+	decisionStopped
 )
 
 // decideActivation maps a snapshot to a terminal decision (or "keep waiting").
@@ -125,6 +128,8 @@ func decideActivation(snap healthSnapshot) activationDecision {
 		return decisionNoService
 	case snap.health == apphealth.Idle:
 		return decisionScaledToZero
+	case snap.health == apphealth.Stopped:
+		return decisionStopped
 	case snap.ready > 0:
 		return decisionHealthy
 	default:
@@ -189,6 +194,7 @@ const (
 	outcomeHealthy terminalOutcome = iota
 	outcomeScaledToZero
 	outcomeNoService
+	outcomeStopped
 	outcomeCrashed
 	outcomeTimeout
 	outcomeCanceled
@@ -210,6 +216,8 @@ func pollOutcome(ctx context.Context, getter appInfoGetter, appName, versionID s
 		return outcomeScaledToZero, snap, true
 	case decisionNoService:
 		return outcomeNoService, snap, true
+	case decisionStopped:
+		return outcomeStopped, snap, true
 	case decisionCrashed:
 		return outcomeCrashed, snap, true
 	default:
@@ -240,6 +248,8 @@ func healthOutcomeText(versionDisplay string, outcome terminalOutcome, snap heal
 		// Deliberately not the scaled-to-zero wording: nothing went to sleep,
 		// this app never had a long-running process to begin with.
 		return fmt.Sprintf("Version %s deployed — no long-running service required", versionDisplay), true
+	case outcomeStopped:
+		return fmt.Sprintf("Version %s deployed — stopped, every service has num_instances = 0", versionDisplay), true
 	case outcomeCrashed:
 		detail := ""
 		if snap.crashCount > 0 {

@@ -15,6 +15,7 @@ type serviceHealth struct {
 	Dead            int    `json:"dead"`
 	CrashStreak     int    `json:"crash_streak"`
 	CrashLooping    bool   `json:"crash_looping"`
+	Stopped         bool   `json:"stopped,omitempty"`
 	CooldownSeconds int32  `json:"cooldown_seconds,omitempty"`
 	LastExitCode    *int64 `json:"last_exit_code,omitempty"`
 	LastFailureLog  string `json:"last_failure_log,omitempty"`
@@ -24,6 +25,9 @@ func renderServiceHealth(health []serviceHealth) string {
 	var b strings.Builder
 	for _, svc := range health {
 		state := fmt.Sprintf("%d running, %d dead", svc.Running, svc.Dead)
+		if svc.Stopped {
+			state = infoGray.Render("stopped (num_instances = 0)") + ", " + state
+		}
 		if svc.CrashLooping {
 			state += fmt.Sprintf("; %d crashes in current streak, retry in %s", svc.CrashStreak, formatDuration(time.Duration(svc.CooldownSeconds)*time.Second))
 			state = infoRed.Render("crash-looping") + ", " + state
@@ -57,7 +61,7 @@ func fetchServiceHealth(ctx *Context, app string) ([]serviceHealth, error) {
 	}
 	var health []serviceHealth
 	for _, svc := range res.Status().Services() {
-		h := serviceHealth{Service: svc.Service(), Running: int(svc.Running()), Dead: int(svc.Dead()), CrashStreak: int(svc.CrashCount()), CrashLooping: svc.Health() == "crashed", CooldownSeconds: svc.CooldownSeconds()}
+		h := serviceHealth{Service: svc.Service(), Running: int(svc.Running()), Dead: int(svc.Dead()), CrashStreak: int(svc.CrashCount()), CrashLooping: svc.Health() == "crashed", Stopped: svc.Health() == "stopped", CooldownSeconds: svc.CooldownSeconds()}
 		if svc.HasLastExitCode() {
 			code := svc.LastExitCode()
 			h.LastExitCode = &code

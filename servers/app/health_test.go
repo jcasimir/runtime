@@ -34,6 +34,12 @@ func TestPoolHealthClassify(t *testing.T) {
 		// idle would say it went to sleep rather than that it is ready.
 		{"service-free app at zero is ready, not idle", poolHealth{ready: 0, desired: 0, isAutoscale: true, needsNoService: true}, apphealth.Ready},
 		{"service-free app wins over the autoscale reading", poolHealth{ready: 0, desired: 0, isAutoscale: false, needsNoService: true}, apphealth.Ready},
+		// num_instances = 0 stops a fixed service by config. Alone it reads as
+		// stopped; beside a runnable service the app is judged on that one.
+		{"every service fixed at zero is stopped", poolHealth{desired: 0, isAutoscale: true, hasStopped: true}, apphealth.Stopped},
+		{"stopped beside an idle autoscale service is idle", poolHealth{desired: 0, isAutoscale: true, hasStopped: true, hasRunnable: true}, apphealth.Idle},
+		{"stopped beside a fixed service at zero is starting", poolHealth{desired: 0, isAutoscale: false, hasStopped: true, hasRunnable: true}, apphealth.Starting},
+		{"stopped beside a running service is healthy", poolHealth{ready: 1, desired: 1, isAutoscale: false, hasStopped: true, hasRunnable: true}, apphealth.Healthy},
 		{"all ready is healthy", poolHealth{ready: 3, desired: 3}, apphealth.Healthy},
 		{"some ready is degraded", poolHealth{ready: 1, desired: 3}, apphealth.Degraded},
 		{"none ready is starting", poolHealth{ready: 0, desired: 2}, apphealth.Starting},
@@ -125,11 +131,18 @@ func TestCollectServiceHealthUsesSharedCooldownAndLatestExit(t *testing.T) {
 	assert.EqualValues(t, 1, got[1].Running())
 	fixed, ports, err := r.collectServiceHealth(ctx,
 		[]compute_v1alpha.SandboxPool{{ID: "pool-fixed", Service: "fixed"}},
-		&core_v1alpha.ConfigSpec{Services: []core_v1alpha.ConfigSpecServices{{Name: "fixed", Concurrency: core_v1alpha.ConfigSpecServicesConcurrency{Mode: "fixed"}}}}, now, false)
+		&core_v1alpha.ConfigSpec{Services: []core_v1alpha.ConfigSpecServices{{Name: "fixed", Concurrency: core_v1alpha.ConfigSpecServicesConcurrency{Mode: "fixed", NumInstances: 1}}}}, now, false)
 	require.NoError(t, err)
 	assert.Empty(t, ports)
 	require.Len(t, fixed, 1)
 	assert.Equal(t, apphealth.Starting, fixed[0].Health(), "fixed service at zero must not be classified as idle")
+
+	stopped, _, err := r.collectServiceHealth(ctx,
+		[]compute_v1alpha.SandboxPool{{ID: "pool-stopped", Service: "worker"}},
+		&core_v1alpha.ConfigSpec{Services: []core_v1alpha.ConfigSpecServices{{Name: "worker", Concurrency: core_v1alpha.ConfigSpecServicesConcurrency{Mode: "fixed", NumInstances: 0}}}}, now, false)
+	require.NoError(t, err)
+	require.Len(t, stopped, 1)
+	assert.Equal(t, apphealth.Stopped, stopped[0].Health(), "a service configured with num_instances = 0 is stopped, not starting")
 }
 
 func TestCollectServiceHealthListFailure(t *testing.T) {
@@ -174,4 +187,35 @@ func TestSpecNeedsNoService(t *testing.T) {
 		Tasks: []core_v1alpha.ConfigSpecTasks{{Name: "session"}},
 	}))
 	assert.True(t, specNeedsNoService(&core_v1alpha.ConfigSpec{StaticDir: "/site"}))
+}
+
+func TestPoolHealthNoteSpec(t *testing.T) {
+	svc := func(name, mode string, n int64) core_v1alpha.ConfigSpecServices {
+		return core_v1alpha.ConfigSpecServices{
+			Name:        name,
+			Concurrency: core_v1alpha.ConfigSpecServicesConcurrency{Mode: mode, NumInstances: n},
+		}
+	}
+	note := func(services ...core_v1alpha.ConfigSpecServices) poolHealth {
+		h := poolHealth{isAutoscale: true}
+		h.noteSpec(&core_v1alpha.ConfigSpec{Services: services})
+		return h
+	}
+
+	h := note(svc("worker", "fixed", 0))
+	assert.True(t, h.stopped())
+	assert.True(t, h.isAutoscale, "a service fixed at zero sits at zero on purpose")
+
+	h = note(svc("web", "auto", 0), svc("worker", "fixed", 0))
+	assert.False(t, h.stopped(), "web can still wake on a request")
+	assert.True(t, h.isAutoscale)
+
+	h = note(svc("db", "fixed", 1), svc("worker", "fixed", 0))
+	assert.False(t, h.stopped())
+	assert.False(t, h.isAutoscale, "db is pinned to a nonzero count")
+
+	h = poolHealth{isAutoscale: true}
+	h.noteSpec(nil)
+	assert.False(t, h.stopped())
+	assert.True(t, h.isAutoscale, "a nil spec keeps the autoscale default")
 }

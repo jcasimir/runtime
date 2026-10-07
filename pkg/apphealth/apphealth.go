@@ -15,6 +15,10 @@ const (
 	Crashed = "crashed"
 	// Idle means the app is deliberately scaled to zero (no desired instances).
 	Idle = "idle"
+	// Stopped means every service is configured as fixed with zero instances:
+	// deployed, but not running until num_instances is raised. Unlike idle, a
+	// request does not wake it.
+	Stopped = "stopped"
 	// Ready means the app is deployed and available to invoke, but has no
 	// long-running process to be healthy or idle. A task-only app is doing
 	// exactly what it was configured to do; reporting it as idle would say it

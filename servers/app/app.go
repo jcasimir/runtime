@@ -223,8 +223,8 @@ func (r *AppInfo) collectAppHealth(ctx context.Context) (*appHealthSource, error
 
 		if spec, ok := src.specs[pool.SandboxSpec.Version.String()]; ok {
 			for _, svc := range spec.Services {
-				if svc.Name == pool.Service && svc.Concurrency.Mode == "fixed" {
-					ps.isAutoscale = false
+				if svc.Name == pool.Service {
+					ps.noteService(svc.Concurrency)
 				}
 			}
 		}
@@ -245,7 +245,7 @@ func (s *appHealthSource) healthOf(entry appEntry) apphealth.State {
 		out.Pooled = true
 		out.ReadyInstances = int32(ps.ready)
 		out.DesiredInstances = int32(ps.desired)
-		if ps.isAutoscale {
+		if ps.isAutoscale && !ps.stopped() {
 			out.ScalingMode = "auto"
 		} else {
 			out.ScalingMode = "fixed"
@@ -265,10 +265,12 @@ func (s *appHealthSource) healthOf(entry appEntry) apphealth.State {
 		// at zero), while a fixed service reads as starting (not up yet) rather
 		// than a misleading idle. Both classifiers have to agree, or `m app
 		// list` and the deploy poller disagree about the same app.
+		spec := s.specs[entry.activeVersion.ID.String()]
 		ps := poolHealth{
-			isAutoscale:    specAllowsScaleToZero(s.specs[entry.activeVersion.ID.String()]),
-			needsNoService: specNeedsNoService(s.specs[entry.activeVersion.ID.String()]),
+			isAutoscale:    true,
+			needsNoService: specNeedsNoService(spec),
 		}
+		ps.noteSpec(spec)
 		out.Health = ps.classify()
 		return out
 	}
