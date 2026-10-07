@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"testing"
 	"time"
 
@@ -162,6 +163,11 @@ func TestRotationRecoversWhenRecordCommitsButResponseIsLost(t *testing.T) {
 	persisted, err := keyring.Ensure(c.Log, dataPath)
 	require.NoError(t, err)
 	require.Equal(t, active.ToKey, persisted.CurrentID())
+
+	require.NoError(t, os.Remove(keyring.Path(dataPath)))
+	require.ErrorIs(t, c.advance(ctx, active), os.ErrNotExist)
+	assert.NoFileExists(t, keyring.Path(dataPath), "reconciliation must not generate replacement keys")
+	require.Equal(t, oldKey, backend.Keyring().CurrentID())
 
 	// A different persisted current key must not be adopted for this record.
 	require.NoError(t, keyring.Save(keyring.Path(dataPath), oldRing))

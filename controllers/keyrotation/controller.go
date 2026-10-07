@@ -243,7 +243,7 @@ func (c *Controller) rewrap(ctx context.Context, rec *core_v1alpha.KeyRotation) 
 	// The record may have committed even though Begin received an error and
 	// never switched the live ring. Resume from the ring saved before the write.
 	if c.Backend.Keyring().CurrentID() == rec.FromKey {
-		ring, err := keyring.Ensure(c.Log, c.DataPath)
+		ring, err := keyring.Load(c.DataPath)
 		if err != nil {
 			return fmt.Errorf("loading the rotated keyring: %w", err)
 		}
