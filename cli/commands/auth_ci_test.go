@@ -46,7 +46,7 @@ func TestGitHubClaimConditions(t *testing.T) {
 	want := map[string]string{
 		"repository":       "acme/web-app",
 		"repository_owner": "acme",
-		"event_name":       "push,workflow_dispatch",
+		"event_name":       "push,workflow_dispatch,pull_request",
 	}
 	for key, pattern := range want {
 		if got[key] != pattern {

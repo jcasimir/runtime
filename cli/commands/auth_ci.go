@@ -27,7 +27,7 @@ func AuthCIAdd(ctx *Context, opts struct {
 	GitHub        string `long:"github" description:"GitHub owner/repo shorthand (sets issuer, provider, and repository claim conditions)"`
 	Issuer        string `long:"issuer" description:"OIDC issuer URL"`
 	Subject       string `long:"subject" description:"Glob pattern for the token subject"`
-	AllowedEvents string `long:"allowed-events" description:"Comma-separated event names to allow (default: push,workflow_dispatch)"`
+	AllowedEvents string `long:"allowed-events" description:"Comma-separated event names to allow (default: push,workflow_dispatch,pull_request)"`
 	AllowedRefs   string `long:"allowed-refs" description:"Glob pattern for allowed git refs"`
 	Description   string `long:"description" description:"Human-readable description of this binding"`
 	AppCentric
@@ -213,7 +213,7 @@ func gitHubClaimConditions(githubRepo, allowedEvents, allowedRefs string) ([]*oi
 		return nil, fmt.Errorf("--github must be in owner/repo format (e.g. acme/web-app)")
 	}
 
-	events := "push,workflow_dispatch"
+	events := "push,workflow_dispatch,pull_request"
 	if allowedEvents != "" {
 		events = allowedEvents
 	}
