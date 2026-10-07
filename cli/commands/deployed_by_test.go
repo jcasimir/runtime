@@ -24,8 +24,8 @@ func TestDeployedByJSON(t *testing.T) {
 
 		out, err := json.Marshal(deployedByOf(dep))
 		require.NoError(t, err)
-		assert.JSONEq(t, `{"subject":"usr-ada","auth_method":"jwt","email":"ada@example.com","name":"Ada Lovelace","display":"Ada Lovelace"}`, string(out))
-		assert.Equal(t, "Ada Lovelace", formatUser(dep))
+		assert.JSONEq(t, `{"subject":"usr-ada","auth_method":"jwt","email":"ada@example.com","name":"Ada Lovelace","display":"Ada Lovelace (ada@example.com)"}`, string(out))
+		assert.Equal(t, "Ada Lovelace (ada@example.com)", formatUser(dep))
 	})
 
 	t.Run("ci deploy", func(t *testing.T) {

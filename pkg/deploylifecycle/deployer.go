@@ -1,27 +1,29 @@
 package deploylifecycle
 
-import "strings"
+import (
+	"strings"
 
-// DescribeDeployer renders who started a deployment for people to read,
-// preferring a display name, then an email, then the authenticated subject.
-// It returns "" when nothing identifies the deployer, leaving the caller to
-// pick its own placeholder.
+	"miren.dev/runtime/pkg/userlabel"
+)
+
+// DescribeDeployer renders who started a deployment for people to read: the
+// person by userlabel's cascade ("Name (email)", then either alone) when the
+// token named them, otherwise the authenticated subject. It returns "" when
+// nothing identifies the deployer, leaving the caller to pick its own
+// placeholder.
 //
 // Name and email come from the cloud token of whoever deployed, so they are
 // absent for deploys made before cloud stamped them, and for identities with
 // no cloud user behind them (cert auth, CI). Those fall through to the
 // subject.
 func DescribeDeployer(name, email, subject, authMethod string) string {
-	switch {
-	case name != "":
-		return name
-	case email != "":
-		return email
-	case authMethod == "oidc":
-		return describeOIDCSubject(subject)
-	default:
-		return subject
+	if who := userlabel.Label(name, email, ""); who != "" {
+		return who
 	}
+	if authMethod == "oidc" {
+		return describeOIDCSubject(subject)
+	}
+	return subject
 }
 
 // describeOIDCSubject shortens a GitHub Actions subject such as

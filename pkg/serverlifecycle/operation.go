@@ -96,6 +96,12 @@ type Operation struct {
 	ID          string `json:"id"`
 	Action      Action `json:"action"`
 	RequestedBy string `json:"requested_by,omitempty"`
+	// RequestedByName and RequestedByEmail are the person behind RequestedBy,
+	// when the caller's credentials said (a cloud login does). RequestedBy
+	// stays the subject: cloud resolves a user xid there to name the
+	// requester in its own notifications.
+	RequestedByName  string `json:"requested_by_name,omitempty"`
+	RequestedByEmail string `json:"requested_by_email,omitempty"`
 
 	// TargetVersion is as requested ("latest", "main", a tag); ResolvedVersion
 	// and ResolvedCommit are what it became.

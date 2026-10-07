@@ -19,6 +19,7 @@ import (
 	"miren.dev/runtime/pkg/serverconfig"
 	"miren.dev/runtime/pkg/serverlifecycle"
 	"miren.dev/runtime/pkg/ui"
+	"miren.dev/runtime/pkg/userlabel"
 )
 
 // lifecycleDaemon is what the operations and upgrade commands need to know
@@ -124,23 +125,25 @@ type unavailableBackup struct{ err error }
 func (u unavailableBackup) Backup(context.Context, string) (string, error) { return "", u.err }
 
 type operationJSON struct {
-	ID              string            `json:"id"`
-	Action          string            `json:"action"`
-	Phase           string            `json:"phase"`
-	RequestedBy     string            `json:"requested_by,omitempty"`
-	TargetVersion   string            `json:"target_version,omitempty"`
-	ResolvedVersion string            `json:"resolved_version,omitempty"`
-	PreviousVersion string            `json:"previous_version,omitempty"`
-	NewVersion      string            `json:"new_version,omitempty"`
-	Components      map[string]string `json:"components,omitempty"`
-	Error           string            `json:"error,omitempty"`
-	Progress        string            `json:"progress,omitempty"`
-	BackupRef       string            `json:"backup_ref,omitempty"`
-	DataRestore     *dataRestoreJSON  `json:"data_restore,omitempty"`
-	DrivenBy        string            `json:"driven_by,omitempty"`
-	Nodes           []nodeStepJSON    `json:"nodes,omitempty"`
-	CreatedAt       time.Time         `json:"created_at"`
-	FinishedAt      *time.Time        `json:"finished_at,omitempty"`
+	ID               string            `json:"id"`
+	Action           string            `json:"action"`
+	Phase            string            `json:"phase"`
+	RequestedBy      string            `json:"requested_by,omitempty"`
+	RequestedByName  string            `json:"requested_by_name,omitempty"`
+	RequestedByEmail string            `json:"requested_by_email,omitempty"`
+	TargetVersion    string            `json:"target_version,omitempty"`
+	ResolvedVersion  string            `json:"resolved_version,omitempty"`
+	PreviousVersion  string            `json:"previous_version,omitempty"`
+	NewVersion       string            `json:"new_version,omitempty"`
+	Components       map[string]string `json:"components,omitempty"`
+	Error            string            `json:"error,omitempty"`
+	Progress         string            `json:"progress,omitempty"`
+	BackupRef        string            `json:"backup_ref,omitempty"`
+	DataRestore      *dataRestoreJSON  `json:"data_restore,omitempty"`
+	DrivenBy         string            `json:"driven_by,omitempty"`
+	Nodes            []nodeStepJSON    `json:"nodes,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	FinishedAt       *time.Time        `json:"finished_at,omitempty"`
 }
 
 type nodeStepJSON struct {
@@ -165,6 +168,7 @@ type dataRestoreJSON struct {
 func toOperationJSON(op *serverlifecycle.Operation) operationJSON {
 	out := operationJSON{
 		ID: op.ID, Action: string(op.Action), Phase: string(op.Phase), RequestedBy: op.RequestedBy,
+		RequestedByName: op.RequestedByName, RequestedByEmail: op.RequestedByEmail,
 		TargetVersion: op.TargetVersion, ResolvedVersion: op.ResolvedVersion,
 		PreviousVersion: op.PreviousVersion, NewVersion: op.NewVersion, Components: op.Components,
 		Error: op.Error, Progress: op.Progress, BackupRef: op.BackupRef, DrivenBy: op.DrivenBy,
@@ -323,8 +327,8 @@ func printOperation(ctx *Context, opts FormatOptions, op *serverlifecycle.Operat
 		ui.NewNamedValue("Action", string(op.Action)),
 		ui.NewStyledValue("Phase", string(op.Phase), phaseStyle(op.Phase)),
 	}
-	if op.RequestedBy != "" {
-		items = append(items, ui.NewNamedValue("Requested", op.RequestedBy))
+	if who := userlabel.Label(op.RequestedByName, op.RequestedByEmail, op.RequestedBy); who != "" {
+		items = append(items, ui.NewNamedValue("Requested", who))
 	}
 	if op.TargetVersion != "" {
 		target := op.TargetVersion

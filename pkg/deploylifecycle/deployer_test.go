@@ -12,7 +12,8 @@ func TestDescribeDeployer(t *testing.T) {
 		who, email, subject, method string
 		want                        string
 	}{
-		{name: "name wins", who: "Ada Lovelace", email: "ada@example.com", subject: "usr-ada", method: "jwt", want: "Ada Lovelace"},
+		{name: "name and email", who: "Ada Lovelace", email: "ada@example.com", subject: "usr-ada", method: "jwt", want: "Ada Lovelace (ada@example.com)"},
+		{name: "name when no email", who: "Ada Lovelace", subject: "usr-ada", method: "jwt", want: "Ada Lovelace"},
 		{name: "email when no name", email: "ada@example.com", subject: "usr-ada", method: "jwt", want: "ada@example.com"},
 		{name: "subject when token predates profile claims", subject: "usr-ada", method: "jwt", want: "usr-ada"},
 		{name: "cert subject as-is", subject: "miren-admin", method: "cert", want: "miren-admin"},
