@@ -101,7 +101,7 @@ func TestBuildServicesConfig(t *testing.T) {
 					"web": {
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 						// No Command field - relies on container default
 					},
@@ -161,14 +161,14 @@ func TestBuildServicesConfig(t *testing.T) {
 						// Only concurrency, no command
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 					},
 					"worker": {
 						Command: "node worker.js",
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 2,
+							NumInstances: new(2),
 						},
 					},
 				},
@@ -254,7 +254,7 @@ func TestBuildServicesConfig(t *testing.T) {
 						Image: "oci.miren.cloud/postgres:15",
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 					},
 				},
@@ -293,14 +293,14 @@ func TestBuildServicesConfig(t *testing.T) {
 						Image: "oci.miren.cloud/postgres:15",
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 					},
 					"redis": {
 						Image: "oci.miren.cloud/redis:7",
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 					},
 					"web": {
@@ -338,7 +338,7 @@ func TestBuildServicesConfig(t *testing.T) {
 						Image: "oci.miren.cloud/postgres:15",
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 						Disks: []appconfig.DiskConfig{
 							{
@@ -377,7 +377,7 @@ func TestBuildServicesConfig(t *testing.T) {
 					"web": {
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 						Disks: []appconfig.DiskConfig{
 							{
@@ -408,7 +408,7 @@ func TestBuildServicesConfig(t *testing.T) {
 					"db": {
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 						Disks: []appconfig.DiskConfig{
 							{
@@ -439,7 +439,7 @@ func TestBuildServicesConfig(t *testing.T) {
 					"database": {
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 2,
+							NumInstances: new(2),
 						},
 						Disks: []appconfig.DiskConfig{
 							{
@@ -487,7 +487,7 @@ func TestBuildServicesConfig(t *testing.T) {
 					"reader": {
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 						Disks: []appconfig.DiskConfig{
 							{
@@ -557,7 +557,7 @@ func TestBuildServicesConfig(t *testing.T) {
 					"worker": {
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 2,
+							NumInstances: new(2),
 						},
 						EnvVars: []appconfig.AppEnvVar{
 							{Key: "WORKER_THREADS", Value: "4"},
@@ -567,7 +567,7 @@ func TestBuildServicesConfig(t *testing.T) {
 					"scheduler": {
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 					},
 				},
@@ -608,7 +608,7 @@ func TestBuildServicesConfig(t *testing.T) {
 						Command: "./ircd",
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 						Ports: []appconfig.PortConfig{
 							{Port: 6667, Name: "irc", Type: "tcp"},
@@ -649,7 +649,7 @@ func TestBuildServicesConfig(t *testing.T) {
 						Command: "./dns-server",
 						Concurrency: &appconfig.ServiceConcurrencyConfig{
 							Mode:         "fixed",
-							NumInstances: 1,
+							NumInstances: new(1),
 						},
 						Ports: []appconfig.PortConfig{
 							{Port: 53, Name: "dns-udp", Type: "udp"},
@@ -1511,7 +1511,7 @@ func TestBuildVersionConfig(t *testing.T) {
 							Command: "celery worker",
 							Concurrency: &appconfig.ServiceConcurrencyConfig{
 								Mode:         "fixed",
-								NumInstances: 2,
+								NumInstances: new(2),
 							},
 						},
 					},

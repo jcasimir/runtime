@@ -115,10 +115,10 @@ name = "test-app"
 mode = "fixed"
 num_instances = -1
 `,
-			wantErr: "service worker: num_instances must be at least 1 for fixed mode",
+			wantErr: "service worker: num_instances cannot be negative",
 		},
 		{
-			name: "zero num_instances in fixed mode",
+			name: "zero num_instances in fixed mode keeps the service stopped",
 			config: `
 name = "test-app"
 
@@ -126,7 +126,19 @@ name = "test-app"
 mode = "fixed"
 num_instances = 0
 `,
-			wantErr: "service worker: num_instances must be at least 1 for fixed mode",
+			wantErr: "",
+		},
+		{
+			// Omitting the key must not read as 0, or a forgotten line would
+			// silently stop the service.
+			name: "fixed mode without num_instances",
+			config: `
+name = "test-app"
+
+[services.worker.concurrency]
+mode = "fixed"
+`,
+			wantErr: "service worker: num_instances is required for fixed mode",
 		},
 		{
 			name: "empty mode defaults to auto",
@@ -402,7 +414,7 @@ num_instances = 1
 	assert.Equal(t, "auto", webSvc.Concurrency.Mode)
 	assert.Equal(t, 80, webSvc.Concurrency.RequestsPerInstance)
 	assert.Equal(t, "15m", webSvc.Concurrency.ScaleDownDelay)
-	assert.Equal(t, 0, webSvc.Concurrency.NumInstances)
+	assert.Equal(t, 0, webSvc.Concurrency.Instances())
 
 	// Check worker service
 	workerSvc, ok := ac.Services["worker"]
@@ -411,7 +423,7 @@ num_instances = 1
 	assert.Equal(t, "fixed", workerSvc.Concurrency.Mode)
 	assert.Equal(t, 0, workerSvc.Concurrency.RequestsPerInstance)
 	assert.Equal(t, "", workerSvc.Concurrency.ScaleDownDelay)
-	assert.Equal(t, 1, workerSvc.Concurrency.NumInstances)
+	assert.Equal(t, 1, workerSvc.Concurrency.Instances())
 }
 
 func TestResolveDefaults_WebService(t *testing.T) {
@@ -436,7 +448,7 @@ func TestResolveDefaults_OtherService(t *testing.T) {
 	require.True(t, ok, "worker service should be created")
 	require.NotNil(t, workerSvc.Concurrency)
 	assert.Equal(t, "fixed", workerSvc.Concurrency.Mode)
-	assert.Equal(t, 1, workerSvc.Concurrency.NumInstances)
+	assert.Equal(t, 1, workerSvc.Concurrency.Instances())
 }
 
 func TestResolveDefaults_PreservesExistingConfig(t *testing.T) {
@@ -464,7 +476,7 @@ func TestResolveDefaults_PreservesExistingConfig(t *testing.T) {
 	require.True(t, ok, "worker service should be created")
 	require.NotNil(t, workerSvc.Concurrency)
 	assert.Equal(t, "fixed", workerSvc.Concurrency.Mode)
-	assert.Equal(t, 1, workerSvc.Concurrency.NumInstances)
+	assert.Equal(t, 1, workerSvc.Concurrency.Instances())
 }
 
 func TestResolveDefaults_MultipleServices(t *testing.T) {
@@ -479,10 +491,10 @@ func TestResolveDefaults_MultipleServices(t *testing.T) {
 
 	// Others get fixed mode
 	assert.Equal(t, "fixed", ac.Services["worker"].Concurrency.Mode)
-	assert.Equal(t, 1, ac.Services["worker"].Concurrency.NumInstances)
+	assert.Equal(t, 1, ac.Services["worker"].Concurrency.Instances())
 
 	assert.Equal(t, "fixed", ac.Services["scheduler"].Concurrency.Mode)
-	assert.Equal(t, 1, ac.Services["scheduler"].Concurrency.NumInstances)
+	assert.Equal(t, 1, ac.Services["scheduler"].Concurrency.Instances())
 }
 
 func TestResolveDefaults_EmptyServicesList(t *testing.T) {
@@ -735,7 +747,7 @@ func TestGetDefaultsForServices(t *testing.T) {
 				assert.Equal(t, "auto", svc.Concurrency.Mode)
 				assert.Equal(t, 10, svc.Concurrency.RequestsPerInstance)
 				assert.Equal(t, "15m", svc.Concurrency.ScaleDownDelay)
-				assert.Equal(t, 0, svc.Concurrency.NumInstances)
+				assert.Equal(t, 0, svc.Concurrency.Instances())
 			},
 		},
 		{
@@ -747,7 +759,7 @@ func TestGetDefaultsForServices(t *testing.T) {
 				require.NotNil(t, svc)
 				require.NotNil(t, svc.Concurrency)
 				assert.Equal(t, "fixed", svc.Concurrency.Mode)
-				assert.Equal(t, 1, svc.Concurrency.NumInstances)
+				assert.Equal(t, 1, svc.Concurrency.Instances())
 				assert.Equal(t, 0, svc.Concurrency.RequestsPerInstance)
 				assert.Equal(t, "", svc.Concurrency.ScaleDownDelay)
 			},
@@ -2030,6 +2042,20 @@ variant = "standard"
 		assert.Contains(t, err.Error(), "num_instances = 1")
 	})
 
+	t.Run("zero instances is accepted", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name = "test-app"
+
+[services.web.concurrency]
+mode = "fixed"
+num_instances = 0
+
+[addons.miren-sqlite]
+variant = "standard"
+`))
+		require.NoError(t, err, "a stopped service has no writer to conflict with")
+	})
+
 	// The scoping knob is what lets the rest of the app scale.
 	t.Run("services narrows the constraint", func(t *testing.T) {
 		ac, err := Parse([]byte(`
@@ -2084,4 +2110,35 @@ mount_path = "/data"
 `))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `must be "miren" or "local"`)
+}
+
+func TestValidateMirenDiskAllowsStoppedService(t *testing.T) {
+	disk := `
+[[services.db.disks]]
+name = "test-app-data"
+mount_path = "/data"
+size_gb = 1
+`
+	t.Run("zero instances is accepted", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name = "test-app"
+
+[services.db.concurrency]
+mode = "fixed"
+num_instances = 0
+` + disk))
+		require.NoError(t, err, "a stopped service holds no lease on the disk")
+	})
+
+	t.Run("more than one instance is rejected", func(t *testing.T) {
+		_, err := Parse([]byte(`
+name = "test-app"
+
+[services.db.concurrency]
+mode = "fixed"
+num_instances = 2
+` + disk))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "num_instances=1")
+	})
 }

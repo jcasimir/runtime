@@ -695,7 +695,7 @@ func buildServicesConfig(appConfig *appconfig.AppConfig, procfileServices map[st
 			if serviceConfig.Concurrency != nil {
 				svc.Concurrency = core_v1alpha.ConfigSpecServicesConcurrency{
 					Mode:                serviceConfig.Concurrency.Mode,
-					NumInstances:        int64(serviceConfig.Concurrency.NumInstances),
+					NumInstances:        int64(serviceConfig.Concurrency.Instances()),
 					RequestsPerInstance: int64(serviceConfig.Concurrency.RequestsPerInstance),
 					ScaleDownDelay:      serviceConfig.Concurrency.ScaleDownDelay,
 					ShutdownTimeout:     serviceConfig.Concurrency.ShutdownTimeout,

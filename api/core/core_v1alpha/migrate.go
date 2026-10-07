@@ -56,7 +56,7 @@ func MigrateAppVersionConcurrency(ctx context.Context, log *slog.Logger, eac *en
 			if serviceConfig, ok := ac.Services[svc.Name]; ok && serviceConfig.Concurrency != nil {
 				svc.ServiceConcurrency = ServiceConcurrency{
 					Mode:                serviceConfig.Concurrency.Mode,
-					NumInstances:        int64(serviceConfig.Concurrency.NumInstances),
+					NumInstances:        int64(serviceConfig.Concurrency.Instances()),
 					RequestsPerInstance: int64(serviceConfig.Concurrency.RequestsPerInstance),
 					ScaleDownDelay:      serviceConfig.Concurrency.ScaleDownDelay,
 				}

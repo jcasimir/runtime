@@ -92,8 +92,18 @@ type ServiceConcurrencyConfig struct {
 	Mode                string `toml:"mode"` // "auto" or "fixed"
 	RequestsPerInstance int    `toml:"requests_per_instance"`
 	ScaleDownDelay      string `toml:"scale_down_delay"` // e.g. "2m", "15m"
-	NumInstances        int    `toml:"num_instances"`
-	ShutdownTimeout     string `toml:"shutdown_timeout"` // e.g. "10s", "30s" - time to wait for graceful shutdown
+	// NumInstances is a pointer so an omitted key can be told apart from an
+	// explicit 0, which keeps a fixed service deployed but stopped.
+	NumInstances    *int   `toml:"num_instances"`
+	ShutdownTimeout string `toml:"shutdown_timeout"` // e.g. "10s", "30s" - time to wait for graceful shutdown
+}
+
+// Instances returns the configured num_instances, or 0 when it was omitted.
+func (c *ServiceConcurrencyConfig) Instances() int {
+	if c == nil || c.NumInstances == nil {
+		return 0
+	}
+	return *c.NumInstances
 }
 
 // DiskConfig represents a disk attachment for a service.
@@ -534,7 +544,7 @@ func (ac *AppConfig) Validate() error {
 						}
 					}
 				}
-				if concurrency.NumInstances > 0 {
+				if concurrency.NumInstances != nil && *concurrency.NumInstances > 0 {
 					return &ValidationError{
 						KeyPath: concurrencyPath + ".num_instances",
 						Message: fmt.Sprintf("service %s: num_instances cannot be set in auto mode", serviceName),
@@ -544,10 +554,16 @@ func (ac *AppConfig) Validate() error {
 
 			// Validate fixed mode settings
 			if concurrency.Mode == "fixed" {
-				if concurrency.NumInstances <= 0 {
+				if concurrency.NumInstances == nil {
 					return &ValidationError{
 						KeyPath: concurrencyPath + ".num_instances",
-						Message: fmt.Sprintf("service %s: num_instances must be at least 1 for fixed mode", serviceName),
+						Message: fmt.Sprintf("service %s: num_instances is required for fixed mode (set 0 to keep the service stopped)", serviceName),
+					}
+				}
+				if *concurrency.NumInstances < 0 {
+					return &ValidationError{
+						KeyPath: concurrencyPath + ".num_instances",
+						Message: fmt.Sprintf("service %s: num_instances cannot be negative", serviceName),
 					}
 				}
 				if concurrency.RequestsPerInstance > 0 {
@@ -793,10 +809,11 @@ func (ac *AppConfig) Validate() error {
 					Message: fmt.Sprintf("service %s: miren disks can only be attached to services with fixed concurrency mode", serviceName),
 				}
 			}
-			if svcConfig.Concurrency.NumInstances != 1 {
+			// 0 is allowed: a stopped service holds no lease on the disk.
+			if n := svcConfig.Concurrency.NumInstances; n == nil || *n > 1 {
 				return &ValidationError{
 					KeyPath: svcPrefix + ".concurrency.num_instances",
-					Message: fmt.Sprintf("service %s: miren disks can only be attached to services with fixed concurrency mode and num_instances=1", serviceName),
+					Message: fmt.Sprintf("service %s: miren disks can only be attached to services with fixed concurrency mode and num_instances=1 (or 0 to keep it stopped)", serviceName),
 				}
 			}
 		}
@@ -825,11 +842,11 @@ func (ac *AppConfig) Validate() error {
 				continue
 			}
 			c := svcConfig.Concurrency
-			if c == nil || c.Mode != "fixed" || c.NumInstances != 1 {
+			if c == nil || c.Mode != "fixed" || c.NumInstances == nil || *c.NumInstances > 1 {
 				return &ValidationError{
 					KeyPath: "services." + serviceName + ".concurrency",
 					Message: fmt.Sprintf(
-						"service %s: addon %s supplies a database that allows one writer, so the service must set mode = \"fixed\" with num_instances = 1, or the addon must name other services with services = [...]",
+						"service %s: addon %s supplies a database that allows one writer, so the service must set mode = \"fixed\" with num_instances = 1 (or 0 to keep it stopped), or the addon must name other services with services = [...]",
 						serviceName, addonName),
 				}
 			}
@@ -1027,7 +1044,7 @@ func (ac *AppConfig) ResolveDefaults(services []string) {
 			ac.Services[serviceName] = &ServiceConfig{
 				Concurrency: &ServiceConcurrencyConfig{
 					Mode:            "fixed",
-					NumInstances:    1,
+					NumInstances:    new(1),
 					ShutdownTimeout: "10s",
 				},
 			}
