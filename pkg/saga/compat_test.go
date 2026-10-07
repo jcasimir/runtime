@@ -544,7 +544,7 @@ func nestedUpgradeRegistry(t *testing.T, ctrl *nestedTestController, prep *prepC
 func crashedInParentStep(t *testing.T, storage Storage, childStatus Status, childActions map[string]*ActionResult) string {
 	t.Helper()
 	ctx := context.Background()
-	childID := deriveChildID("parent-1", "child-saga", "parent-step")
+	childID := NestedExecutionID("parent-1", "child-saga", "parent-step")
 	order := []string{}
 	for name := range childActions {
 		order = append(order, name)
@@ -739,7 +739,7 @@ func TestRecovery_RunningWithNothingRecordedIsNotExempt(t *testing.T) {
 	prep := &prepCounter{}
 	storage := NewMemoryStorage()
 
-	childID := deriveChildID("parent-1", "child-saga", "parent-step")
+	childID := NestedExecutionID("parent-1", "child-saga", "parent-step")
 	require.NoError(t, storage.Save(ctx, &Execution{
 		ID:                childID,
 		DefinitionName:    "child-saga",

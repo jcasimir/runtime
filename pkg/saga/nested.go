@@ -86,7 +86,7 @@ func RunNested(ctx context.Context, sagaName string, opts ...NestedOption) (*Nes
 	childID := cfg.id
 	if childID == "" {
 		actionName, _ := actionNameFromContext(ctx)
-		childID = deriveChildID(parentExecID, sagaName, actionName)
+		childID = NestedExecutionID(parentExecID, sagaName, actionName)
 	}
 	controlCtx := controlContextFromContext(ctx)
 	exec, err := parent.createChildExecution(controlCtx, def, cfg.inputs, childID, parentExecID)
@@ -108,12 +108,54 @@ func RunNested(ctx context.Context, sagaName string, opts ...NestedOption) (*Nes
 		// Still in flight: drive it below.
 	}
 
-	// Run the child saga
-	if err := parent.runExecution(controlCtx, ctx, def, exec); err != nil {
+	// Drive the child the way resume drives a top-level execution. A child
+	// interrupted while undoing, or after recording a failed action, has to
+	// finish compensating; running it forward instead would skip the failed
+	// action as already executed and report the child completed.
+	if err := parent.resumeWithActionContext(controlCtx, ctx, def, exec); err != nil {
 		return nil, err
+	}
+	if exec.Status != StatusCompleted {
+		return nil, fmt.Errorf("nested saga %q execution %q did not complete (status %q): %s",
+			sagaName, exec.ID, exec.Status, exec.Error)
 	}
 
 	return collectOutputs(def, exec), nil
+}
+
+// ResumeNested drives the calling action's own child execution of sagaName
+// when a previous attempt of the action left it in flight, and reports
+// found=false when there is no such child or it already finished.
+//
+// An action that inspects shared state before calling RunNested should call
+// this first. On a re-run, whatever the child already built is visible to
+// that inspection and looks like someone else's work, so the action would
+// back off from or tear down its own half-finished child instead of
+// resuming it. The child keeps the inputs it was created with; terminal
+// children are left to the caller's normal path.
+func ResumeNested(ctx context.Context, sagaName string) (*NestedResult, bool, error) {
+	parent, ok := executorFromContext(ctx)
+	if !ok {
+		return nil, false, fmt.Errorf("ResumeNested called outside of a saga execution (no executor in context)")
+	}
+
+	parentExecID, _ := executionIDFromContext(ctx)
+	actionName, _ := actionNameFromContext(ctx)
+	childID := NestedExecutionID(parentExecID, sagaName, actionName)
+
+	exec, err := parent.storage.Get(controlContextFromContext(ctx), childID)
+	if errors.Is(err, ErrExecutionNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("checking for in-flight nested execution: %w", err)
+	}
+	if isTerminal(exec.Status) {
+		return nil, false, nil
+	}
+
+	result, err := RunNested(ctx, sagaName, WithNestedID(childID))
+	return result, true, err
 }
 
 // createChildExecution builds and persists a new Execution linked to a parent.
@@ -216,11 +258,11 @@ func UndoNested(ctx context.Context, executionID string) error {
 	return err
 }
 
-// deriveChildID produces a deterministic execution ID from the parent execution,
-// the child saga name, and the calling action name. This ensures that re-executing
-// a parent action during recovery produces the same child ID, enabling
-// createChildExecution's idempotency check to find the prior child execution.
-func deriveChildID(parentExecID, sagaName, actionName string) string {
+// NestedExecutionID is the ID RunNested gives the child of sagaName started by
+// the named action of a parent execution, absent WithNestedID. It is
+// deterministic so that re-executing a parent action during recovery finds the
+// prior child execution through createChildExecution's idempotency check.
+func NestedExecutionID(parentExecID, sagaName, actionName string) string {
 	h := sha256.Sum256([]byte(parentExecID + "\x00" + sagaName + "\x00" + actionName))
 	return sagaIDKind + "/" + sagaIDName + "-" + base58.Encode(h[:16])
 }
