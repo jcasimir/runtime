@@ -194,6 +194,10 @@ miren auth ci add -a myapp --github acme/web-app \
 
 An explicit `--allowed-events` replaces the default set. Existing bindings keep their configured events; recreate a binding to use the new defaults.
 
+:::warning[Restrict production deployments]
+Pull request workflows can contain code controlled by the PR author. For production apps, use `--allowed-events push,workflow_dispatch` or restrict the binding to your production branch with `--allowed-refs refs/heads/main`. Keep PR preview deployments on a staging app.
+:::
+
 ### Allowed Refs
 
 Restrict deployments to specific git refs:
