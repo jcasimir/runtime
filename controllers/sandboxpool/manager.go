@@ -85,8 +85,19 @@ func (m *Manager) Reconcile(ctx context.Context, pool *compute_v1alpha.SandboxPo
 
 	// Skip crash detection for decommissioned pools (desired=0, no references).
 	// Sandbox deaths during intentional scale-down are expected, not crashes.
-	if pool.DesiredInstances > 0 || len(pool.ReferencedByVersions) > 0 {
-		newCrashes, latestCrash := m.countStartupFailures(sandboxes, pool)
+	//
+	// The same holds for a fixed service configured with num_instances = 0:
+	// it is stopped on purpose, so its sandboxes dying on the way down are
+	// not crashes. The config lookup only runs when there is something to
+	// excuse, keeping it off the steady-state path.
+	newCrashes, latestCrash := m.countStartupFailures(sandboxes, pool)
+	hasCrashState := newCrashes > 0 || pool.ConsecutiveCrashCount > 0 || !pool.CooldownUntil.IsZero()
+	if pool.DesiredInstances == 0 && len(pool.ReferencedByVersions) > 0 && hasCrashState && m.serviceStopped(ctx, pool) {
+		m.log.Info("clearing crash state on stopped service", "pool", pool.ID, "service", pool.Service)
+		pool.LastCrashTime = latestCrash
+		pool.ConsecutiveCrashCount = 0
+		pool.CooldownUntil = time.Time{}
+	} else if pool.DesiredInstances > 0 || len(pool.ReferencedByVersions) > 0 {
 		if newCrashes > 0 {
 			pool.ConsecutiveCrashCount += int64(newCrashes)
 			pool.LastCrashTime = latestCrash
@@ -527,8 +538,8 @@ func (m *Manager) updatePoolStatus(ctx context.Context, pool *compute_v1alpha.Sa
 		meta.Update(pool.Encode())
 	}
 	// Explicitly set status fields to ensure 0 values are persisted. The crash
-	// fields need the same treatment: clearing them sets zero values that
-	// Encode() would drop.
+	// fields need the same treatment: clearing them (a healthy sandbox, or a
+	// stopped service) sets zero values that Encode() would drop.
 	meta.Update([]entity.Attr{
 		entity.Int64(compute_v1alpha.SandboxPoolCurrentInstancesId, current),
 		entity.Int64(compute_v1alpha.SandboxPoolReadyInstancesId, ready),
@@ -841,6 +852,32 @@ func (m *Manager) countStartupFailures(sandboxes []*sandboxWithMeta, pool *compu
 		}
 	}
 	return count, latest
+}
+
+// serviceStopped reports whether the pool's version configures its service as
+// fixed with zero instances. Lookup failures read as not stopped, which keeps
+// the existing crash handling.
+func (m *Manager) serviceStopped(ctx context.Context, pool *compute_v1alpha.SandboxPool) bool {
+	if pool.SandboxSpec.Version == "" {
+		return false
+	}
+	verResp, err := m.eac.Get(ctx, pool.SandboxSpec.Version.String())
+	if err != nil {
+		return false
+	}
+	var ver core_v1alpha.AppVersion
+	ver.Decode(verResp.Entity().Entity())
+
+	spec, err := coreutil.ResolveRuntimeConfig(ctx, m.eac, &ver)
+	if err != nil {
+		return false
+	}
+	svcConcurrency, err := coreutil.GetServiceConcurrency(spec, pool.Service)
+	if err != nil {
+		return false
+	}
+	sc := core_v1alpha.ServiceConcurrency(svcConcurrency)
+	return concurrency.NewStrategyForVersion(&ver, pool.Service, &sc).MaxInstances() == 0
 }
 
 // backoffDuration calculates the exponential backoff duration based on consecutive crash count

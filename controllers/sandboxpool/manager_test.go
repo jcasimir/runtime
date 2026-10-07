@@ -1423,6 +1423,79 @@ func TestManagerDecommissionedPool_NoCrashDetection(t *testing.T) {
 		"decommissioned pool should not enter cooldown")
 }
 
+// TestManagerStoppedService_NoCrashCooldown verifies that a fixed service
+// configured with num_instances = 0 is not treated as crashing. A sandbox that
+// dies young as the service stops would otherwise push the pool into cooldown,
+// which hands a referenced pool a replacement and revives the service.
+func TestManagerStoppedService_NoCrashCooldown(t *testing.T) {
+	ctx := context.Background()
+	log := testutils.TestLogger(t)
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	appVer := &core_v1alpha.AppVersion{
+		App:     entity.Id("app-1"),
+		Version: "v1",
+		Config: core_v1alpha.Config{
+			Services: []core_v1alpha.Services{
+				{
+					Name: "worker",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+						Mode:         "fixed",
+						NumInstances: 0,
+					},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "ver-1", appVer)
+	require.NoError(t, err)
+
+	// Crash state carried over from before the stop.
+	pool := &compute_v1alpha.SandboxPool{
+		Service:               "worker",
+		DesiredInstances:      0,
+		ReferencedByVersions:  []entity.Id{verID},
+		ConsecutiveCrashCount: 2,
+		CooldownUntil:         time.Now().Add(5 * time.Minute),
+		SandboxSpec: compute_v1alpha.SandboxSpec{
+			Version: verID,
+			Container: []compute_v1alpha.SandboxSpecContainer{
+				{Image: "test:latest"},
+			},
+		},
+	}
+	poolID, err := server.Client.Create(ctx, "test-pool", pool)
+	require.NoError(t, err)
+	pool.ID = poolID
+
+	// A sandbox that lived 20 seconds, which crash detection would count.
+	shortLivedTime := time.Now().Add(-30 * time.Second)
+	server.Store.NowFunc = func() time.Time { return shortLivedTime }
+	deadSbID, err := server.Client.Create(ctx, "dead-sb", &compute_v1alpha.Sandbox{
+		Status: compute_v1alpha.DEAD,
+		Spec:   pool.SandboxSpec,
+	}, entityserver.WithLabels(types.LabelSet("service", "worker", "pool", poolID.String())))
+	require.NoError(t, err)
+	server.Store.NowFunc = func() time.Time { return shortLivedTime.Add(20 * time.Second) }
+	_, err = server.EAC.Patch(ctx, entity.New(
+		entity.DBId, deadSbID,
+		(&compute_v1alpha.Sandbox{Status: compute_v1alpha.DEAD}).Encode,
+	).Attrs(), 0)
+	require.NoError(t, err)
+	server.Store.NowFunc = nil
+
+	manager := NewManager(log, server.EAC)
+	reconcilePool(t, ctx, server, manager, pool)
+
+	updated := getPool(t, ctx, server, poolID)
+	assert.Equal(t, int64(0), updated.DesiredInstances, "cooldown must not revive a stopped service")
+	assert.Equal(t, int64(0), updated.ConsecutiveCrashCount, "a stopped service has no crash state")
+	assert.True(t, updated.CooldownUntil.IsZero(), "a stopped service should not sit in cooldown")
+	assert.Len(t, listSandboxesForPool(t, ctx, server, pool), 1, "nothing beyond the dead sandbox should be booted")
+}
+
 // TestManagerCrashResetDoesNotRecount verifies that after crash state is reset
 // (e.g. by a deploy), old DEAD sandboxes are not re-counted as new crashes.
 // This is a regression test for MIR-956.
