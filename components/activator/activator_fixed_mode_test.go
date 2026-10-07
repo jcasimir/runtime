@@ -277,3 +277,54 @@ func TestActivatorFixedModeNoSlotExhaustion(t *testing.T) {
 		require.NoError(t, err)
 	}
 }
+
+// TestActivatorStoppedServiceFailsFast verifies that a lease request for a
+// fixed service configured with zero instances returns ErrServiceStopped at
+// once rather than waiting out the pool timeout for capacity that never comes.
+func TestActivatorStoppedServiceFailsFast(t *testing.T) {
+	ctx := context.Background()
+	log := testutils.TestLogger(t)
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	appVer := &core_v1alpha.AppVersion{
+		App:      entity.Id("app/test-stopped-app"),
+		Version:  "v1",
+		ImageUrl: "test:latest",
+		Config: core_v1alpha.Config{
+			Port: 3000,
+			Services: []core_v1alpha.Services{
+				{
+					Name: "web",
+					ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+						Mode:         "fixed",
+						NumInstances: 0,
+					},
+				},
+			},
+		},
+	}
+	verID, err := server.Client.Create(ctx, "test-stopped-v1", appVer)
+	require.NoError(t, err)
+	appVer.ID = verID
+
+	activator := &localActivator{
+		log:             log,
+		eac:             server.EAC,
+		versions:        make(map[verKey]*versionPoolRef),
+		poolSandboxes:   make(map[entity.Id]*poolSandboxes),
+		pools:           make(map[verKey]*poolState),
+		newSandboxChans: make(map[verKey][]chan struct{}),
+		invalidationCh:  make(chan SandboxInvalidation, 1),
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	lease, err := activator.AcquireLease(reqCtx, appVer, "web")
+	assert.Nil(t, lease)
+	require.ErrorIs(t, err, ErrServiceStopped)
+	assert.Less(t, time.Since(start), time.Second, "a stopped service should fail fast")
+}

@@ -320,6 +320,11 @@ func (a *localActivator) AcquireLease(ctx context.Context, ver *core_v1alpha.App
 var ErrSandboxDiedEarly = fmt.Errorf("sandbox died while booting")
 var ErrPoolTimeout = fmt.Errorf("timeout waiting for sandbox from pool")
 
+// ErrServiceStopped means the service is configured as fixed with zero
+// instances. No capacity will ever arrive, so callers fail fast instead of
+// waiting out the pool timeout.
+var ErrServiceStopped = fmt.Errorf("service is stopped (num_instances = 0)")
+
 // waitForSandbox waits for a sandbox with capacity to become available.
 // If incrementPool is true, it will ensure the pool exists and increment DesiredInstances.
 // If incrementPool is false, it assumes PENDING sandboxes exist and just waits for them.
@@ -617,6 +622,9 @@ func (a *localActivator) requestPoolCapacity(ctx context.Context, ver *core_v1al
 	sc := core_v1alpha.ServiceConcurrency(svcConcurrency)
 	strategy := concurrency.NewStrategyForVersion(ver, service, &sc)
 	maxInstances := int64(strategy.MaxInstances())
+	if maxInstances == 0 {
+		return nil, ErrServiceStopped
+	}
 
 	// poolLoop is labeled so the pool-creation retry path below can break all
 	// the way back out to re-read the cache. The outer loop re-acquires a.mu
