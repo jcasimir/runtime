@@ -221,9 +221,10 @@ can recover, and [tell us what breaks](https://github.com/mirendev/runtime/issue
 That difference has consequences worth knowing:
 
 - **One writer.** SQLite allows a single writer, so a service with a SQLite
-  database must use `mode = "fixed"` with `num_instances = 1`. Deploying without
-  that fails with the reason, rather than starting an app whose database is
-  quietly missing.
+  database must use `mode = "fixed"` with `num_instances = 1` (or `0` to
+  [stop the service](./scaling.md#stopping-a-service)). Deploying without that
+  fails with the reason, rather than starting an app whose database is quietly
+  missing.
 - **One database per app.** An app gets a single SQLite database, because an app
   gets a single instance of any addon.
 - **Scoped with `services`.** By default the database attaches to every service,

@@ -349,13 +349,13 @@ shutdown_timeout = "10s"
 | `mode` | string | `"auto"` or `"fixed"` | `"auto"` for web, `"fixed"` for others |
 | `requests_per_instance` | int | Target concurrent requests per instance (auto mode only) | `10` |
 | `scale_down_delay` | duration | Time to wait before removing idle instances (auto mode only) | `"15m"` |
-| `num_instances` | int | Exact number of instances to run (fixed mode only) | `1` |
+| `num_instances` | int | Exact number of instances to run (fixed mode only). `0` keeps the service deployed but stopped; see [Stopping a Service](./scaling.md#stopping-a-service) | `1` |
 | `shutdown_timeout` | duration | Time a stopping instance gets to exit after `SIGTERM` before it is killed. A new value takes effect from the next deploy; see [Graceful Shutdown](./services.md#graceful-shutdown) | `"10s"` |
 
 :::note[Validation]
 - `mode` must be `"auto"` or `"fixed"`.
 - In **auto** mode: `requests_per_instance` must be non-negative, `scale_down_delay` must be a valid Go duration, and `num_instances` must not be set.
-- In **fixed** mode: `num_instances` must be at least 1, and `requests_per_instance` / `scale_down_delay` must not be set.
+- In **fixed** mode: `num_instances` is required and must not be negative (`0` stops the service), and `requests_per_instance` / `scale_down_delay` must not be set.
 - `shutdown_timeout` must be a valid Go duration (e.g. `"10s"`, `"30s"`).
 :::
 

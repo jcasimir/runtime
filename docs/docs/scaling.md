@@ -122,7 +122,23 @@ num_instances = 3
 | Option | Description | Default |
 |--------|-------------|---------|
 | `mode` | Must be `"fixed"` | `"fixed"` for non-web |
-| `num_instances` | Exact number of instances to run | 1 |
+| `num_instances` | Exact number of instances to run. `0` stops the service | 1 |
+
+### Stopping a Service
+
+Set `num_instances = 0` to keep a fixed service deployed but stopped:
+
+```toml
+[services.worker.concurrency]
+mode = "fixed"
+num_instances = 0
+```
+
+Deploy, and the service's instances shut down. Nothing boots for it, not even the single instance a deploy normally starts to verify the new version, and it stays stopped until you deploy again with a higher count. Its disks, addons, routes, and environment variables stay in place, so raising `num_instances` brings it back as it was.
+
+A stopped service doesn't wake on traffic the way an autoscaled service at zero does. HTTP requests to it get a 503 right away; take its route down with [`miren route down`](./maintenance-mode.md) first if visitors should see a holding page instead. To stop an autoscaled `web` service, switch it to `mode = "fixed"` with `num_instances = 0`.
+
+When every service in an app is stopped, `miren app list` shows the app as `stopped` and `miren deploy` reports the version as deployed and stopped rather than waiting for an instance.
 
 ## Examples
 
@@ -198,7 +214,7 @@ size_gb = 20
 
 ## Scaling and Disks
 
-Services with persistent disks must use fixed mode with exactly 1 instance:
+Services with persistent disks must use fixed mode with exactly 1 instance, or 0 to [stop the service](#stopping-a-service):
 
 ```toml
 [services.db.concurrency]
