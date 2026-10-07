@@ -2,6 +2,7 @@ package keyrotation
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -68,6 +69,68 @@ func drive(t *testing.T, c *Controller, ctx context.Context) {
 		}
 	}
 	t.Fatal("rotation did not finish")
+}
+
+type failRotationRecord struct {
+	rpc.Client
+	err error
+}
+
+func (s *failRotationRecord) Call(ctx context.Context, method string, args, result any) error {
+	if method == "put" && s.err != nil {
+		err := s.err
+		s.err = nil
+		return err
+	}
+	return s.Client.Call(ctx, method, args, result)
+}
+
+func TestFailedRotationRecordLeavesLiveKeyUnchanged(t *testing.T) {
+	c, backend, ec, _ := newTestController(t)
+	ctx := t.Context()
+	oldKey := backend.Keyring().CurrentID()
+	_, _, err := backend.Put(ctx, "app/before", []byte("before rotation"))
+	require.NoError(t, err)
+
+	failure := errors.New("injected rotation record failure")
+	fault := &failRotationRecord{Client: ec.EAC().Client, err: failure}
+	c.EC = entityserver.NewClient(c.Log, esv1.NewEntityAccessClient(fault))
+
+	require.ErrorContains(t, c.Begin(ctx), "recording the rotation: "+failure.Error())
+	require.Nil(t, fault.err, "the record write must have reached the injected failure")
+	require.Equal(t, oldKey, backend.Keyring().CurrentID())
+	assert.Len(t, backend.Keyring().Keys(), 1)
+	active, err := c.activeRotation(ctx)
+	require.NoError(t, err)
+	require.Nil(t, active)
+
+	_, _, err = backend.Put(ctx, "app/after", []byte("after failure"))
+	require.NoError(t, err)
+	remaining, err := backend.CountOnKey(ctx, oldKey)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "writes still seal under the old key after failure")
+
+	// Retrying must target the original key, not strand its versions.
+	require.NoError(t, c.Begin(ctx))
+	active, err = c.activeRotation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, oldKey, active.FromKey)
+	assert.Equal(t, backend.Keyring().CurrentID(), active.ToKey)
+	drive(t, c, ctx)
+	assert.Len(t, backend.Keyring().Keys(), 1)
+	remaining, err = backend.CountOnKey(ctx, oldKey)
+	require.NoError(t, err)
+	assert.Zero(t, remaining)
+
+	for path, want := range map[string]string{
+		"app/before": "before rotation",
+		"app/after":  "after failure",
+	} {
+		got, err := backend.Resolve(ctx, path)
+		require.NoError(t, err)
+		assert.Equal(t, want, string(got.Bytes))
+	}
 }
 
 func TestRotationRewrapsEveryVersionAndRetiresTheOldKey(t *testing.T) {
