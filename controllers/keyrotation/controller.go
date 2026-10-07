@@ -240,6 +240,20 @@ func (c *Controller) advance(ctx context.Context, rec *core_v1alpha.KeyRotation)
 
 // rewrap moves a batch of versions off the retiring key.
 func (c *Controller) rewrap(ctx context.Context, rec *core_v1alpha.KeyRotation) error {
+	// The record may have committed even though Begin received an error and
+	// never switched the live ring. Resume from the ring saved before the write.
+	if c.Backend.Keyring().CurrentID() == rec.FromKey {
+		ring, err := keyring.Ensure(c.Log, c.DataPath)
+		if err != nil {
+			return fmt.Errorf("loading the rotated keyring: %w", err)
+		}
+		if ring.CurrentID() != rec.ToKey {
+			return fmt.Errorf("persisted current key %s does not match rotation target %s", ring.CurrentID(), rec.ToKey)
+		}
+		c.Backend.UseKeyring(ring)
+		c.Log.Info("resumed cluster key rotation", "from_key", rec.FromKey, "to_key", rec.ToKey)
+	}
+
 	moved, err := c.Backend.RewrapBatch(ctx, rec.FromKey, rewrapBatch)
 	if moved > 0 {
 		rec.Rewrapped += int64(moved)
