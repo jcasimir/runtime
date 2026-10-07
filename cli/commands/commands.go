@@ -292,6 +292,20 @@ miren deploy --format jsonl | jq -c 'select(.event == "build_step")'
 			Body: "miren app restart -s web",
 		}),
 	))
+	d.Dispatch("app disable", Infer("app disable", "Hold every service of an app at zero instances", AppDisable,
+		WithDescription(appDisableDescription),
+		WithExample(mflags.Example{
+			Name: "Disable an app",
+			Body: "miren app disable -a myapp --reason \"Moved to the new cluster\"",
+		}),
+	))
+	d.Dispatch("app enable", Infer("app enable", "Start a disabled app again", AppEnable,
+		WithDescription(appEnableDescription),
+		WithExample(mflags.Example{
+			Name: "Enable an app",
+			Body: "miren app enable -a myapp",
+		}),
+	))
 	d.Dispatch("app set-workload-role", Infer("app set-workload-role", "Set the API role for an app's sandbox identity tokens", AppSetWorkloadRole,
 		WithExample(mflags.Example{
 			Name: "Let an app's workloads read and deploy their own app",
@@ -1550,6 +1564,16 @@ Use restart to:
 :::note[Config and env changes restart on their own]
 You do not need to restart after ` + "`" + `miren env set` + "`" + `, ` + "`" + `miren env delete` + "`" + `, ` + "`" + `miren addon create` + "`" + `, or ` + "`" + `miren addon destroy` + "`" + `. Each of those already creates a new version and rolls out new sandboxes automatically. A manual restart on top only adds a redundant rollout.
 :::`
+
+const appDisableDescription = `Disable turns an app off. Every service is held at zero instances: running sandboxes shut down, nothing boots on a deploy, and HTTP requests get a 503. The app keeps its versions, routes, environment, disks, and addons, so ` + "`" + `miren app enable` + "`" + ` brings it back as it was.
+
+Disabled is an explicit state, so ` + "`" + `miren app list` + "`" + ` and ` + "`" + `miren app status` + "`" + ` report it as such rather than as an app that failed to start.
+
+:::note[Tasks still run]
+Disable stops services, not tasks. ` + "`" + `miren app run` + "`" + ` and scheduled tasks keep working, which leaves room for a backup or a migration while the app is off.
+:::`
+
+const appEnableDescription = `Enable turns a disabled app back on. Fixed-mode services return to their configured count right away; autoscaled services stay at zero and start on the next request.`
 
 const secretSetDescription = `Stores a value in the cluster's secret store. The value is encrypted at rest and is never echoed, logged, or written to disk by this command — it travels to the server, which holds the only key.
 

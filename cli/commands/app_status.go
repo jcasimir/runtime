@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"miren.dev/runtime/api/app/app_v1alpha"
 	"miren.dev/runtime/api/deployment/deployment_v1alpha"
+	"miren.dev/runtime/pkg/rpc/standard"
 	"miren.dev/runtime/pkg/theme"
 	"miren.dev/runtime/pkg/ui"
 )
@@ -102,6 +103,15 @@ func AppStatus(ctx *Context, opts struct {
 	if down := appResult.MaintenanceRoutes(); len(down) > 0 {
 		ctx.Printf("%s %s\n", labelStyle.Render("Maintenance:"),
 			yellowStyle.Render(fmt.Sprintf("%s serving a holding page", maintenanceRouteList(down))))
+	}
+
+	if appResult.HasDisabledAt() {
+		since := standard.FromTimestamp(appResult.DisabledAt())
+		line := fmt.Sprintf("since %s", since.Local().Format(time.RFC1123))
+		if reason := appResult.DisabledReason(); reason != "" {
+			line += " — " + reason
+		}
+		ctx.Printf("%s %s\n", labelStyle.Render("Disabled:"), yellowStyle.Render(line))
 	}
 
 	// Configuration
@@ -385,6 +395,8 @@ func printAppStatusJSON(
 		Source            *sourceJSON      `json:"source,omitempty"`
 		WorkloadRole      string           `json:"workload_role,omitempty"`
 		MaintenanceRoutes []string         `json:"maintenance_routes,omitempty"`
+		DisabledAt        *time.Time       `json:"disabled_at,omitempty"`
+		DisabledReason    string           `json:"disabled_reason,omitempty"`
 		Configuration     *configuration   `json:"configuration,omitempty"`
 		ActiveDeployment  *deploymentJSON  `json:"active_deployment,omitempty"`
 		RecentDeployments []deploymentJSON `json:"recent_deployments,omitempty"`
@@ -395,7 +407,12 @@ func printAppStatusJSON(
 		Cluster:           cluster,
 		WorkloadRole:      appResult.WorkloadRole(),
 		MaintenanceRoutes: appResult.MaintenanceRoutes(),
+		DisabledReason:    appResult.DisabledReason(),
 		Services:          health,
+	}
+	if appResult.HasDisabledAt() {
+		at := standard.FromTimestamp(appResult.DisabledAt())
+		output.DisabledAt = &at
 	}
 	if healthErr != nil {
 		output.HealthError = healthErr.Error()
