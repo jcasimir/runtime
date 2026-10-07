@@ -942,6 +942,87 @@ func TestAutoModeDrainedPoolOnlyRevivesForNewVersion(t *testing.T) {
 	assert.Contains(t, pools[0].ReferencedByVersions, v2.ID)
 }
 
+// TestFixedModeZeroInstancesStopsService verifies that num_instances = 0 keeps a
+// fixed service deployed but stopped: a new pool is created at zero, a redeploy
+// to zero stops a running pool without booting it for verification, the
+// minutely resync leaves it stopped, and raising the count starts it again.
+func TestFixedModeZeroInstancesStopsService(t *testing.T) {
+	ctx := context.Background()
+	log := testutils.TestLogger(t)
+
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{Project: entity.Id("project-1")}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	newVersion := func(name string, instances int64) *core_v1alpha.AppVersion {
+		t.Helper()
+		ver := &core_v1alpha.AppVersion{
+			App:      app.ID,
+			Version:  name,
+			ImageUrl: "worker:latest",
+			Config: core_v1alpha.Config{
+				Services: []core_v1alpha.Services{
+					{
+						Name: "worker",
+						ServiceConcurrency: core_v1alpha.ServiceConcurrency{
+							Mode:         "fixed",
+							NumInstances: instances,
+						},
+					},
+				},
+			},
+		}
+		verID, createErr := server.Client.Create(ctx, name, ver)
+		require.NoError(t, createErr)
+		ver.ID = verID
+		return ver
+	}
+
+	deploy := func(ver *core_v1alpha.AppVersion) compute_v1alpha.SandboxPool {
+		t.Helper()
+		app.ActiveVersion = ver.ID
+		require.NoError(t, server.Client.Update(ctx, app))
+		require.NoError(t, launcher(log, server).Reconcile(ctx, app, nil))
+		pools := listAllPools(t, ctx, server)
+		require.Len(t, pools, 1, "same sandbox spec should reuse one pool")
+		return pools[0]
+	}
+
+	t.Run("new pool starts stopped", func(t *testing.T) {
+		pool := deploy(newVersion("v0", 0))
+		assert.Equal(t, int64(0), pool.DesiredInstances,
+			"a stopped service's pool must not boot, even for deploy verification")
+	})
+
+	t.Run("running pool stops and starts again", func(t *testing.T) {
+		running := deploy(newVersion("v1", 1))
+		assert.Equal(t, int64(1), running.DesiredInstances)
+
+		stopped := deploy(newVersion("v2", 0))
+		assert.Equal(t, running.ID, stopped.ID)
+		assert.Equal(t, int64(0), stopped.DesiredInstances,
+			"redeploying with num_instances = 0 must stop the service")
+
+		require.NoError(t, launcher(log, server).Reconcile(ctx, app, nil))
+		pools := listAllPools(t, ctx, server)
+		require.Len(t, pools, 1)
+		assert.Equal(t, int64(0), pools[0].DesiredInstances,
+			"steady-state resync must leave a stopped service stopped")
+
+		restarted := deploy(newVersion("v3", 1))
+		assert.Equal(t, running.ID, restarted.ID)
+		assert.Equal(t, int64(1), restarted.DesiredInstances)
+	})
+}
+
+func launcher(log *slog.Logger, server *testutils.InMemEntityServer) *Launcher {
+	return newTestLauncher(log, server.EAC)
+}
+
 // Helper functions
 
 func listAllPools(t *testing.T, ctx context.Context, server *testutils.InMemEntityServer) []compute_v1alpha.SandboxPool {
