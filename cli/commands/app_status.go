@@ -100,18 +100,20 @@ func AppStatus(ctx *Context, opts struct {
 		ctx.Printf("%s %s\n", labelStyle.Render("Workload Role:"), role)
 	}
 
-	if down := appResult.MaintenanceRoutes(); len(down) > 0 {
-		ctx.Printf("%s %s\n", labelStyle.Render("Maintenance:"),
-			yellowStyle.Render(fmt.Sprintf("%s serving a holding page", maintenanceRouteList(down))))
-	}
-
+	var disabledAt *time.Time
 	if appResult.HasDisabledAt() {
-		since := standard.FromTimestamp(appResult.DisabledAt())
-		line := fmt.Sprintf("since %s", since.Local().Format(time.RFC1123))
-		if reason := appResult.DisabledReason(); reason != "" {
-			line += " — " + reason
+		at := standard.FromTimestamp(appResult.DisabledAt())
+		disabledAt = &at
+	}
+	if label, lines := notServingLines(disabledAt, appResult.DisabledReason(), appResult.MaintenanceRoutes()); label != "" {
+		indent := strings.Repeat(" ", lipgloss.Width(label)+1)
+		for i, line := range lines {
+			lead := indent
+			if i == 0 {
+				lead = labelStyle.Render(label) + " "
+			}
+			ctx.Printf("%s%s\n", lead, yellowStyle.Render(line))
 		}
-		ctx.Printf("%s %s\n", labelStyle.Render("Disabled:"), yellowStyle.Render(line))
 	}
 
 	// Configuration
@@ -467,4 +469,27 @@ func maintenanceRouteList(hosts []string) string {
 	}
 
 	return strings.Join(named, ", ")
+}
+
+// notServingLines explains why an app, or some of its routes, isn't serving.
+// A disabled app and a route in maintenance read as one section: the app is
+// off, and those routes show their maintenance page instead of the disabled
+// one.
+func notServingLines(disabledAt *time.Time, reason string, maintenanceRoutes []string) (string, []string) {
+	if disabledAt == nil {
+		if len(maintenanceRoutes) == 0 {
+			return "", nil
+		}
+		return "Maintenance:", []string{fmt.Sprintf("%s serving a holding page", maintenanceRouteList(maintenanceRoutes))}
+	}
+
+	line := fmt.Sprintf("disabled since %s", disabledAt.Local().Format(time.RFC1123))
+	if reason != "" {
+		line += " — " + reason
+	}
+	lines := []string{line}
+	if len(maintenanceRoutes) > 0 {
+		lines = append(lines, fmt.Sprintf("in maintenance instead: %s", maintenanceRouteList(maintenanceRoutes)))
+	}
+	return "Not serving:", lines
 }
