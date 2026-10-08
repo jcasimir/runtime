@@ -132,7 +132,9 @@ To turn an app off without deleting it, disable it:
 miren app disable -a myapp --reason "Moved to the new cluster"
 ```
 
-Every service, autoscaled or fixed, is held at zero until you run `miren app enable`. Running instances shut down, deploys record the new version without booting it, HTTP requests get a 503, and `miren app restart` refuses until the app is enabled. The app keeps its versions, routes, environment, disks, and addons. Tasks still run, so `miren app run` works for a backup or migration while the app is off.
+Every service, autoscaled or fixed, is held at zero until you run `miren app enable`. Running instances shut down, deploys record the new version without booting it, visitors get a 503 holding page, and `miren app restart` refuses until the app is enabled. The app keeps its versions, routes, environment, disks, and addons. Scheduled tasks pause, but `miren app run` still works for a backup or migration while the app is off.
+
+To take traffic down while the app keeps running, use [maintenance mode](./maintenance-mode.md) instead.
 
 Unlike an autoscaled service that has scaled to zero, a disabled app doesn't wake on traffic. `miren app list` shows it as `disabled`, and `miren app status` shows when and why.
 

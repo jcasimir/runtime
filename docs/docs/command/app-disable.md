@@ -8,12 +8,16 @@ description: "Hold every service of an app at zero instances"
 
 Hold every service of an app at zero instances
 
-Disable turns an app off. Every service is held at zero instances: running sandboxes shut down, nothing boots on a deploy, and HTTP requests get a 503. The app keeps its versions, routes, environment, disks, and addons, so `miren app enable` brings it back as it was.
+Disable turns an app off. Every service is held at zero instances: running sandboxes shut down, nothing boots on a deploy, scheduled tasks pause, and visitors get a 503 holding page. The app keeps its versions, routes, environment, disks, and addons, so `miren app enable` brings it back as it was.
 
 Disabled is an explicit state, so `miren app list` and `miren app status` report it as such rather than as an app that failed to start.
 
-:::note[Tasks still run]
-Disable stops services, not tasks. `miren app run` and scheduled tasks keep working, which leaves room for a backup or a migration while the app is off.
+:::note[Manual tasks still run]
+`miren app run` keeps working, which leaves room for a backup or a migration while the app is off. Scheduled tasks don't fire while the app is disabled, and enabling it resumes the schedule from that moment without running the ticks it missed.
+:::
+
+:::tip[Taking only traffic down?]
+To show visitors a holding page while the app keeps running, for a migration for example, put its routes into maintenance with `miren route down` instead.
 :::
 
 ## Usage
