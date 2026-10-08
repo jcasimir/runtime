@@ -682,7 +682,7 @@ func (h *Server) serveHTTPWithMetrics(w http.ResponseWriter, req *http.Request, 
 		// A wildcard route also serves as a multi-tenant subdomain, so a failed
 		// ephemeral lookup should fall back to the active version rather than 404.
 		wildcardRoute := route != nil && ingress.IsWildcardHost(route.Host)
-		resolved, ok := h.resolveIngressTarget(w, r, targetAppId, ephemeralLabel, wildcardRoute)
+		resolved, ok := h.resolveIngressTarget(w, r, targetAppId, ephemeralLabel, wildcardRoute, appName)
 		if !ok {
 			return nil
 		}
@@ -717,7 +717,10 @@ type cachedVersionConfig struct {
 	config  core_v1alpha.ConfigSpec
 }
 
-func (h *Server) resolveIngressTarget(w http.ResponseWriter, req *http.Request, appID entity.Id, ephemeralLabel string, wildcardRoute bool) (*resolvedIngressTarget, bool) {
+// resolveIngressTarget reads the app and the version a request should reach,
+// answering the request itself when there's nothing to reach. appName, when
+// non-nil, is filled in for metrics if the request ends here.
+func (h *Server) resolveIngressTarget(w http.ResponseWriter, req *http.Request, appID entity.Id, ephemeralLabel string, wildcardRoute bool, appName *string) (*resolvedIngressTarget, bool) {
 	ctx := req.Context()
 	gr, err := h.eac.Get(ctx, appID.String())
 	if err != nil {
@@ -729,6 +732,17 @@ func (h *Server) resolveIngressTarget(w http.ResponseWriter, req *http.Request, 
 	target := &resolvedIngressTarget{ephemeralLabel: ephemeralLabel}
 	target.app.Decode(gr.Entity().Entity())
 	target.appMetadata.Decode(gr.Entity().Entity())
+
+	// A disabled app answers with its holding page before auth, for the same
+	// reason maintenance does, and before the lease cache, so a warm app stops
+	// serving the moment it's disabled rather than when its sandboxes exit.
+	if !target.app.DisabledAt.IsZero() {
+		if appName != nil && *appName == "" {
+			*appName = target.appMetadata.Name
+		}
+		h.serveDisabled(w, req, &target.app)
+		return nil, false
+	}
 
 	strategy := resolveVersionStrategy(ephemeralLabel, wildcardRoute)
 	if strategy != resolveActive {
@@ -1424,6 +1438,12 @@ func (h *Server) DoRequest(ctx context.Context, req *httpingress_v1alpha.Interna
 
 	var appEntity core_v1alpha.App
 	appEntity.Decode(gr.Entity().Entity())
+
+	// Checked before the lease cache, as on the HTTP path.
+	if !appEntity.DisabledAt.IsZero() {
+		resp.SetError("app is disabled")
+		return resp, nil
+	}
 
 	if appEntity.ActiveVersion == "" {
 		resp.SetError("no active version for app")
