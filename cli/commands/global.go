@@ -127,6 +127,7 @@ func setup(ctx context.Context, flags *GlobalFlags, opts any, commandName string
 	}); ok {
 		cfg, err := lc.LoadConfig()
 		if cfg != nil {
+			cfg.SetLogger(s.Log)
 			s.ClientConfig = cfg
 		} else if err != nil && !errors.Is(err, clientconfig.ErrNoConfig) {
 			s.Log.Warn("Failed to load client config", "error", err)

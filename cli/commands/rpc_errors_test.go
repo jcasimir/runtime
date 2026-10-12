@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -360,5 +361,29 @@ func TestUnusableClusterErrorShowsItsCause(t *testing.T) {
 	}
 	if !strings.Contains(d.Summary, "prod") {
 		t.Errorf("Summary = %q, want it to name the cluster", d.Summary)
+	}
+}
+
+// A rate-limited sign-in is not an expired one. Pointing at `miren login`
+// would just spend another attempt against the same limit.
+func TestUnusableClusterErrorRateLimited(t *testing.T) {
+	c := &Context{ClusterName: "prod"}
+	rl := &clientconfig.CloudRateLimitError{RetryAt: time.Now().Add(20 * time.Second)}
+	err := c.unusableClusterError("prod", fmt.Errorf("failed to authenticate with cloud: %w", rl))
+
+	d, ok := errors.AsType[*ui.Diagnostic](err)
+	if !ok {
+		t.Fatalf("got %T, want *ui.Diagnostic", err)
+	}
+	for _, a := range d.Actions {
+		if strings.Contains(a.Command, "miren login") {
+			t.Errorf("rate-limit diagnostic suggests %q", a.Command)
+		}
+	}
+	if len(d.Facts) != 1 || d.Facts[0].Label != "Retry in" {
+		t.Errorf("Facts = %+v, want a single Retry in", d.Facts)
+	}
+	if !errors.Is(err, rl) {
+		t.Error("the rate-limit error should stay reachable via errors.Is")
 	}
 }

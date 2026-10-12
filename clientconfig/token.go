@@ -177,7 +177,7 @@ func (c *Config) TokenForIdentity(ctx context.Context, name string, identity *Id
 		if authServer == "" {
 			authServer = fallbackHost
 		}
-		return AuthenticateWithKey(ctx, authServer, keyPair)
+		return AuthenticateWithKey(ctx, c.logger(), authServer, keyPair)
 
 	case IdentityToken:
 		return c.tokenForTokenIdentity(ctx, name, identity, fallbackHost)
