@@ -257,19 +257,20 @@ config :hello, shared: System.fetch_env!("API_TOKEN")
 func TestElixirClusterNode(t *testing.T) {
 	s := initElixir(t, copyFixture(t, "phoenix"))
 	command := strings.Replace(s.WebCommand(), "exec /app/bin/hopwatch start", "exec env", 1)
-	ip, err := exec.Command("hostname", "-i").Output()
-	require.NoError(t, err)
+	binDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "hostname"),
+		[]byte("#!/bin/sh\n[ \"$1\" = \"-i\" ] || exit 1\nprintf '10.0.0.23\\n'\n"), 0o755))
 	for _, tc := range []struct {
 		name, version, node, distribution, want string
 	}{
-		{"first deploy", "v1", "", "", "hopwatch_v1@" + strings.TrimSpace(string(ip))},
-		{"next deploy", "v2", "", "", "hopwatch_v2@" + strings.TrimSpace(string(ip))},
+		{"first deploy", "v1", "", "", "hopwatch_v1@10.0.0.23"},
+		{"next deploy", "v2", "", "", "hopwatch_v2@10.0.0.23"},
 		{"custom clustering", "", "custom@10.0.0.7", "sname", "custom@10.0.0.7"},
 		{"missing version", "", "", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command("sh", "-c", command)
-			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "MIREN_RUNTIME_VERSION=" + tc.version,
+			cmd.Env = []string{"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"), "MIREN_RUNTIME_VERSION=" + tc.version,
 				"RELEASE_NODE=" + tc.node, "RELEASE_DISTRIBUTION=" + tc.distribution}
 			out, err := cmd.CombinedOutput()
 			if tc.want == "" {
