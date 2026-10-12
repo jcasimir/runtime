@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"miren.dev/runtime/appconfig"
 	"miren.dev/runtime/pkg/tarx"
 )
 
@@ -71,7 +73,7 @@ func TestElixirDetect(t *testing.T) {
 		assert.Equal(t, "hopwatch", s.releaseName)
 		assert.True(t, s.hasPhoenix)
 		assert.Equal(t, []string{"."}, s.assetDeployDirs)
-		assert.Equal(t, `RELEASE_DISTRIBUTION=${RELEASE_DISTRIBUTION:-name} RELEASE_NODE=${RELEASE_NODE:-hopwatch@$(hostname -i)} exec /app/bin/hopwatch start`, s.WebCommand())
+		assert.Equal(t, `RELEASE_DISTRIBUTION=${RELEASE_DISTRIBUTION:-name} RELEASE_NODE=${RELEASE_NODE:-hopwatch_${MIREN_RUNTIME_VERSION:?}@$(hostname -i)} exec /app/bin/hopwatch start`, s.WebCommand())
 	})
 
 	t.Run("no mix.exs", func(t *testing.T) {
@@ -181,8 +183,7 @@ func TestElixirEnvVars(t *testing.T) {
 		assert.True(t, vars["SECRET_KEY_BASE"].CanGenerate)
 		assert.Equal(t, "required", vars["PHX_HOST"].Confidence)
 		assert.Equal(t, "web.app.miren", vars["DNS_CLUSTER_QUERY"].DefaultValue)
-		assert.True(t, vars["RELEASE_COOKIE"].CanGenerate)
-		assert.Equal(t, "required", vars["RELEASE_COOKIE"].Confidence)
+		assert.NotContains(t, vars, "RELEASE_COOKIE")
 		// postgrex is in the lock, and runtime.exs raises without it.
 		assert.Equal(t, "required", vars["DATABASE_URL"].Confidence)
 		assert.Equal(t, "optional", vars["POOL_SIZE"].Confidence)
@@ -217,6 +218,18 @@ func TestElixirEnvVars(t *testing.T) {
 		assert.Equal(t, "/app/bin/hopwatch start", s.WebCommand())
 	})
 
+	t.Run("explicit cookie reads are still reported", func(t *testing.T) {
+		dir := copyFixture(t, "phoenix")
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "config", "prod.exs"),
+			[]byte(`import Config
+config :hopwatch, cookie: System.fetch_env!("RELEASE_COOKIE")
+`), 0o644))
+		vars := envByName(initElixir(t, dir).RequiredEnvVars())
+		assert.Equal(t, "required", vars["RELEASE_COOKIE"].Confidence)
+		assert.Equal(t, "code", vars["RELEASE_COOKIE"].Source)
+		assert.False(t, vars["RELEASE_COOKIE"].CanGenerate)
+	})
+
 	t.Run("dev-only config is ignored", func(t *testing.T) {
 		dir := copyFixture(t, "elixir")
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "config", "dev.exs"),
@@ -239,6 +252,58 @@ config :hello, shared: System.fetch_env!("API_TOKEN")
 		vars := envByName(initElixir(t, dir).RequiredEnvVars())
 		assert.NotContains(t, vars, "FROM_DEPS")
 	})
+}
+
+func TestElixirClusterNode(t *testing.T) {
+	s := initElixir(t, copyFixture(t, "phoenix"))
+	command := strings.Replace(s.WebCommand(), "exec /app/bin/hopwatch start", "exec env", 1)
+	ip, err := exec.Command("hostname", "-i").Output()
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, version, node, distribution, want string
+	}{
+		{"first deploy", "v1", "", "", "hopwatch_v1@" + strings.TrimSpace(string(ip))},
+		{"next deploy", "v2", "", "", "hopwatch_v2@" + strings.TrimSpace(string(ip))},
+		{"custom clustering", "", "custom@10.0.0.7", "sname", "custom@10.0.0.7"},
+		{"missing version", "", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-c", command)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "MIREN_RUNTIME_VERSION=" + tc.version,
+				"RELEASE_NODE=" + tc.node, "RELEASE_DISTRIBUTION=" + tc.distribution}
+			out, err := cmd.CombinedOutput()
+			if tc.want == "" {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err, string(out))
+			assert.Contains(t, strings.Split(string(out), "\n"), "RELEASE_NODE="+tc.want)
+			distribution := tc.distribution
+			if distribution == "" {
+				distribution = "name"
+			}
+			assert.Contains(t, strings.Split(string(out), "\n"), "RELEASE_DISTRIBUTION="+distribution)
+		})
+	}
+}
+
+func TestElixirDefaultTasks(t *testing.T) {
+	for _, fixture := range []string{"phoenix", "elixir"} {
+		t.Run(fixture, func(t *testing.T) {
+			dir := copyFixture(t, fixture)
+			assert.Empty(t, initElixir(t, dir).DefaultTasks())
+			require.NoError(t, os.MkdirAll(filepath.Join(dir, "rel/overlays/bin"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "rel/overlays/bin/migrate"), []byte("#!/bin/sh\n"), 0o755))
+			tasks := initElixir(t, dir).DefaultTasks()
+			if fixture == "elixir" {
+				assert.Empty(t, tasks)
+				return
+			}
+			require.Len(t, tasks, 1)
+			assert.Equal(t, "/app/bin/migrate", tasks["migrate"].Command)
+			assert.Equal(t, appconfig.TriggerDeploy, tasks["migrate"].Trigger)
+		})
+	}
 }
 
 func TestElixir(t *testing.T) {
