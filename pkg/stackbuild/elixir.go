@@ -373,6 +373,12 @@ func (s *ElixirStack) DefaultTasks() map[string]*appconfig.TaskConfig {
 	if !s.hasPhoenix || !s.hasFile("rel/overlays/bin/migrate") {
 		return nil
 	}
+	// Runs cannot mount service disks, so a SQLite migration would fail or
+	// modify a throwaway database instead of the service's database.
+	lock, _ := s.readFile("mix.lock")
+	if s.hasLockedDep("ecto_sqlite3", lock) {
+		return nil
+	}
 	return map[string]*appconfig.TaskConfig{
 		"migrate": {Command: "/app/bin/migrate", Trigger: appconfig.TriggerDeploy},
 	}

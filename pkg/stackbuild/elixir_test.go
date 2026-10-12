@@ -288,14 +288,29 @@ func TestElixirClusterNode(t *testing.T) {
 }
 
 func TestElixirDefaultTasks(t *testing.T) {
-	for _, fixture := range []string{"phoenix", "elixir"} {
-		t.Run(fixture, func(t *testing.T) {
-			dir := copyFixture(t, fixture)
+	for _, tc := range []struct {
+		name    string
+		fixture string
+		sqlite  bool
+	}{
+		{name: "phoenix", fixture: "phoenix"},
+		{name: "elixir", fixture: "elixir"},
+		{name: "sqlite", fixture: "phoenix", sqlite: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := copyFixture(t, tc.fixture)
+			if tc.sqlite {
+				lockPath := filepath.Join(dir, "mix.lock")
+				lock, err := os.ReadFile(lockPath)
+				require.NoError(t, err)
+				withSQLite := strings.Replace(string(lock), "%{", `%{"ecto_sqlite3": {:hex, :ecto_sqlite3, "0.22.0", "checksum", [:mix], [], "hexpm", "checksum"},`, 1)
+				require.NoError(t, os.WriteFile(lockPath, []byte(withSQLite), 0o644))
+			}
 			assert.Empty(t, initElixir(t, dir).DefaultTasks())
 			require.NoError(t, os.MkdirAll(filepath.Join(dir, "rel/overlays/bin"), 0o755))
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "rel/overlays/bin/migrate"), []byte("#!/bin/sh\n"), 0o755))
 			tasks := initElixir(t, dir).DefaultTasks()
-			if fixture == "elixir" {
+			if tc.fixture == "elixir" || tc.sqlite {
 				assert.Empty(t, tasks)
 				return
 			}
