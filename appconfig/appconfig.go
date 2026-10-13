@@ -3,6 +3,7 @@ package appconfig
 import (
 	"bytes"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -623,7 +624,10 @@ func (ac *AppConfig) Validate() error {
 
 		if hc := svcConfig.HealthCheck; hc != nil {
 			hcPath := svcPrefix + ".health_check"
-			if !strings.HasPrefix(hc.Path, "/") || strings.ContainsAny(hc.Path, "#") {
+			// A path on the instance itself: no host (//other.example), no
+			// fragment, nothing a request line can't carry.
+			if _, err := url.ParseRequestURI(hc.Path); err != nil || !strings.HasPrefix(hc.Path, "/") ||
+				strings.HasPrefix(hc.Path, "//") || strings.ContainsAny(hc.Path, "# \t") {
 				return &ValidationError{
 					KeyPath: hcPath + ".path",
 					Message: fmt.Sprintf("service %s: health_check path must be an absolute URL path, such as \"/up\"", serviceName),

@@ -1768,6 +1768,20 @@ func TestServiceHealthCheckValidation(t *testing.T) {
 			wantErr: "health_check path must be an absolute URL path",
 		},
 		{
+			name:    "path may carry a query",
+			service: "[services.web]\n[services.web.health_check]\npath = \"/up?deep=1\"\n",
+		},
+		{
+			name:    "path can't hold a space",
+			service: "[services.web]\n[services.web.health_check]\npath = \"/up now\"\n",
+			wantErr: "health_check path must be an absolute URL path",
+		},
+		{
+			name:    "path can't name another host",
+			service: "[services.web]\n[services.web.health_check]\npath = \"//evil.example/up\"\n",
+			wantErr: "health_check path must be an absolute URL path",
+		},
+		{
 			name:    "path is required",
 			service: "[services.web]\n[services.web.health_check]\ntimeout = \"30s\"\n",
 			wantErr: "health_check path must be an absolute URL path",

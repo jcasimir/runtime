@@ -77,6 +77,8 @@ func resolveHealthCheckTimeout(spec string) time.Duration {
 type waitHealthyIn struct {
 	SandboxID     string         `json:"sandbox_id" saga:"sandbox_id"`
 	Addresses     []string       `json:"addresses" saga:"addresses"`
+	WaitPortIDs   []string       `json:"wait_port_ids" saga:"wait_port_ids"`
+	WaitPortPorts []int          `json:"wait_port_ports" saga:"wait_port_ports"`
 	ObservedPorts []observedPort `json:"observed_ports" saga:"observed_ports"`
 	PortsReady    saga.Edge      `saga:"ports_ready"`
 }
@@ -111,6 +113,12 @@ func waitHealthy(ctx context.Context, in waitHealthyIn) (waitHealthyOut, error) 
 
 	var last string
 	for {
+		if exitErr := containerExited(checkCtx, deps, in.WaitPortIDs, in.WaitPortPorts); exitErr != nil {
+			msg := fmt.Sprintf("app exited during its health check (GET %s)", path)
+			deps.logSandboxEvent(ctx, in.SandboxID, msg)
+			return waitHealthyOut{}, cond.Workload(fmt.Errorf("%s: %w", msg, exitErr))
+		}
+
 		status, err := healthCheckGet(checkCtx, url)
 		switch {
 		case err == nil && status >= 200 && status < 400:
@@ -140,6 +148,22 @@ func waitHealthy(ctx context.Context, in waitHealthyIn) (waitHealthyOut, error) 
 	msg := fmt.Sprintf("health check GET %s did not pass within %s (last attempt: %s)", path, timeout, last)
 	deps.logSandboxEvent(ctx, in.SandboxID, msg)
 	return waitHealthyOut{}, cond.Workload(errors.New(msg))
+}
+
+// containerExited returns errProcessExited's error if a container wait-ports
+// waited on has since exited, so a crash fails the check now rather than at
+// its timeout. WaitForPort reports exit before it looks at ports, and with a
+// port that already bound it returns at once.
+func containerExited(ctx context.Context, deps *createSandboxDeps, ids []string, ports []int) error {
+	for i := range ids {
+		if i >= len(ports) {
+			break
+		}
+		if err := deps.runtime.WaitForPort(ctx, ids[i], ports[i], 10*time.Millisecond); errors.Is(err, errProcessExited) {
+			return err
+		}
+	}
+	return nil
 }
 
 // healthCheckURL returns the URL to check: the address and port the activator

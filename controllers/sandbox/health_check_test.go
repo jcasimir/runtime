@@ -196,3 +196,24 @@ func indexOf(order []string, action string) int {
 	}
 	return -1
 }
+
+func TestCreateSandboxSaga_HealthCheckFailsFastWhenAppExits(t *testing.T) {
+	stubHealthCheck(t, healthAnswer{err: fmt.Errorf("connection refused")})
+	h := newTestHarness(t)
+	withHealthCheck(h, "/up", "30s")
+	// wait-ports sees the port bind (call 1); the app then exits.
+	h.runtime.waitForPortFn = func(call int) error {
+		if call == 1 {
+			return nil
+		}
+		return errProcessExited
+	}
+
+	start := time.Now()
+	err := h.execute(t)
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second, "an exit must not wait out the 30s timeout")
+	assert.True(t, cond.IsWorkload(err))
+	require.Len(t, h.obs.loggedEvents, 1)
+	assert.Contains(t, h.obs.loggedEvents[0], "app exited during its health check")
+}
