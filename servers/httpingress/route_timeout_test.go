@@ -1,9 +1,14 @@
 package httpingress
 
 import (
+	"errors"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,4 +96,100 @@ func TestTransportForAppliesOverrideTimeout(t *testing.T) {
 	require.Error(t, err, "the override timeout should have cut the request short")
 	require.Less(t, elapsed, 5*time.Second,
 		"request should have timed out on the override, not the 30s default")
+}
+
+func TestProxyTransportReusedConnectionGetsFreshTimeout(t *testing.T) {
+	const timeout = 500 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err != nil || string(body) != "payload" {
+				http.Error(w, "invalid body", http.StatusBadRequest)
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+	transport := newProxyTransport(timeout).(*http.Transport)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+
+	resp, err := client.Get(backend.URL)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+	require.NoError(t, err)
+
+	// The next response fits the full budget, but not the old budget's remainder.
+	time.Sleep(400 * time.Millisecond)
+	req, err := http.NewRequest(http.MethodPost, backend.URL, strings.NewReader("payload"))
+	require.NoError(t, err)
+	var reused bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+	}))
+	start := time.Now()
+	resp, err = client.Do(req)
+	t.Logf("reused=%v, POST elapsed=%s, error=%v", reused, time.Since(start), err)
+	require.True(t, reused, "the regression requires a warmed persistent connection")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "ok", string(body))
+}
+
+func TestProxyTransportResponseTimeouts(t *testing.T) {
+	for _, mode := range []string{"silent headers", "stalled body", "active stream"} {
+		t.Run(mode, func(t *testing.T) {
+			const timeout = 400 * time.Millisecond
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if mode == "silent headers" {
+					<-r.Context().Done()
+					return
+				}
+				_, _ = io.WriteString(w, "start\n")
+				w.(http.Flusher).Flush()
+				if mode == "stalled body" {
+					<-r.Context().Done()
+					return
+				}
+				for range 4 {
+					time.Sleep(150 * time.Millisecond)
+					_, _ = io.WriteString(w, "chunk\n")
+					w.(http.Flusher).Flush()
+				}
+			}))
+			defer backend.Close()
+			transport := newProxyTransport(timeout).(*http.Transport)
+			defer transport.CloseIdleConnections()
+			client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+			start := time.Now()
+			resp, err := client.Get(backend.URL)
+			if mode != "silent headers" {
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				var body []byte
+				body, err = io.ReadAll(resp.Body)
+				if mode == "active stream" {
+					require.NoError(t, err)
+					require.Equal(t, "start\n"+strings.Repeat("chunk\n", 4), string(body))
+					require.Greater(t, time.Since(start), timeout,
+						"streaming must not have a total-duration cutoff")
+					return
+				}
+				require.Equal(t, "start\n", string(body))
+			}
+			var netErr net.Error
+			require.True(t, errors.As(err, &netErr), "expected network timeout, got %v", err)
+			require.True(t, netErr.Timeout())
+			require.GreaterOrEqual(t, time.Since(start), timeout/2,
+				"must not time out prematurely")
+			require.Less(t, time.Since(start), 3*timeout,
+				"must be the ingress timeout, not the client's 5s safety limit")
+		})
+	}
 }
