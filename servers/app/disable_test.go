@@ -90,6 +90,7 @@ func TestAppDisableEnable(t *testing.T) {
 	app := getApp()
 	assert.False(t, app.DisabledAt.IsZero())
 	assert.Equal(t, "moved to the new box", app.DisabledReason)
+	disabledAt := app.DisabledAt
 
 	src, err := appInfo.collectAppHealth(ctx)
 	require.NoError(t, err)
@@ -110,6 +111,8 @@ func TestAppDisableEnable(t *testing.T) {
 	app = getApp()
 	assert.True(t, app.DisabledAt.IsZero())
 	assert.Empty(t, app.DisabledReason)
+	assert.True(t, app.LastDisabledAt.Equal(disabledAt), "enable keeps the window it closed, for the run scheduler")
+	assert.False(t, app.LastEnabledAt.Before(disabledAt))
 }
 
 // An app can be disabled before it's ever deployed. Status has to say so

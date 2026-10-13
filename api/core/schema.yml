@@ -116,6 +116,19 @@ kinds:
       type: string
       doc: Why the app was disabled, as given to `miren app disable`
 
+    last_disabled_at:
+      type: time
+      doc: >-
+        Start of the most recent disabled period that has ended, copied from
+        disabled_at by `miren app enable`. With last_enabled_at it lets the
+        run scheduler skip ticks that fell inside a disable it never saw.
+
+    last_enabled_at:
+      type: time
+      doc: >-
+        When `miren app enable` last ended a disabled period. See
+        last_disabled_at.
+
     workload_role:
       type: string
       doc: >-

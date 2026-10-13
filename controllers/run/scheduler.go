@@ -254,8 +254,10 @@ func (s *Scheduler) sweepTask(
 	// it first would drop any tick whose fire failed -- permanently, since the
 	// frontier is what decides a tick is behind us.
 	for _, tick := range fired {
-		if err := s.fire(ctx, app, ver, appName, task, tick); err != nil {
-			return err
+		if !disabledAt(app, tick) {
+			if err := s.fire(ctx, app, ver, appName, task, tick); err != nil {
+				return err
+			}
 		}
 
 		s.mu.Lock()
@@ -264,6 +266,17 @@ func (s *Scheduler) sweepTask(
 	}
 
 	return nil
+}
+
+// disabledAt reports whether the app was disabled at tick, by its most
+// recently ended disabled period. A disable the scheduler sees while it's in
+// effect resets the frontier instead (see Sweep); this catches the one that
+// started and ended between two sweeps.
+func disabledAt(app *core_v1alpha.App, tick time.Time) bool {
+	if app.LastDisabledAt.IsZero() || app.LastEnabledAt.IsZero() {
+		return false
+	}
+	return !tick.Before(app.LastDisabledAt) && tick.Before(app.LastEnabledAt)
 }
 
 // fireTick creates the run for one tick, or records that it was skipped.

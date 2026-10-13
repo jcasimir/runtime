@@ -260,6 +260,34 @@ func TestSchedulerPausesWhileTheAppIsDisabled(t *testing.T) {
 	assert.Equal(t, "2026-08-04T14:30:00Z", runs[0].Tick)
 }
 
+// A disable and enable can both land between two sweeps, so no sweep ever
+// sees the flag set. The window enable records still keeps the scheduler from
+// firing a tick that came due while the app was off, while a tick that came
+// due before the disable fires as usual.
+func TestSchedulerSkipsTicksFromADisableItNeverSaw(t *testing.T) {
+	ctx := context.Background()
+	h := newSchedHarness(t, "*-*-* *:*:00")
+	appID := entity.Id("app/demo")
+
+	require.NoError(t, h.s.Sweep(ctx, atUTC("2026-08-04T11:59:30Z")))
+
+	// Disabled at 12:00:30 and enabled at 12:01:20, both before the next sweep.
+	_, err := h.inm.EAC.Patch(ctx, entity.New(
+		entity.Ref(entity.DBId, appID),
+		entity.Time(core_v1alpha.AppLastDisabledAtId, atUTC("2026-08-04T12:00:30Z")),
+		entity.Time(core_v1alpha.AppLastEnabledAtId, atUTC("2026-08-04T12:01:20Z")),
+	).Attrs(), 0)
+	require.NoError(t, err)
+
+	require.NoError(t, h.s.Sweep(ctx, atUTC("2026-08-04T12:01:30Z")))
+	runs := h.runs(ctx)
+	require.Len(t, runs, 1, "12:00 came due before the disable; 12:01 came due while disabled")
+	assert.Equal(t, "2026-08-04T12:00:00Z", runs[0].Tick)
+
+	require.NoError(t, h.s.Sweep(ctx, atUTC("2026-08-04T12:02:01Z")))
+	assert.Len(t, h.runs(ctx), 2, "the schedule carries on after the window")
+}
+
 // Manual and deploy tasks are not on a schedule and must never be fired by it.
 func TestSchedulerIgnoresUnscheduledTasks(t *testing.T) {
 	ctx := context.Background()

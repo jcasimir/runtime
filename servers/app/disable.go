@@ -92,9 +92,15 @@ func (r *AppInfo) Enable(ctx context.Context, state *app_v1alpha.CrudEnable) err
 		return fmt.Errorf("app %q is not disabled", name)
 	}
 
+	// Keep the window being closed. The run scheduler only samples the flag
+	// between sweeps, so a disable and enable that both land between two
+	// sweeps would otherwise leave no trace, and a tick due in between would
+	// fire as if the app had never been off.
 	if err := r.EC.Patch(ctx, appRec.ID, 0,
 		entity.Time(core_v1alpha.AppDisabledAtId, time.Time{}),
 		entity.String(core_v1alpha.AppDisabledReasonId, ""),
+		entity.Time(core_v1alpha.AppLastDisabledAtId, appRec.DisabledAt),
+		entity.Time(core_v1alpha.AppLastEnabledAtId, time.Now()),
 	); err != nil {
 		return fmt.Errorf("enabling app %q: %w", name, err)
 	}
