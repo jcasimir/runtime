@@ -498,20 +498,56 @@ jobs:
         with:
           path: artifacts
 
-      - name: Get OIDC token
-        uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9.0.0
-        id: get-oidc-token
-        with:
-          script: |
-            const token = await core.getIDToken()
-            core.setOutput('token', token)
-
       - name: Upload to Miren API
         run: |
           set -eo pipefail
 
           REF_NAME="${{ needs.init.outputs.ref }}"
-          TOKEN="${{ steps.get-oidc-token.outputs.token }}"
+
+          # Every attempt mints its own OIDC token. One token minted up front
+          # expires partway through a slow run's retries, and from then on every
+          # retry fails 401 however healthy the API is.
+          mint_token() {
+            local token
+            token=$(curl -sSf --retry 3 \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -r '.value')
+            [[ -n "$token" && "$token" != null ]] || return 1
+            printf '%s' "$token"
+          }
+
+          # PUT one file, retrying transient failures. 401 (stale token), 408 and
+          # 429 are worth another attempt; any other 4xx means the request itself
+          # is wrong, and repeating it only burns time.
+          put_asset() {
+            local file="$1" url="$2" body status token attempt
+            body=$(mktemp)
+            for attempt in 1 2 3 4; do
+              status=000
+              if token=$(mint_token); then
+                echo "::add-mask::${token}"
+                status=$(curl -sS --connect-timeout 10 --max-time 180 -X PUT \
+                  -H "Authorization: Bearer ${token}" \
+                  -F "file=@${file}" \
+                  -o "$body" -w '%{http_code}' \
+                  "$url") || status=000
+              else
+                echo "could not mint an OIDC token" > "$body"
+              fi
+              if [[ "$status" == 2?? ]]; then
+                cat "$body"; echo
+                rm -f "$body"
+                return 0
+              fi
+              echo "PUT ${url} attempt ${attempt} failed: HTTP ${status} $(head -c 200 "$body")"
+              if [[ "$status" == 4?? && ! "$status" =~ ^(401|408|429)$ ]]; then
+                break
+              fi
+              (( attempt < 4 )) && sleep $((2 ** attempt))
+            done
+            rm -f "$body"
+            return 1
+          }
 
           # Determine if this is a tag build
           IS_TAG_BUILD=false
@@ -670,11 +706,7 @@ jobs:
           upload_one() {
             local file="$1" url="$2"
             echo "Uploading ${file} -> ${url}"
-            curl --fail-with-body --retry 3 --retry-all-errors \
-              --connect-timeout 10 --max-time 180 -X PUT \
-              -H "Authorization: Bearer ${TOKEN}" \
-              -F "file=@${file}" \
-              "${url}"
+            put_asset "$file" "$url"
           }
 
           MAX_PARALLEL=4
@@ -714,11 +746,7 @@ jobs:
 
           for path in "${paths[@]}"; do
             echo "Uploading version.json to $path..."
-            curl --fail-with-body --retry 3 --retry-all-errors \
-              --connect-timeout 10 --max-time 180 -X PUT \
-              -H "Authorization: Bearer ${TOKEN}" \
-              -F "file=@version.json" \
-              "https://api.miren.cloud/assets/release/miren/${path}/version.json"
+            put_asset version.json "https://api.miren.cloud/assets/release/miren/${path}/version.json"
           done
 
   update-homebrew-tap:
