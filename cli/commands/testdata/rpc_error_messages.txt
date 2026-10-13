@@ -151,6 +151,15 @@ ERROR: can't connect using the configuration for cluster "homelab"
 
   Cause: cluster has a client certificate but no client key
 
+# the cloud is rate-limiting sign-ins
+
+ERROR: too many sign-ins to reach cluster "homelab"
+
+  The cloud is rate-limiting sign-ins from this address. Your credentials are
+  fine, so signing in again won't help; waiting will.
+
+  Retry in  23s
+
 # clusters are configured but none is active
 
 ERROR: no active cluster

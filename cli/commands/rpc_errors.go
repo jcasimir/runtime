@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"miren.dev/runtime/clientconfig"
 	"miren.dev/runtime/pkg/rpc"
 	"miren.dev/runtime/pkg/ui"
 )
@@ -102,6 +103,25 @@ func (c *Context) noActiveClusterError() error {
 	return d
 }
 
+// cloudRateLimitError reports that the cloud turned away our sign-in for
+// making too many of them. The credentials are fine, so the one thing this
+// must not do is send the user to `miren login`, which is just another
+// sign-in for the limiter to refuse.
+func (c *Context) cloudRateLimitError(name string, rl *clientconfig.CloudRateLimitError, now time.Time) error {
+	d := &ui.Diagnostic{
+		Summary: fmt.Sprintf("too many sign-ins to reach %s", clusterLabel(name)),
+		Detail: "The cloud is rate-limiting sign-ins from this address. Your " +
+			"credentials are fine, so signing in again won't help; waiting will.",
+		Cause: rl,
+	}
+
+	if wait := rl.RetryIn(now); wait > 0 {
+		d.Facts = []ui.Fact{{Label: "Retry in", Value: wait.String()}}
+	}
+
+	return d
+}
+
 // unusableClusterError reports that the named cluster's configuration can't be
 // turned into a connection.
 //
@@ -109,6 +129,10 @@ func (c *Context) noActiveClusterError() error {
 // clientconfig.yaml and clientconfig.d/*.yaml, and "which file is this cluster
 // even defined in" is the first thing you need in order to fix it.
 func (c *Context) unusableClusterError(name string, err error) error {
+	if rl, ok := errors.AsType[*clientconfig.CloudRateLimitError](err); ok {
+		return c.cloudRateLimitError(name, rl, time.Now())
+	}
+
 	d := &ui.Diagnostic{
 		Summary: fmt.Sprintf("can't connect using the configuration for %s", clusterLabel(name)),
 		Detail:  "The cluster is configured, but we couldn't turn its entry into a connection.",

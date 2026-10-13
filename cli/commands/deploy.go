@@ -374,6 +374,7 @@ func runDeploy(ctx *Context, opts deployOpts, summary *deployevents.Result, even
 		if err != nil {
 			return fmt.Errorf("failed to reload config after adding cluster: %w", err)
 		}
+		cfg.SetLogger(ctx.Log)
 		ctx.ClientConfig = cfg
 
 		// Get the active cluster (the one we just added)
