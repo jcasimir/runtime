@@ -466,8 +466,9 @@ jobs:
           # this builds the tag's Dockerfile, so a dispatched rebuild must not
           # write to it. Reading stays on: a rebuild consuming a stale layer is
           # the ordinary cache-trust question every push shares, not something
-          # this path makes worse.
-          cache-to: ${{ needs.init.outputs.cache == 'true' && 'type=gha,mode=max' || '' }}
+          # this path makes worse. ignore-error keeps a cache-service hiccup from
+          # cancelling the image push that runs alongside the export.
+          cache-to: ${{ needs.init.outputs.cache == 'true' && 'type=gha,mode=max,ignore-error=true' || '' }}
 
   upload-to-miren:
     needs: [init, test, package, build-binaries]
@@ -831,7 +832,9 @@ jobs:
             }
 
       - name: Send Slack notification on success
-        if: success() && needs.upload-to-miren.result == 'success'
+        # A step's success() only covers earlier steps in this job, not `needs`,
+        # so it has to rule out a failed sibling job explicitly.
+        if: needs.upload-to-miren.result == 'success' && !contains(needs.*.result, 'failure')
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
