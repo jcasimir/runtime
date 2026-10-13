@@ -122,3 +122,36 @@ func TestNoHealthCheckRetiresPreviousPoolAsBefore(t *testing.T) {
 	assert.Equal(t, int64(0), oldPool.DesiredInstances,
 		"without a health check the previous version is retired after the ready wait, as before")
 }
+
+func TestHealthCheckThirdDeployRetiresEveryHeldPoolOncePassing(t *testing.T) {
+	ctx := context.Background()
+	server, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+
+	app := &core_v1alpha.App{Project: entity.Id("project-1")}
+	appID, err := server.Client.Create(ctx, "test-app", app)
+	require.NoError(t, err)
+	app.ID = appID
+
+	l := newTestLauncher(testutils.TestLogger(t), server.EAC)
+
+	v1 := createCheckedVersion(t, ctx, server, app, "v1", "test:v1", "/up")
+	activate(t, ctx, server, l, app, v1)
+	v2 := createCheckedVersion(t, ctx, server, app, "v2", "test:v2", "/up") // never passes
+	activate(t, ctx, server, l, app, v2)
+	v3 := createCheckedVersion(t, ctx, server, app, "v3", "test:v3", "/up")
+	activate(t, ctx, server, l, app, v3)
+
+	p1, _ := poolForVersion(t, ctx, server, v1.ID)
+	assert.Equal(t, int64(1), p1.DesiredInstances, "v1 still serves while v3 boots")
+
+	p3, e3 := poolForVersion(t, ctx, server, v3.ID)
+	p3.ReadyInstances = 1
+	require.NoError(t, l.updatePool(ctx, &PoolWithEntity{Pool: p3, Entity: *e3}))
+	require.NoError(t, l.Reconcile(ctx, app, nil))
+
+	for _, v := range []*core_v1alpha.AppVersion{v1, v2} {
+		p, _ := poolForVersion(t, ctx, server, v.ID)
+		assert.Equal(t, int64(0), p.DesiredInstances, "%s retired once v3 passed", v.Version)
+	}
+}

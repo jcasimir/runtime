@@ -101,7 +101,7 @@ func TestFallbackLeaseOnlyForHealthCheckedServices(t *testing.T) {
 	f := newFallbackFixture()
 	f.track(f.v1, "", compute_v1alpha.RUNNING)
 	f.track(f.v2, "", compute_v1alpha.PENDING)
-	assert.Nil(t, f.a.fallbackLease(f.v2, "web"),
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")),
 		"without a health check, requests wait for the active version as before")
 
 	// The active version's pool decides: a check added by this deploy counts
@@ -109,18 +109,18 @@ func TestFallbackLeaseOnlyForHealthCheckedServices(t *testing.T) {
 	f = newFallbackFixture()
 	f.track(f.v1, "", compute_v1alpha.RUNNING)
 	f.track(f.v2, "/up", compute_v1alpha.PENDING)
-	assert.NotNil(t, f.a.fallbackLease(f.v2, "web"))
+	assert.NotNil(t, lease(f.a.fallbackLease(f.v2, "web")))
 }
 
 func TestFallbackLeaseBeforeActivePoolIsTracked(t *testing.T) {
 	f := newFallbackFixture()
 	f.track(f.v1, "/up", compute_v1alpha.RUNNING)
-	assert.NotNil(t, f.a.fallbackLease(f.v2, "web"),
+	assert.NotNil(t, lease(f.a.fallbackLease(f.v2, "web")),
 		"a previous pool with a check stands in until the active pool is seen")
 
 	f = newFallbackFixture()
 	f.track(f.v1, "", compute_v1alpha.RUNNING)
-	assert.Nil(t, f.a.fallbackLease(f.v2, "web"))
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")))
 }
 
 func TestFallbackLeaseIgnoresOtherAppsServicesAndPreviews(t *testing.T) {
@@ -128,25 +128,67 @@ func TestFallbackLeaseIgnoresOtherAppsServicesAndPreviews(t *testing.T) {
 	other := &core_v1alpha.AppVersion{ID: "ver/o1", App: "app/other", Version: "o1"}
 	f.track(other, "/up", compute_v1alpha.RUNNING)
 	f.track(f.v2, "/up", compute_v1alpha.PENDING)
-	assert.Nil(t, f.a.fallbackLease(f.v2, "web"), "never serve another app's sandbox")
-	assert.Nil(t, f.a.fallbackLease(f.v2, "worker"), "never serve another service's sandbox")
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")), "never serve another app's sandbox")
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "worker")), "never serve another service's sandbox")
 
 	f = newFallbackFixture()
 	preview := &core_v1alpha.AppVersion{ID: "ver/p1", App: "app/a", Version: "p1", EphemeralLabel: "pr-1"}
 	f.track(preview, "/up", compute_v1alpha.RUNNING)
 	f.track(f.v2, "/up", compute_v1alpha.PENDING)
-	assert.Nil(t, f.a.fallbackLease(f.v2, "web"), "never serve a preview's sandbox as production")
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")), "never serve a preview's sandbox as production")
 
 	f = newFallbackFixture()
 	f.v2.EphemeralLabel = "pr-2"
 	f.track(f.v1, "/up", compute_v1alpha.RUNNING)
 	f.track(f.v2, "/up", compute_v1alpha.PENDING)
-	assert.Nil(t, f.a.fallbackLease(f.v2, "web"), "a preview never falls back to production")
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")), "a preview never falls back to production")
 }
 
 func TestFallbackLeaseSkipsSandboxesThatCannotServe(t *testing.T) {
 	f := newFallbackFixture()
 	f.track(f.v1, "/up", compute_v1alpha.STOPPED, compute_v1alpha.DEAD)
 	f.track(f.v2, "/up", compute_v1alpha.PENDING)
-	assert.Nil(t, f.a.fallbackLease(f.v2, "web"))
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")))
+}
+
+func lease(l *Lease, _ bool) *Lease { return l }
+
+func TestFallbackLeaseNotWhileActiveVersionIsRunning(t *testing.T) {
+	f := newFallbackFixture()
+	f.track(f.v1, "/up", compute_v1alpha.RUNNING)
+	f.track(f.v2, "/up", compute_v1alpha.RUNNING)
+	// v2 passed and is busy: the normal path waits or scales it, rather than
+	// splitting traffic back onto v1.
+	busy := f.a.poolSandboxes["pool/v2"].sandboxes[0].tracker
+	for busy.HasCapacity() {
+		busy.AcquireLease()
+	}
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")))
+}
+
+func TestFallbackLeaseSkipsDiskPools(t *testing.T) {
+	f := newFallbackFixture()
+	f.track(f.v1, "/up", compute_v1alpha.RUNNING)
+	f.track(f.v2, "/up", compute_v1alpha.PENDING)
+	f.a.poolSandboxes["pool/v1"].pool.SandboxSpec.Volume = []compute_v1alpha.SandboxSpecVolume{{Name: "data"}}
+	assert.Nil(t, lease(f.a.fallbackLease(f.v2, "web")), "a disk service's old pool is draining")
+}
+
+func TestFallbackLeaseKicksAnActivePoolAtZero(t *testing.T) {
+	f := newFallbackFixture()
+	f.track(f.v1, "/up", compute_v1alpha.RUNNING)
+	f.track(f.v2, "/up") // no sandboxes, DesiredInstances 0
+
+	l, kick := f.a.fallbackLease(f.v2, "web")
+	require.NotNil(t, l)
+	assert.True(t, kick, "nothing would otherwise start the version the launcher waits on")
+
+	_, kick = f.a.fallbackLease(f.v2, "web")
+	assert.False(t, kick, "one request for capacity per interval, not one per request")
+
+	f = newFallbackFixture()
+	f.track(f.v1, "/up", compute_v1alpha.RUNNING)
+	f.track(f.v2, "/up", compute_v1alpha.PENDING)
+	_, kick = f.a.fallbackLease(f.v2, "web")
+	assert.False(t, kick, "a booting sandbox needs no kick")
 }
