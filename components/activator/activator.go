@@ -300,7 +300,12 @@ func (a *localActivator) AcquireLease(ctx context.Context, ver *core_v1alpha.App
 		// Status changed or capacity was taken between RLock and Lock, fall through to pool request
 	}
 
-	// No available sandboxes with capacity
+	// No available sandboxes with capacity. A health-checked service keeps its
+	// previous version answering until the active one passes its check.
+	if lease := a.fallbackLease(ver, service); lease != nil {
+		return lease, nil
+	}
+
 	if hasPending {
 		// We have PENDING sandboxes booting - wait for them instead of creating more
 		a.log.Info("no running sandboxes available, but pending sandboxes exist - waiting",
@@ -320,6 +325,72 @@ func (a *localActivator) AcquireLease(ctx context.Context, ver *core_v1alpha.App
 		"service", service)
 
 	return a.waitForSandbox(ctx, ver, service, true)
+}
+
+// fallbackLease leases a RUNNING sandbox of another version of the same app
+// and service, for a service with a health check whose active version has no
+// RUNNING sandbox yet. The deployment launcher keeps the previous version's pool
+// up until the active version passes its check, so during a deploy requests go
+// to the old version instead of waiting on, or failing against, the new one.
+// It returns nil when there is nothing to fall back to.
+func (a *localActivator) fallbackLease(ver *core_v1alpha.AppVersion, service string) *Lease {
+	if ver.EphemeralLabel != "" {
+		return nil
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Whether the service has a health check is read from the active version's
+	// pool. Until the activator has seen that pool, a previous version's pool
+	// with a check stands in for it.
+	activeKnown, activeChecked := false, false
+	if st, ok := a.pools[verKey{ver.ID.String(), service}]; ok && st.pool != nil {
+		activeKnown = true
+		activeChecked = st.pool.SandboxSpec.HealthCheckPath != ""
+	}
+	if activeKnown && !activeChecked {
+		return nil
+	}
+
+	for key, ref := range a.versions {
+		if key.service != service || key.ver == ver.ID.String() || ref.ver == nil ||
+			ref.ver.App != ver.App || ref.ver.EphemeralLabel != "" {
+			continue
+		}
+		ps, ok := a.poolSandboxes[ref.poolID]
+		if !ok {
+			continue
+		}
+		if !activeKnown && (ps.pool == nil || ps.pool.SandboxSpec.HealthCheckPath == "") {
+			continue
+		}
+		for _, s := range ps.sandboxes {
+			if s.sandbox.Status != compute_v1alpha.RUNNING || !s.tracker.HasCapacity() || s.url == "" {
+				continue
+			}
+			leaseSize := s.tracker.AcquireLease()
+			s.lastRenewal = time.Now()
+			a.log.Info("active version has no healthy sandbox yet; serving from the previous version",
+				"app", ver.App,
+				"version", ver.Version,
+				"fallback_version", ref.ver.Version,
+				"sandbox", s.sandbox.ID,
+				"service", service)
+			// The lease names the version it came from, so renewing and
+			// releasing it find this pool.
+			return &Lease{
+				ver:     ref.ver,
+				sandbox: s.sandbox,
+				ent:     s.ent,
+				pool:    service,
+				service: service,
+				Size:    leaseSize,
+				URL:     s.url,
+			}
+		}
+	}
+	return nil
 }
 
 var ErrSandboxDiedEarly = fmt.Errorf("sandbox died while booting")
