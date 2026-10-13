@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -108,4 +110,46 @@ func TestAppDisableEnable(t *testing.T) {
 	app = getApp()
 	assert.True(t, app.DisabledAt.IsZero())
 	assert.Empty(t, app.DisabledReason)
+}
+
+// An app can be disabled before it's ever deployed. Status has to say so
+// rather than falling back to unknown for want of an active version, the same
+// way list does.
+func TestAppStatusReportsDisabledWithoutAnActiveVersion(t *testing.T) {
+	ctx := context.Background()
+
+	inmem, cleanup := testutils.NewInMemEntityServer(t)
+	defer cleanup()
+	ec := entityserver.NewClient(slog.Default(), inmem.EAC)
+
+	// AppInfo reads the last hour of CPU and memory; an empty answer is enough.
+	vm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer vm.Close()
+	reader := metrics.NewVictoriaMetricsReader(slog.Default(), vm.URL, 0)
+
+	appInfo := &AppInfo{
+		Log:  slog.Default(),
+		EC:   ec,
+		CPU:  &metrics.CPUUsage{Reader: reader},
+		Mem:  &metrics.MemoryUsage{Reader: reader},
+		HTTP: &metrics.HTTPMetrics{},
+	}
+	crud := &app_v1alpha.CrudClient{Client: rpc.LocalClient(app_v1alpha.AdaptCrud(appInfo))}
+	status := app_v1alpha.NewAppStatusClient(rpc.LocalClient(app_v1alpha.AdaptAppStatus(appInfo)))
+
+	_, err := ec.Create(ctx, "never-deployed", &core_v1alpha.App{})
+	require.NoError(t, err)
+
+	res, err := status.AppInfo(ctx, "never-deployed")
+	require.NoError(t, err)
+	assert.Equal(t, apphealth.Unknown, res.Status().Health(), "an enabled app with no version is unknown")
+
+	_, err = crud.Disable(ctx, "never-deployed", "not needed yet")
+	require.NoError(t, err)
+
+	res, err = status.AppInfo(ctx, "never-deployed")
+	require.NoError(t, err)
+	assert.Equal(t, apphealth.Disabled, res.Status().Health())
 }
