@@ -20,6 +20,7 @@ import (
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/session/secrets/secretsprovider"
+	"miren.dev/runtime/appconfig"
 	"miren.dev/runtime/components/ocireg"
 	"miren.dev/runtime/pkg/containerdx"
 	"miren.dev/runtime/pkg/idgen"
@@ -334,6 +335,7 @@ type BuildResult struct {
 	WorkingDir      string
 	ExposedPorts    []string // OCI port/protocol keys, such as "4000/tcp"
 	DetectionEvents []stackbuild.DetectionEvent
+	DefaultTasks    map[string]*appconfig.TaskConfig
 }
 
 func exposedPortNames(ports map[string]struct{}) []string {
@@ -444,6 +446,7 @@ func (b *Buildkit) buildImage(
 
 		res.Entrypoint = stack.Entrypoint()
 		res.DetectionEvents = stack.Events()
+		res.DefaultTasks = stack.DefaultTasks()
 
 		if wc := stack.WebCommand(); wc != "" {
 			res.Command = wc

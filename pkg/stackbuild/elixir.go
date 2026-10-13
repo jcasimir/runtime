@@ -14,6 +14,7 @@ import (
 
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/imagemetaresolver"
+	"miren.dev/runtime/appconfig"
 	"miren.dev/runtime/pkg/imagerefs"
 )
 
@@ -360,10 +361,27 @@ func (s *ElixirStack) WebCommand() string {
 	if !s.dnsCluster {
 		return "/app/bin/" + s.releaseName + " start"
 	}
-	// DNSCluster discovers peers by IP and constructs release_name@IP. The
-	// release must use the same naming scheme on every replica. Leave explicit
-	// node settings alone for applications with their own clustering setup.
-	return `RELEASE_DISTRIBUTION=${RELEASE_DISTRIBUTION:-name} RELEASE_NODE=${RELEASE_NODE:-` + s.releaseName + `@$(hostname -i)} exec /app/bin/` + s.releaseName + ` start`
+	// DNSCluster constructs peers using our node's basename. Scope it to the
+	// deployed version so old and new replicas cannot join during a rollout.
+	// Leave explicit node settings alone for custom clustering setups.
+	return `RELEASE_DISTRIBUTION=${RELEASE_DISTRIBUTION:-name} RELEASE_NODE=${RELEASE_NODE:-` + s.releaseName + `_${MIREN_RUNTIME_VERSION:?}@$(hostname -i)} exec /app/bin/` + s.releaseName + ` start`
+}
+
+func (s *ElixirStack) DefaultTasks() map[string]*appconfig.TaskConfig {
+	// phx.gen.release creates this overlay only for Ecto apps. Mix copies it
+	// into the release, so no Mix toolchain is needed at runtime.
+	if !s.hasPhoenix || !s.hasFile("rel/overlays/bin/migrate") {
+		return nil
+	}
+	// Runs cannot mount service disks, so a SQLite migration would fail or
+	// modify a throwaway database instead of the service's database.
+	lock, _ := s.readFile("mix.lock")
+	if s.hasLockedDep("ecto_sqlite3", lock) {
+		return nil
+	}
+	return map[string]*appconfig.TaskConfig{
+		"migrate": {Command: "/app/bin/migrate", Trigger: appconfig.TriggerDeploy},
+	}
 }
 
 // RequiredEnvVars returns the detected environment variable requirements
@@ -406,9 +424,6 @@ func (s *ElixirStack) detectEnvVars() []EnvVarRequirement {
 		results = append(results, EnvVarRequirement{
 			Name: "DNS_CLUSTER_QUERY", Source: "dns_cluster", Confidence: "required",
 			DefaultValue: "web.app.miren", Reason: "Discover Miren web replicas by DNS",
-		}, EnvVarRequirement{
-			Name: "RELEASE_COOKIE", Source: "dns_cluster", Confidence: "required",
-			CanGenerate: true, Reason: "Shared Erlang cookie for all replicas",
 		})
 	}
 
