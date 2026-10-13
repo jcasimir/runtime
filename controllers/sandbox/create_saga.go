@@ -714,7 +714,11 @@ func registerCreateSandboxSaga(
 		nodeID:     nodeID,
 	}
 
+	// v2 added wait-healthy. A v1 execution can resume under it: the step's
+	// inputs all come from v1 actions, and one already past set-running just
+	// probes a RUNNING sandbox before update-services, passing or compensating.
 	return saga.Define(sagaCreateSandbox).
+		Version(2).ResumesFrom(1).
 		Using(deps).
 		Using(log).
 		Action(actionAllocNetwork, allocNetwork).Undo(undoAllocNetwork).
