@@ -385,9 +385,17 @@ func (a *localActivator) fallbackLease(ver *core_v1alpha.AppVersion, service str
 		}
 	}
 
+	// The newest version with room serves: when two old versions are both up
+	// (a deploy landed before the launcher retired the one before it), the
+	// newer one is the one that last passed.
+	var best *versionPoolRef
+	var bestSandbox *sandbox
 	for k, ref := range a.versions {
 		if k.service != service || k.ver == key.ver || ref.ver == nil ||
 			ref.ver.App != ver.App || ref.ver.EphemeralLabel != "" {
+			continue
+		}
+		if best != nil && !newerVersion(ref.ver, best.ver) {
 			continue
 		}
 		ps, ok := a.poolSandboxes[ref.poolID]
@@ -402,39 +410,55 @@ func (a *localActivator) fallbackLease(ver *core_v1alpha.AppVersion, service str
 			continue
 		}
 		for _, s := range ps.sandboxes {
-			if s.sandbox.Status != compute_v1alpha.RUNNING || !s.tracker.HasCapacity() || s.url == "" {
-				continue
+			if s.sandbox.Status == compute_v1alpha.RUNNING && s.tracker.HasCapacity() && s.url != "" {
+				best, bestSandbox = ref, s
+				break
 			}
-			leaseSize := s.tracker.AcquireLease()
-			s.lastRenewal = time.Now()
-			a.log.Info("active version has no healthy sandbox yet; serving from the previous version",
-				"app", ver.App,
-				"version", ver.Version,
-				"fallback_version", ref.ver.Version,
-				"sandbox", s.sandbox.ID,
-				"service", service)
-			kick = activePool != nil && activePool.DesiredInstances == 0 && !booting &&
-				time.Since(a.fallbackKicks[key]) > fallbackKickInterval
-			if kick {
-				if a.fallbackKicks == nil {
-					a.fallbackKicks = make(map[verKey]time.Time)
-				}
-				a.fallbackKicks[key] = time.Now()
-			}
-			// The lease names the version it came from, so renewing and
-			// releasing it find this pool.
-			return &Lease{
-				ver:     ref.ver,
-				sandbox: s.sandbox,
-				ent:     s.ent,
-				pool:    service,
-				service: service,
-				Size:    leaseSize,
-				URL:     s.url,
-			}, kick
 		}
 	}
-	return nil, false
+	if bestSandbox == nil {
+		return nil, false
+	}
+
+	s := bestSandbox
+	leaseSize := s.tracker.AcquireLease()
+	s.lastRenewal = time.Now()
+	a.log.Info("active version has no healthy sandbox yet; serving from the previous version",
+		"app", ver.App,
+		"version", ver.Version,
+		"fallback_version", best.ver.Version,
+		"sandbox", s.sandbox.ID,
+		"service", service)
+	kick = activePool != nil && activePool.DesiredInstances == 0 && !booting &&
+		time.Since(a.fallbackKicks[key]) > fallbackKickInterval
+	if kick {
+		if a.fallbackKicks == nil {
+			a.fallbackKicks = make(map[verKey]time.Time)
+		}
+		a.fallbackKicks[key] = time.Now()
+	}
+	// The lease names the version it came from, so renewing and releasing it
+	// find this pool.
+	return &Lease{
+		ver:     best.ver,
+		sandbox: s.sandbox,
+		ent:     s.ent,
+		pool:    service,
+		service: service,
+		Size:    leaseSize,
+		URL:     s.url,
+	}, kick
+}
+
+// newerVersion reports whether a was created after b. Version names are
+// "<app>-v" plus an idgen ID, whose leading bits are a millisecond timestamp
+// and whose base58 alphabet sorts in ASCII order, so a longer name, or a
+// later one of the same length, is newer.
+func newerVersion(a, b *core_v1alpha.AppVersion) bool {
+	if len(a.Version) != len(b.Version) {
+		return len(a.Version) > len(b.Version)
+	}
+	return a.Version > b.Version
 }
 
 // fallbackKickInterval spaces out the capacity requests fallbackLease makes for

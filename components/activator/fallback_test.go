@@ -14,6 +14,7 @@ import (
 	"miren.dev/runtime/api/core/core_v1alpha"
 	"miren.dev/runtime/pkg/concurrency"
 	"miren.dev/runtime/pkg/entity"
+	"miren.dev/runtime/pkg/idgen"
 )
 
 // fallbackFixture is an activator tracking two versions of one app's web
@@ -191,4 +192,41 @@ func TestFallbackLeaseKicksAnActivePoolAtZero(t *testing.T) {
 	f.track(f.v2, "/up", compute_v1alpha.PENDING)
 	_, kick = f.a.fallbackLease(f.v2, "web")
 	assert.False(t, kick, "a booting sandbox needs no kick")
+}
+
+func TestFallbackLeasePrefersTheNewestRunningVersion(t *testing.T) {
+	// v1 and v2 both still up (v3 deployed before the launcher retired v1):
+	// v2 last passed, so it serves. Map order is random, so try repeatedly.
+	for i := 0; i < 50; i++ {
+		f := newFallbackFixture()
+		v3 := &core_v1alpha.AppVersion{ID: "ver/v3", App: "app/a", Version: "v3"}
+		f.track(f.v1, "/up", compute_v1alpha.RUNNING)
+		f.track(f.v2, "/up", compute_v1alpha.RUNNING)
+		f.track(v3, "/up", compute_v1alpha.PENDING)
+
+		l := lease(f.a.fallbackLease(v3, "web"))
+		require.NotNil(t, l)
+		require.Equal(t, f.v2, l.Version())
+	}
+
+	// A newest version with no room leaves the next one to serve.
+	f := newFallbackFixture()
+	v3 := &core_v1alpha.AppVersion{ID: "ver/v3", App: "app/a", Version: "v3"}
+	f.track(f.v1, "/up", compute_v1alpha.RUNNING)
+	f.track(f.v2, "/up", compute_v1alpha.RUNNING)
+	f.track(v3, "/up", compute_v1alpha.PENDING)
+	full := f.a.poolSandboxes["pool/v2"].sandboxes[0].tracker
+	for full.HasCapacity() {
+		full.AcquireLease()
+	}
+	assert.Equal(t, f.v1, lease(f.a.fallbackLease(v3, "web")).Version())
+}
+
+func TestNewerVersionFollowsCreationOrder(t *testing.T) {
+	older := &core_v1alpha.AppVersion{Version: "demo-" + idgen.Gen("v")}
+	time.Sleep(2 * time.Millisecond)
+	newer := &core_v1alpha.AppVersion{Version: "demo-" + idgen.Gen("v")}
+
+	assert.True(t, newerVersion(newer, older))
+	assert.False(t, newerVersion(older, newer))
 }
