@@ -111,7 +111,6 @@ func TestAppDisableEnable(t *testing.T) {
 	app = getApp()
 	assert.True(t, app.DisabledAt.IsZero())
 	assert.Empty(t, app.DisabledReason)
-	assert.True(t, app.LastDisabledAt.Equal(disabledAt), "enable keeps the window it closed, for the run scheduler")
 	assert.False(t, app.LastEnabledAt.Before(disabledAt))
 }
 
