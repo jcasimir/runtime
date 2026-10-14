@@ -47,11 +47,10 @@ import (
 	"miren.dev/runtime/pkg/workloadidentity"
 )
 
-// idleTimeoutConn wraps a net.Conn and sets a read deadline before each
-// Read call. If no data arrives within the idle timeout, the read fails
-// with a timeout error. Each successful read resets the deadline, so
-// active streams (SSE, WebSocket, chunked) are unaffected as long as
-// data keeps flowing.
+// idleTimeoutConn bounds silence between reads while allowing active streams
+// (SSE, WebSocket, chunked) to continue. Writes refresh the read deadline too:
+// the transport can already be blocked in Read while a pooled connection is
+// idle, and a new request must not inherit that read's remaining budget.
 type idleTimeoutConn struct {
 	net.Conn
 	idleTimeout time.Duration
@@ -60,6 +59,11 @@ type idleTimeoutConn struct {
 func (c *idleTimeoutConn) Read(p []byte) (int, error) {
 	c.SetReadDeadline(time.Now().Add(c.idleTimeout))
 	return c.Conn.Read(p)
+}
+
+func (c *idleTimeoutConn) Write(p []byte) (int, error) {
+	c.SetReadDeadline(time.Now().Add(c.idleTimeout))
+	return c.Conn.Write(p)
 }
 
 var httpingressTracer = otel.Tracer("miren.dev/runtime/httpingress")

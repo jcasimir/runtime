@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -113,6 +114,26 @@ type Config struct {
 	// Unsaved leaf configs that need to be written to clientconfig.d/
 	// Map of filename -> ConfigData
 	unsavedLeafConfigs map[string]*ConfigData
+
+	// log receives diagnostics from authenticating with this config. See
+	// SetLogger.
+	log *slog.Logger
+}
+
+// SetLogger sets where diagnostics from authenticating with this config go.
+// Without one they go to slog's default logger, which a CLI process never
+// configures, so anything below Info is lost.
+func (c *Config) SetLogger(log *slog.Logger) {
+	c.log = log
+}
+
+// logger returns the logger set by SetLogger, or slog's default. It is safe
+// to call on a nil Config.
+func (c *Config) logger() *slog.Logger {
+	if c == nil || c.log == nil {
+		return slog.Default()
+	}
+	return c.log
 }
 
 // ConfigData is used for YAML unmarshaling to handle private fields

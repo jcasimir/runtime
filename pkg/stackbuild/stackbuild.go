@@ -16,6 +16,7 @@ import (
 	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/util/system"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	"miren.dev/runtime/appconfig"
 	"miren.dev/runtime/pkg/imagerefs"
 )
 
@@ -85,6 +86,9 @@ type Stack interface {
 
 	// WebCommand returns the default command for the web service in a Procfile
 	WebCommand() string
+
+	// DefaultTasks returns inferred tasks; explicit application tasks take precedence.
+	DefaultTasks() map[string]*appconfig.TaskConfig
 
 	// Events returns detection events collected during Detect() and Init()
 	Events() []DetectionEvent
@@ -175,6 +179,10 @@ func (s *MetaStack) Init(opts BuildOptions) {
 
 // RequiredEnvVars returns nil by default; stacks can override to provide detected env vars
 func (s *MetaStack) RequiredEnvVars() []EnvVarRequirement {
+	return nil
+}
+
+func (s *MetaStack) DefaultTasks() map[string]*appconfig.TaskConfig {
 	return nil
 }
 

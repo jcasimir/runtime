@@ -27,6 +27,37 @@ import (
 	"miren.dev/runtime/pkg/entity/types"
 )
 
+func TestBuildVersionDefaultTasks(t *testing.T) {
+	defaults := map[string]*appconfig.TaskConfig{
+		"migrate": {Command: "/app/bin/migrate", Trigger: appconfig.TriggerDeploy},
+	}
+	for _, tc := range []struct {
+		name string
+		ac   *appconfig.AppConfig
+		want []core_v1alpha.ConfigSpecTasks
+	}{
+		{"no config", nil, []core_v1alpha.ConfigSpecTasks{{Name: "migrate", Command: "/app/bin/migrate", Trigger: appconfig.TriggerDeploy, MaxConcurrent: 1}}},
+		{"empty config", &appconfig.AppConfig{}, []core_v1alpha.ConfigSpecTasks{{Name: "migrate", Command: "/app/bin/migrate", Trigger: appconfig.TriggerDeploy, MaxConcurrent: 1}}},
+		{"manual override", &appconfig.AppConfig{Tasks: map[string]*appconfig.TaskConfig{"migrate": {Command: "custom", Trigger: appconfig.TriggerManual}}},
+			[]core_v1alpha.ConfigSpecTasks{{Name: "migrate", Command: "custom", Trigger: appconfig.TriggerManual, MaxConcurrent: 1}}},
+		{"renamed deploy task", &appconfig.AppConfig{Tasks: map[string]*appconfig.TaskConfig{"prepare": {Command: "custom", Trigger: appconfig.TriggerDeploy}}},
+			[]core_v1alpha.ConfigSpecTasks{{Name: "prepare", Command: "custom", Trigger: appconfig.TriggerDeploy, MaxConcurrent: 1}}},
+		{"null override", &appconfig.AppConfig{Tasks: map[string]*appconfig.TaskConfig{"migrate": nil}}, []core_v1alpha.ConfigSpecTasks{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var original int
+			if tc.ac != nil {
+				original = len(tc.ac.Tasks)
+			}
+			spec := buildVersionConfig(ConfigInputs{AppConfig: tc.ac, BuildResult: &BuildResult{DefaultTasks: defaults}})
+			assert.Equal(t, tc.want, spec.Tasks)
+			if tc.ac != nil {
+				assert.Len(t, tc.ac.Tasks, original, "defaults must not mutate caller config")
+			}
+		})
+	}
+}
+
 func TestDeploymentLog(t *testing.T) {
 	inmem, cleanup := testutils.NewInMemEntityServer(t)
 	defer cleanup()

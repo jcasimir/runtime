@@ -844,6 +844,23 @@ func buildVersionConfig(inputs ConfigInputs) core_v1alpha.ConfigSpec {
 		defaultServicePortFromImage(&spec, res.ExposedPorts)
 	}
 	spec.Tasks = buildTasksConfig(ac, inputs.Log)
+	if res != nil && len(res.DefaultTasks) > 0 {
+		// An explicit deploy task may already run migrations under another
+		// name. Never add a second automatic deploy hook in that case.
+		hasDeployTask := slices.ContainsFunc(spec.Tasks, func(task core_v1alpha.ConfigSpecTasks) bool {
+			return task.Trigger == appconfig.TriggerDeploy
+		})
+		tasks := map[string]*appconfig.TaskConfig{}
+		if ac != nil {
+			maps.Copy(tasks, ac.Tasks)
+		}
+		for name, task := range res.DefaultTasks {
+			if _, declared := tasks[name]; !declared && (!hasDeployTask || task.Trigger != appconfig.TriggerDeploy) {
+				tasks[name] = task
+			}
+		}
+		spec.Tasks = buildTasksConfig(&appconfig.AppConfig{Tasks: tasks}, inputs.Log)
+	}
 
 	// Merge env vars: preserve manual vars from existing services
 	for i := range spec.Services {
@@ -1782,6 +1799,7 @@ func (b *Builder) AnalyzeApp(ctx context.Context, state *build_v1alpha.BuilderAn
 		stackName = detectedStack.Name()
 		buildResult.Entrypoint = detectedStack.Entrypoint()
 		buildResult.Command = detectedStack.WebCommand()
+		buildResult.DefaultTasks = detectedStack.DefaultTasks()
 		buildResult.WorkingDir = detectedStack.Image().Config.WorkingDir
 	}
 

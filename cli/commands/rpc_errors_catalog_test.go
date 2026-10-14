@@ -137,6 +137,7 @@ func configDiagnosticCases() []struct {
 		clusterErr: errors.New("cluster \"homelab\" not found in configuration"),
 	}
 	unusable := &Context{ClusterName: "homelab"}
+	catalogNow := time.Date(2026, 10, 12, 15, 35, 57, 0, time.UTC)
 	inactive := &Context{ClientConfig: populated}
 
 	asDiagnostic := func(err error) *ui.Diagnostic {
@@ -162,6 +163,12 @@ func configDiagnosticCases() []struct {
 		{
 			scenario:   "the cluster is configured but its entry can't produce a connection",
 			diagnostic: asDiagnostic(unusable.unusableClusterError("homelab", errors.New("cluster has a client certificate but no client key"))),
+		},
+		{
+			scenario: "the cloud is rate-limiting sign-ins",
+			diagnostic: asDiagnostic(unusable.cloudRateLimitError("homelab",
+				&clientconfig.CloudRateLimitError{RetryAt: catalogNow.Add(22*time.Second + 300*time.Millisecond)},
+				catalogNow)),
 		},
 		{
 			scenario:   "clusters are configured but none is active",

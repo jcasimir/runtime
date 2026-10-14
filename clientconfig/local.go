@@ -3,18 +3,22 @@ package clientconfig
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -193,7 +197,7 @@ foundAddress:
 		}
 
 		// Get JWT token using the challenge-response flow
-		token, err := AuthenticateWithKey(ctx, hostname, keyPair)
+		token, err := AuthenticateWithKey(ctx, config.logger(), hostname, keyPair)
 		if err != nil {
 			return nil, fmt.Errorf("failed to authenticate with cloud: %w", err)
 		}
@@ -450,15 +454,43 @@ func getCacheDir() (string, error) {
 	return cacheDir, nil
 }
 
-// getCachedToken retrieves and validates a cached JWT token
-func getCachedToken(fingerprint string) (string, error) {
+// tokenCacheKey names the cache entry for a token minted by issuer for the
+// key with the given fingerprint.
+//
+// The fingerprint can't be used as a filename directly: it's standard base64,
+// so about half of all keys have a '/' in it, and the write then lands in a
+// directory that doesn't exist. Hashing also folds in the issuer, so one key
+// used against two clouds doesn't hand either one the other's token.
+func tokenCacheKey(issuer, fingerprint string) string {
+	sum := sha256.Sum256([]byte(issuer + "\n" + fingerprint))
+	return "token_" + hex.EncodeToString(sum[:])
+}
+
+// tokenMemo holds tokens minted earlier in this process. A single command can
+// build several RPC states (deploy builds three), and each one asks for a
+// token, so this keeps that to one handshake even when the disk cache can't
+// be written.
+var tokenMemo = struct {
+	sync.Mutex
+	tokens map[string]string
+}{tokens: map[string]string{}}
+
+// getCachedToken returns a fresh token for key from memory or disk, or "" if
+// there isn't one.
+func getCachedToken(key string) (string, error) {
+	tokenMemo.Lock()
+	memoized := tokenMemo.tokens[key]
+	tokenMemo.Unlock()
+	if tokenFresh(memoized, tokenExpiryBuffer) {
+		return memoized, nil
+	}
+
 	cacheDir, err := getCacheDir()
 	if err != nil {
 		return "", err
 	}
 
-	tokenPath := filepath.Join(cacheDir, fingerprint)
-	tokenData, err := os.ReadFile(tokenPath)
+	tokenData, err := os.ReadFile(filepath.Join(cacheDir, key))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil // No cached token
@@ -472,18 +504,39 @@ func getCachedToken(fingerprint string) (string, error) {
 		return "", nil // Missing, expired, or expiring soon — need a new one.
 	}
 
+	tokenMemo.Lock()
+	tokenMemo.tokens[key] = tokenString
+	tokenMemo.Unlock()
+
 	return tokenString, nil
 }
 
-// saveTokenToCache saves a JWT token to the cache
-func saveTokenToCache(fingerprint, token string) error {
+// saveTokenToCache remembers token for the rest of this process and writes it
+// to the disk cache for later ones.
+func saveTokenToCache(key, token string) error {
+	tokenMemo.Lock()
+	tokenMemo.tokens[key] = token
+	tokenMemo.Unlock()
+
 	cacheDir, err := getCacheDir()
 	if err != nil {
 		return err
 	}
 
-	tokenPath := filepath.Join(cacheDir, fingerprint)
-	return os.WriteFile(tokenPath, []byte(token), 0600)
+	return os.WriteFile(filepath.Join(cacheDir, key), []byte(token), 0600)
+}
+
+// removeLegacyCachedToken deletes the token cached under the old naming,
+// which used the raw fingerprint as the filename. Nothing reads it any more,
+// and for up to an hour after an upgrade it is still a valid bearer token, so
+// it shouldn't be left lying around. For a fingerprint with a '/' the path
+// never existed, and the remove fails harmlessly.
+func removeLegacyCachedToken(fingerprint string) {
+	cacheDir, err := getCacheDir()
+	if err != nil {
+		return
+	}
+	_ = os.Remove(filepath.Join(cacheDir, fingerprint))
 }
 
 // getCachedAddress retrieves a cached working address for a cluster
@@ -633,19 +686,19 @@ func findWorkingAddress(ctx context.Context, addresses []string) (string, error)
 	return "", fmt.Errorf("all addresses failed: %s", strings.Join(errors, "; "))
 }
 
-// AuthenticateWithKey performs the challenge-response authentication flow
-func AuthenticateWithKey(ctx context.Context, hostname string, keyPair *cloudauth.KeyPair) (string, error) {
-	fingerprint := keyPair.Fingerprint()
-
-	// Check for cached token first
-	if cachedToken, err := getCachedToken(fingerprint); err == nil && cachedToken != "" {
-		return cachedToken, nil
-	}
-
+// AuthenticateWithKey performs the challenge-response authentication flow.
+// log receives diagnostics that don't fail the login, such as a token that
+// couldn't be cached.
+func AuthenticateWithKey(ctx context.Context, log *slog.Logger, hostname string, keyPair *cloudauth.KeyPair) (string, error) {
 	// Build the cloud URL
 	cloudURL := hostname
 	if !strings.HasPrefix(cloudURL, "http://") && !strings.HasPrefix(cloudURL, "https://") {
 		cloudURL = "https://" + cloudURL
+	}
+
+	cacheKey := tokenCacheKey(cloudURL, keyPair.Fingerprint())
+	if cachedToken, err := getCachedToken(cacheKey); err == nil && cachedToken != "" {
+		return cachedToken, nil
 	}
 
 	// Step 1: Begin authentication
@@ -681,12 +734,7 @@ func AuthenticateWithKey(ctx context.Context, hostname string, keyPair *cloudaut
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp map[string]string
-		json.Unmarshal(body, &errResp)
-		if errMsg, ok := errResp["error"]; ok {
-			return "", fmt.Errorf("authentication failed: %s", errMsg)
-		}
-		return "", fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+		return "", authResponseError(resp, body)
 	}
 
 	var beginResp BeginAuthResponse
@@ -738,12 +786,7 @@ func AuthenticateWithKey(ctx context.Context, hostname string, keyPair *cloudaut
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp map[string]string
-		json.Unmarshal(body, &errResp)
-		if errMsg, ok := errResp["error"]; ok {
-			return "", fmt.Errorf("authentication failed: %s", errMsg)
-		}
-		return "", fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+		return "", authResponseError(resp, body)
 	}
 
 	var completeResp CompleteAuthResponse
@@ -755,8 +798,14 @@ func AuthenticateWithKey(ctx context.Context, hostname string, keyPair *cloudaut
 		return "", fmt.Errorf("server did not return a token")
 	}
 
-	// Cache the token for future use
-	_ = saveTokenToCache(fingerprint, completeResp.Token) // Ignore error - caching is optional
+	// Caching is an optimization, so a failed write doesn't fail the login. It
+	// does mean every later command pays for a fresh handshake, which is worth
+	// being able to see.
+	if err := saveTokenToCache(cacheKey, completeResp.Token); err != nil {
+		log.Debug("failed to cache cloud token", "error", err)
+	} else {
+		removeLegacyCachedToken(keyPair.Fingerprint())
+	}
 
 	return completeResp.Token, nil
 }
